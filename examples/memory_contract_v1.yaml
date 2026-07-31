@@ -1,0 +1,77 @@
+schema_version: "1.0"
+suite_id: memory-contract-v1
+name: Memory retrieval contract declaration
+description: Multi-turn Memory fixture and retrieval expectation without a provider.
+tags:
+  - memory
+  - contract-only
+defaults:
+  trials: 1
+  timeout_seconds: 120
+  preserve_sandbox: false
+  metadata: {}
+cases:
+  - case_id: retrieve-stable-preference
+    name: Retrieve a synthetic stable preference
+    description: Demonstrates provider-independent retrieval inputs and ranked results.
+    mode: scripted_multi_turn
+    tags:
+      - retrieval
+    input:
+      turns:
+        - role: user
+          message: My synthetic report preference is a concise Markdown table.
+        - role: assistant
+          message: I will use that format for the next synthetic report.
+        - role: user
+          message: What report format did I request?
+    execution:
+      runner: conversation
+      workdir: workspace
+      config_overrides: {}
+      environment_overrides: {}
+    fixture:
+      files: []
+      memory:
+        items:
+          - memory_id: preference-report-format
+            kind: user_profile
+            content: Synthetic user prefers concise Markdown tables for reports.
+            source: audit-fixture
+            user_id: synthetic-user
+            session_id: synthetic-session
+            metadata:
+              confidence: declared
+          - memory_id: unrelated-episodic-item
+            kind: episodic
+            content: A synthetic example task was completed on a prior turn.
+            source: audit-fixture
+            user_id: synthetic-user
+            metadata: {}
+      skills: []
+      review_requests: []
+    expected:
+      memories:
+        - query:
+            query: preferred report format
+            top_k: 3
+            user_id: synthetic-user
+            session_id: synthetic-session
+            filters:
+              scope: profile
+          required_memory_ids:
+            - preference-report-format
+          required_kinds:
+            - user_profile
+          minimum_matches: 1
+      texts:
+        - target: final_output
+          contains: Markdown table
+          case_sensitive: false
+    evaluators:
+      - evaluator_id: preference-retrieval
+        kind: retrieval
+        required: true
+        config:
+          declared_provider_family: hybrid
+          score_semantics: provider-defined

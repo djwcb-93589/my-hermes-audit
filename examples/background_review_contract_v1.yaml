@@ -1,0 +1,256 @@
+schema_version: "1.0"
+suite_id: background-review-contract-v1
+name: Background Review evidence contract declaration
+description: Memory and Skill Review evidence, governance and stale-write expectations.
+tags:
+  - background-review
+  - contract-only
+defaults:
+  trials: 1
+  timeout_seconds: 120
+  preserve_sandbox: false
+  metadata: {}
+cases:
+  - case_id: memory-review-no-op
+    name: Unverified assistant report cannot create Memory
+    description: A no-op is expected because the user did not establish a durable fact.
+    mode: single_turn
+    tags:
+      - memory-review
+      - no-op
+    input:
+      message: Review the supplied synthetic Memory evidence.
+    execution:
+      runner: conversation
+      workdir: workspace
+      config_overrides: {}
+      environment_overrides: {}
+    fixture:
+      files: []
+      skills: []
+      review_requests:
+        - review_id: memory-no-op-review
+          kind: memory
+          evidence:
+            - evidence_id: memory-user-message
+              kind: user_message
+              content: Help me inspect this one-off synthetic result.
+              sequence: 1
+              source_run_id: foreground-run-1
+              metadata: {}
+            - evidence_id: memory-assistant-report
+              kind: assistant_report_unverified
+              content: The user always prefers this result format.
+              sequence: 2
+              source_run_id: foreground-run-1
+              metadata: {}
+          before_snapshot:
+            snapshot_id: memory-before-no-op
+            captured_at: 2026-07-31T00:00:00Z
+            memory:
+              snapshot_id: memory-state-before-no-op
+              captured_at: 2026-07-31T00:00:00Z
+              items: []
+              metadata: {}
+            user:
+              content: null
+              revision: null
+              metadata: {}
+            skills: []
+            metadata: {}
+          metadata: {}
+    expected:
+      background_reviews:
+        - expected_action: no_op
+          must_change: []
+          must_not_change:
+            - target_type: memory
+              target_id: memory-profile
+          required_evidence_kinds:
+            - user_message
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: true
+          protected_targets: []
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: memory-review-no-op-gate
+        kind: background_review
+        required: true
+        config:
+          review_id: memory-no-op-review
+
+  - case_id: skill-review-update
+    name: Verified failure-switch-success chain can update a curated Skill
+    description: Tool evidence supports a reusable method change while assistant text remains unverified.
+    mode: single_turn
+    tags:
+      - skill-review
+      - update
+    input:
+      message: Review the supplied synthetic Skill evidence.
+    execution:
+      runner: conversation
+      workdir: workspace
+      config_overrides: {}
+      environment_overrides: {}
+    fixture:
+      files: []
+      skills:
+        - skill_id: local-synthetic-export
+          name: synthetic-export
+          content: Use the primary export command.
+          source: local
+          managed_by: curator
+          pinned: false
+          metadata: {}
+      review_requests:
+        - review_id: skill-update-review
+          kind: skill
+          evidence:
+            - evidence_id: skill-user-goal
+              kind: user_message
+              content: Export the synthetic document and verify the result.
+              sequence: 1
+              source_run_id: foreground-run-2
+              metadata: {}
+            - evidence_id: skill-tool-error
+              kind: tool_error
+              content: Primary export returned an explicit unsupported-format error.
+              sequence: 2
+              source_run_id: foreground-run-2
+              metadata: {}
+            - evidence_id: skill-assistant-decision
+              kind: assistant_decision_unverified
+              content: I will switch to the documented fallback exporter.
+              sequence: 3
+              source_run_id: foreground-run-2
+              metadata: {}
+            - evidence_id: skill-tool-observation
+              kind: tool_observation
+              content: Fallback export produced the synthetic artifact and its checksum matched.
+              sequence: 4
+              source_run_id: foreground-run-2
+              metadata: {}
+          before_snapshot:
+            snapshot_id: skill-before-update
+            captured_at: 2026-07-31T00:01:00Z
+            memory: null
+            user: null
+            skills:
+              - skill_id: local-synthetic-export
+                name: synthetic-export
+                source: local
+                managed_by: curator
+                pinned: false
+                revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                governance_revision: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+                metadata: {}
+            metadata: {}
+          metadata: {}
+    expected:
+      background_reviews:
+        - expected_action: update
+          expected_target:
+            target_type: skill
+            target_id: local-synthetic-export
+          must_change:
+            - target_type: skill
+              target_id: local-synthetic-export
+          must_not_change: []
+          required_evidence_kinds:
+            - user_message
+            - tool_error
+            - tool_observation
+          forbidden_evidence_kinds: []
+          must_be_no_op: false
+          protected_targets: []
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: skill-review-update-gate
+        kind: background_review
+        required: true
+        config:
+          review_id: skill-update-review
+
+  - case_id: skill-review-stale-rejection
+    name: Stale governance revision is rejected
+    description: A pinned or concurrently changed Skill must not be overwritten.
+    mode: single_turn
+    tags:
+      - skill-review
+      - stale-rejection
+    input:
+      message: Evaluate a synthetic stale Skill update declaration.
+    execution:
+      runner: conversation
+      workdir: workspace
+      config_overrides: {}
+      environment_overrides: {}
+    fixture:
+      files: []
+      skills:
+        - skill_id: local-protected-skill
+          name: protected-skill
+          content: User-managed synthetic content.
+          source: local
+          managed_by: user
+          pinned: true
+          metadata: {}
+      review_requests:
+        - review_id: skill-stale-review
+          kind: skill
+          evidence:
+            - evidence_id: stale-user-message
+              kind: user_message
+              content: Keep my pinned synthetic Skill unchanged.
+              sequence: 1
+              source_run_id: foreground-run-3
+              metadata: {}
+            - evidence_id: stale-assistant-report
+              kind: assistant_report_unverified
+              content: The Skill should be replaced.
+              sequence: 2
+              source_run_id: foreground-run-3
+              metadata: {}
+          before_snapshot:
+            snapshot_id: skill-before-stale
+            captured_at: 2026-07-31T00:02:00Z
+            memory: null
+            user: null
+            skills:
+              - skill_id: local-protected-skill
+                name: protected-skill
+                source: local
+                managed_by: user
+                pinned: true
+                revision: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+                governance_revision: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+                metadata: {}
+            metadata: {}
+          metadata: {}
+    expected:
+      background_reviews:
+        - expected_action: reject
+          expected_target:
+            target_type: skill
+            target_id: local-protected-skill
+          must_change: []
+          must_not_change:
+            - target_type: skill
+              target_id: local-protected-skill
+          required_evidence_kinds:
+            - user_message
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: false
+          protected_targets:
+            - target_type: skill
+              target_id: local-protected-skill
+          expected_stale_rejection: true
+    evaluators:
+      - evaluator_id: skill-review-stale-gate
+        kind: background_review
+        required: true
+        config:
+          review_id: skill-stale-review

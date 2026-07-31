@@ -1,0 +1,75 @@
+schema_version: "1.0"
+suite_id: core-contract-v1
+name: Core contract declaration
+description: Static single-turn, file and evaluator contract example.
+tags:
+  - core
+  - contract-only
+defaults:
+  trials: 1
+  timeout_seconds: 120
+  preserve_sandbox: false
+  metadata:
+    purpose: documentation
+cases:
+  - case_id: write-summary-file
+    name: Write a summary file
+    description: Declares file setup and expected observations without running an Agent.
+    mode: single_turn
+    tags:
+      - file
+    input:
+      message: Read the task fixture and write a concise summary.
+    execution:
+      runner: conversation
+      workdir: workspace
+      config_overrides:
+        model_profile: audit-placeholder
+      environment_overrides:
+        AUDIT_CASE_MODE: static-contract
+    fixture:
+      files:
+        - path: workspace/input/task.txt
+          content: |
+            This is synthetic documentation data.
+            No real user or credential is present.
+      skills: []
+      review_requests: []
+    expected:
+      files:
+        - path: workspace/output/summary.txt
+          exists: true
+          content_contains:
+            - synthetic documentation data
+      tool_trajectories:
+        - ordered: true
+          allow_additional_calls: false
+          calls:
+            - tool_name: file
+              arguments:
+                action: read
+                path: input/task.txt
+            - tool_name: file
+              arguments:
+                action: write
+                path: output/summary.txt
+      judges:
+        - rubric: The summary preserves the fixture's meaning without inventing facts.
+          criteria:
+            - name: groundedness
+              description: Claims remain grounded in the declared fixture.
+              weight: 1.0
+          minimum_score: 0.8
+          maximum_score: 1.0
+    evaluators:
+      - evaluator_id: summary-file-gate
+        kind: deterministic
+        required: true
+        config:
+          expectation_group: files
+      - evaluator_id: summary-quality-score
+        kind: llm_judge
+        required: false
+        weight: 0.25
+        config:
+          rubric_ref: judges.0

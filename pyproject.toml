@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-hermes-audit"
+version = "0.1.0"
+description = "Strict, runtime-independent audit contracts for MyHermes"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.11,<3",
+    "PyYAML>=6.0,<7",
+]
+
+[project.scripts]
+myhermes-audit = "myhermes_audit.cli:entrypoint"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["myhermes_audit", "myhermes_audit.*"]
