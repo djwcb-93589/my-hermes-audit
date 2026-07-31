@@ -171,12 +171,29 @@ class ReviewOutcome(ContractModel):
 
     @model_validator(mode="after")
     def validate_outcome_shape(self) -> "ReviewOutcome":
-        if self.no_op_reason is not None and self.changes:
-            raise ValueError("no_op_reason cannot be combined with changes")
-        if self.status is ReviewStatus.FAILED and self.error is None:
-            raise ValueError("failed review outcomes require error")
-        if self.status is not ReviewStatus.FAILED and self.error is not None:
-            raise ValueError("error is only valid for failed review outcomes")
+        if self.status is ReviewStatus.COMPLETED:
+            if self.error is not None:
+                raise ValueError("completed review outcomes must not contain error")
+            if bool(self.changes) == (self.no_op_reason is not None):
+                raise ValueError(
+                    "completed review outcomes require either changes or no_op_reason"
+                )
+        elif self.status is ReviewStatus.FAILED:
+            if self.error is None:
+                raise ValueError("failed review outcomes require error")
+            if self.changes or self.no_op_reason is not None:
+                raise ValueError(
+                    "failed review outcomes cannot contain changes or no_op_reason"
+                )
+        elif self.status in {ReviewStatus.REJECTED, ReviewStatus.STALE}:
+            if self.error is not None or self.changes or self.no_op_reason is None:
+                raise ValueError(
+                    "rejected and stale outcomes require only a no_op_reason"
+                )
+        elif self.error is not None or self.changes or self.no_op_reason is not None:
+            raise ValueError(
+                "pending and running outcomes cannot contain terminal results"
+            )
         return self
 
 

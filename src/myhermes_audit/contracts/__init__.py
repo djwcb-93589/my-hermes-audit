@@ -27,6 +27,7 @@ from myhermes_audit.contracts.result import (
     CaseAggregate,
     MetricResult,
     MetricSource,
+    TrialWarning,
     TrialResult,
     TrialStatus,
 )
@@ -81,4 +82,5 @@ __all__ = (
     "TrialConfig",
     "TrialResult",
     "TrialStatus",
+    "TrialWarning",
 )

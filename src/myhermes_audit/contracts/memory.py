@@ -75,12 +75,13 @@ class MemoryQueryResult(ContractModel):
     @model_validator(mode="after")
     def validate_ranks(self) -> "MemoryQueryResult":
         ranks = [item.rank for item in self.items]
-        if ranks and ranks[0] != 1:
-            raise ValueError("retrieved ranks must start at 1")
-        if ranks != sorted(ranks):
-            raise ValueError("retrieved items must be sorted by ascending rank")
-        if len(ranks) != len(set(ranks)):
-            raise ValueError("retrieved ranks must not repeat")
+        if ranks != list(range(1, len(ranks) + 1)):
+            raise ValueError(
+                "retrieved ranks must be unique, sorted, and contiguous from 1"
+            )
+        memory_ids = [item.memory_id for item in self.items]
+        if len(memory_ids) != len(set(memory_ids)):
+            raise ValueError("memory_id must be unique within a MemoryQueryResult")
         if len(self.items) > self.query.top_k:
             raise ValueError("retrieved item count cannot exceed query.top_k")
         return self

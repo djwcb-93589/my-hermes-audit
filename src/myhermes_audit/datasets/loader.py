@@ -8,6 +8,9 @@ from typing import Any
 
 import yaml
 from pydantic import ValidationError
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
+from yaml.resolver import BaseResolver
 
 from myhermes_audit.contracts import AuditSuite
 from myhermes_audit.datasets.resolver import resolve_suite_sources
@@ -15,6 +18,58 @@ from myhermes_audit.errors import DatasetLoadError
 
 
 _MAX_SUITE_BYTES = 5 * 1024 * 1024
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """SafeLoader variant that rejects duplicate keys in every mapping."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader,
+    node: MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    if not isinstance(node, MappingNode):
+        raise ConstructorError(
+            None,
+            None,
+            "expected a mapping node",
+            node.start_mark,
+        )
+
+    # Flatten merge keys first so aliases remain supported while collisions in
+    # the resulting mapping are still rejected.
+    loader.flatten_mapping(node)
+    seen: dict[Any, Any] = {}
+    for key_node, _value_node in node.value:
+        key = loader.construct_object(key_node, deep=False)
+        try:
+            first_mark = seen.get(key)
+        except TypeError as exc:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from exc
+        if first_mark is not None:
+            first_location = (
+                f"line {first_mark.line + 1}, column {first_mark.column + 1}"
+            )
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}; first declared at {first_location}",
+                key_node.start_mark,
+            )
+        seen[key] = key_node.start_mark
+    return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+
+_UniqueKeySafeLoader.add_constructor(
+    BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
 
 
 def _field_path(location: tuple[Any, ...]) -> str:
@@ -138,7 +193,7 @@ def load_suite(path: Path) -> AuditSuite:
     yaml_path = Path(path).expanduser().resolve(strict=False)
     text = _read_yaml_file(yaml_path)
     try:
-        raw_data = yaml.safe_load(text)
+        raw_data = yaml.load(text, Loader=_UniqueKeySafeLoader)
     except yaml.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         location = (

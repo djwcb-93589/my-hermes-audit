@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import shutil
 import tempfile
@@ -74,6 +75,7 @@ class AuditSandbox:
         self._owner_token: str | None = None
         self._controlled_root: Path | None = None
         self._created_parent_dirs: tuple[Path, ...] = ()
+        self._shared_parent_dirs: tuple[Path, ...] = ()
         self._temporary_root = False
         self._created = False
         self._cleaned = False
@@ -232,6 +234,8 @@ class AuditSandbox:
                     try:
                         parent.rmdir()
                     except OSError as cleanup_exc:
+                        if cleanup_exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                            continue
                         raise SandboxError(
                             f"cannot roll back sandbox parent: {cleanup_exc}",
                             operation="create",
@@ -253,6 +257,7 @@ class AuditSandbox:
         self._manifest = manifest
         self._owner_token = owner_token
         self._created_parent_dirs = tuple(created_parent_dirs)
+        self._shared_parent_dirs = (case_directory, run_directory)
         self._created = True
         return layout
 
@@ -458,7 +463,7 @@ class AuditSandbox:
     def cleanup(self) -> None:
         """验证所有权后只删除本实例创建的 Trial 根目录。"""
 
-        if not self._created or self._cleaned:
+        if self.preserve or not self._created or self._cleaned:
             return
         self._validate_cleanup_marker()
         layout = self._require_layout()
@@ -471,15 +476,22 @@ class AuditSandbox:
                 operation="cleanup",
             ) from exc
         self._cleaned = True
-        cleanup_directories = list(reversed(self._created_parent_dirs))
-        if self._temporary_root and controlled_root is not None:
-            cleanup_directories.append(controlled_root)
-        for directory in cleanup_directories:
+        for directory in self._shared_parent_dirs:
             if directory.exists():
                 try:
                     directory.rmdir()
                 except OSError as exc:
+                    if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                        continue
                     raise SandboxError(
-                        f"owned parent is not empty after cleanup: {exc}",
+                        f"cannot remove shared sandbox parent: {exc}",
                         operation="cleanup",
                     ) from exc
+        if self._temporary_root and controlled_root is not None:
+            try:
+                controlled_root.rmdir()
+            except OSError as exc:
+                raise SandboxError(
+                    f"cannot remove temporary controlled root: {exc}",
+                    operation="cleanup",
+                ) from exc

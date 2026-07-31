@@ -21,6 +21,7 @@ from myhermes_audit.contracts.common import (
     JsonObject,
     NonEmptyText,
     NonNegativeInt,
+    PositiveInt,
     SafeRelativePath,
     SchemaVersion,
     Sha256Digest,
@@ -82,6 +83,12 @@ class TrialError(ContractModel):
     details: JsonObject = Field(default_factory=dict)
 
 
+class TrialWarning(ContractModel):
+    warning_type: Identifier
+    message: NonEmptyText
+    details: JsonObject = Field(default_factory=dict)
+
+
 class TrialResult(ContractModel):
     trial_id: Identifier
     run_id: Identifier
@@ -94,6 +101,7 @@ class TrialResult(ContractModel):
     duration_ms: NonNegativeInt | None = None
     metrics: list[MetricResult] = Field(default_factory=list)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
+    warnings: list[TrialWarning] = Field(default_factory=list)
     error: TrialError | None = None
 
     @model_validator(mode="after")
@@ -106,11 +114,32 @@ class TrialResult(ContractModel):
             and self.finished_at < self.started_at
         ):
             raise ValueError("finished_at cannot be before started_at")
+        if self.status is TrialStatus.COMPLETED and self.error is not None:
+            raise ValueError("completed trials must not contain error")
         if self.status in {
             TrialStatus.FAILED,
             TrialStatus.ENVIRONMENT_ERROR,
         } and self.error is None:
             raise ValueError("failed and environment_error trials require error")
+        if self.status in {TrialStatus.PENDING, TrialStatus.RUNNING}:
+            if self.error is not None or self.final_output is not None:
+                raise ValueError(
+                    "pending and running trials cannot contain terminal results"
+                )
+        if self.status is TrialStatus.TIMEOUT:
+            if self.error is None or self.error.error_type != "timeout":
+                raise ValueError("timeout trials require a stable timeout error")
+            if self.final_output is not None:
+                raise ValueError("timeout trials cannot contain final_output")
+        if self.status is TrialStatus.CANCELLED:
+            if self.error is None or self.error.error_type != "cancelled":
+                raise ValueError("cancelled trials require a cancelled error")
+            if self.final_output is not None or any(
+                metric.passed is True for metric in self.metrics
+            ):
+                raise ValueError(
+                    "cancelled trials cannot contain successful run semantics"
+                )
         artifact_ids = [artifact.artifact_id for artifact in self.artifacts]
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("artifact_id must be unique within a TrialResult")
@@ -143,7 +172,7 @@ class MetricSummary(ContractModel):
 
 class CaseAggregate(ContractModel):
     case_id: Identifier
-    trial_count: NonNegativeInt
+    trial_count: PositiveInt
     passed_count: NonNegativeInt
     pass_rate: StrictFloat = Field(ge=0, le=1)
     metric_summaries: list[MetricSummary] = Field(default_factory=list)
@@ -154,6 +183,17 @@ class CaseAggregate(ContractModel):
             raise ValueError("passed_count cannot exceed trial_count")
         if not math.isfinite(self.pass_rate):
             raise ValueError("pass_rate must be finite")
+        expected_rate = self.passed_count / self.trial_count
+        if not math.isclose(
+            self.pass_rate,
+            expected_rate,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("pass_rate must equal passed_count / trial_count")
+        metric_names = [item.metric_name for item in self.metric_summaries]
+        if len(metric_names) != len(set(metric_names)):
+            raise ValueError("metric_summaries must have unique metric_name values")
         return self
 
 
