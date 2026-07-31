@@ -96,11 +96,27 @@ class RunnerKind(str, Enum):
     CONVERSATION = "conversation"
 
 
+class ToolsetName(str, Enum):
+    FILE = "file"
+    TERMINAL = "terminal"
+
+
 class ExecutionSpec(ContractModel):
     runner: RunnerKind = RunnerKind.CONVERSATION
     workdir: SafeRelativePath = "workspace"
+    enabled_toolsets: list[ToolsetName] = Field(default_factory=list)
     config_overrides: JsonObject = Field(default_factory=dict)
     environment_overrides: dict[NonEmptyText, StrictStr] = Field(default_factory=dict)
+
+    @field_validator("enabled_toolsets")
+    @classmethod
+    def validate_enabled_toolsets(
+        cls,
+        value: list[ToolsetName],
+    ) -> list[ToolsetName]:
+        if len(value) != len(set(value)):
+            raise ValueError("enabled_toolsets must not repeat")
+        return value
 
     @field_validator("environment_overrides")
     @classmethod
@@ -108,20 +124,9 @@ class ExecutionSpec(ContractModel):
         cls,
         value: dict[str, str],
     ) -> dict[str, str]:
-        reserved = {
-            "DB_PATH",
-            "HERMES_HOME",
-            "HERMES_WORKSPACE",
-            "MYHERMES_AUDIT_ARTIFACTS_DIR",
-        }
-        for key in value:
-            if not key.replace("_", "a").isalnum() or key[0].isdigit():
-                raise ValueError(f"invalid environment variable name: {key!r}")
-            if key.upper() in reserved:
-                raise ValueError(
-                    f"environment override {key!r} is owned by AuditSandbox"
-                )
-        return value
+        from myhermes_audit.environment import validate_suite_environment_overrides
+
+        return validate_suite_environment_overrides(value)
 
 
 class FixtureFile(ContractModel):
@@ -200,10 +205,35 @@ class FixtureSpec(ContractModel):
 
 
 class FileExpectation(ContractModel):
-    path: SafeRelativePath
+    path: FixtureTargetPath
     exists: StrictBool = True
     sha256: Sha256Digest | None = None
+    exact_text: StrictStr | None = None
     content_contains: list[NonEmptyText] = Field(default_factory=list)
+    content_not_contains: list[NonEmptyText] = Field(default_factory=list)
+    minimum_size_bytes: NonNegativeInt | None = None
+    maximum_size_bytes: NonNegativeInt | None = None
+
+    @model_validator(mode="after")
+    def validate_file_expectation(self) -> "FileExpectation":
+        if (
+            self.minimum_size_bytes is not None
+            and self.maximum_size_bytes is not None
+            and self.minimum_size_bytes > self.maximum_size_bytes
+        ):
+            raise ValueError("minimum_size_bytes cannot exceed maximum_size_bytes")
+        if not self.exists and any(
+            (
+                self.sha256 is not None,
+                self.exact_text is not None,
+                bool(self.content_contains),
+                bool(self.content_not_contains),
+                self.minimum_size_bytes is not None,
+                self.maximum_size_bytes is not None,
+            )
+        ):
+            raise ValueError("a non-existent file cannot have content constraints")
+        return self
 
 
 class TextTarget(str, Enum):
@@ -216,14 +246,28 @@ class TextTarget(str, Enum):
 class TextExpectation(ContractModel):
     target: TextTarget
     reference: NonEmptyText | None = None
+    exact: StrictStr | None = None
     contains: NonEmptyText | None = None
+    not_contains: NonEmptyText | None = None
     matches_regex: NonEmptyText | None = None
     case_sensitive: StrictBool = True
 
     @model_validator(mode="after")
     def validate_matcher(self) -> "TextExpectation":
-        if self.contains is None and self.matches_regex is None:
-            raise ValueError("contains or matches_regex must be provided")
+        if all(
+            value is None
+            for value in (
+                self.exact,
+                self.contains,
+                self.not_contains,
+                self.matches_regex,
+            )
+        ):
+            raise ValueError(
+                "exact, contains, not_contains, or matches_regex must be provided"
+            )
+        if self.target is TextTarget.FINAL_OUTPUT and self.reference is not None:
+            raise ValueError("final_output text expectations do not use reference")
         return self
 
 
@@ -232,10 +276,39 @@ class JsonMatchMode(str, Enum):
     SUBSET = "subset"
 
 
-class JsonExpectation(ContractModel):
-    target: NonEmptyText
+class JsonRootType(str, Enum):
+    OBJECT = "object"
+    ARRAY = "array"
+    STRING = "string"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+    NULL = "null"
+
+
+class JsonValueExpectation(ContractModel):
+    path: NonEmptyText
     expected: JsonValue
+
+
+class JsonExpectation(ContractModel):
+    target: FixtureTargetPath
+    expected: JsonValue | None = None
     match: JsonMatchMode = JsonMatchMode.EXACT
+    root_type: JsonRootType | None = None
+    required_keys: list[NonEmptyText] = Field(default_factory=list)
+    values: list[JsonValueExpectation] = Field(default_factory=list)
+    forbidden_keys: list[NonEmptyText] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_json_expectation(self) -> "JsonExpectation":
+        if len(self.required_keys) != len(set(self.required_keys)):
+            raise ValueError("required_keys must not repeat")
+        if len(self.forbidden_keys) != len(set(self.forbidden_keys)):
+            raise ValueError("forbidden_keys must not repeat")
+        paths = [item.path for item in self.values]
+        if len(paths) != len(set(paths)):
+            raise ValueError("JSON value paths must not repeat")
+        return self
 
 
 class ToolCallExpectation(ContractModel):
@@ -247,6 +320,33 @@ class ToolTrajectoryExpectation(ContractModel):
     calls: list[ToolCallExpectation] = Field(default_factory=list)
     ordered: StrictBool = True
     allow_additional_calls: StrictBool = False
+    required_tools: list[NonEmptyText] = Field(default_factory=list)
+    forbidden_tools: list[NonEmptyText] = Field(default_factory=list)
+    minimum_tool_calls: NonNegativeInt | None = None
+    maximum_tool_calls: NonNegativeInt | None = None
+    required_successful_tools: list[NonEmptyText] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_trajectory(self) -> "ToolTrajectoryExpectation":
+        for field_name in (
+            "required_tools",
+            "forbidden_tools",
+            "required_successful_tools",
+        ):
+            values = getattr(self, field_name)
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} must not repeat")
+        if set(self.required_tools) & set(self.forbidden_tools):
+            raise ValueError("a tool cannot be both required and forbidden")
+        if set(self.required_successful_tools) & set(self.forbidden_tools):
+            raise ValueError("a successful tool cannot also be forbidden")
+        if (
+            self.minimum_tool_calls is not None
+            and self.maximum_tool_calls is not None
+            and self.minimum_tool_calls > self.maximum_tool_calls
+        ):
+            raise ValueError("minimum_tool_calls cannot exceed maximum_tool_calls")
+        return self
 
 
 class MemoryExpectation(ContractModel):

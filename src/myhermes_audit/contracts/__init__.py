@@ -24,12 +24,18 @@ from myhermes_audit.contracts.memory import (
 from myhermes_audit.contracts.result import (
     ArtifactRef,
     AuditRunResult,
+    AuditSummary,
     CaseAggregate,
+    MetricEvidence,
+    MetricSummary,
     MetricResult,
     MetricSource,
+    TrialRuntimeSummary,
+    TrialError,
     TrialWarning,
     TrialResult,
     TrialStatus,
+    TurnResult,
 )
 from myhermes_audit.contracts.suite import (
     AuditCase,
@@ -43,6 +49,7 @@ from myhermes_audit.contracts.suite import (
     FixtureFile,
     FixtureSpec,
     TrialConfig,
+    ToolsetName,
 )
 
 __all__ = (
@@ -50,6 +57,7 @@ __all__ = (
     "AuditCase",
     "AuditFingerprint",
     "AuditRunResult",
+    "AuditSummary",
     "AuditSuite",
     "BackgroundReviewExpectation",
     "CaseAggregate",
@@ -68,6 +76,8 @@ __all__ = (
     "MemoryQueryResult",
     "MemoryStateSnapshot",
     "MetricResult",
+    "MetricEvidence",
+    "MetricSummary",
     "MetricSource",
     "RetrievedMemory",
     "ReviewAction",
@@ -80,7 +90,11 @@ __all__ = (
     "ReviewStateSnapshot",
     "SubjectFingerprint",
     "TrialConfig",
+    "TrialError",
+    "TrialRuntimeSummary",
     "TrialResult",
     "TrialStatus",
     "TrialWarning",
+    "ToolsetName",
+    "TurnResult",
 )

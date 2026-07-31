@@ -1,0 +1,200 @@
+schema_version: "1.0"
+suite_id: core_run_v1
+name: Core isolated MyHermes run
+description: Synthetic P1 cases for the real subprocess runner.
+tags:
+  - p1
+  - offline-runner
+defaults:
+  trials: 1
+  timeout_seconds: 120
+  preserve_sandbox: false
+  metadata:
+    data_classification: synthetic
+cases:
+  - case_id: exact-format
+    name: Exact text formatting
+    mode: single_turn
+    input:
+      message: Reply with exactly AUDIT_READY and no other text.
+    execution:
+      runner: conversation
+      workdir: workspace
+      enabled_toolsets: []
+    expected:
+      texts:
+        - target: final_output
+          exact: AUDIT_READY
+    evaluators:
+      - evaluator_id: exact-output
+        kind: deterministic
+        required: true
+        config:
+          expectation_group: texts
+
+  - case_id: read-workspace-file
+    name: Read a synthetic workspace file
+    mode: single_turn
+    input:
+      message: Read input/note.txt with the file tool and include its reference code in your answer.
+    execution:
+      runner: conversation
+      workdir: workspace
+      enabled_toolsets:
+        - file
+    fixture:
+      files:
+        - path: workspace/input/note.txt
+          content: "Synthetic reference code: ORBIT-17.\n"
+    expected:
+      texts:
+        - target: final_output
+          contains: ORBIT-17
+      tool_trajectories:
+        - required_tools:
+            - file
+          minimum_tool_calls: 1
+          required_successful_tools:
+            - file
+    evaluators:
+      - evaluator_id: reference-answer
+        kind: deterministic
+        required: true
+        config:
+          expectation_group: texts
+      - evaluator_id: file-read-trace
+        kind: tool_trajectory
+        required: true
+
+  - case_id: create-text-file
+    name: Create a synthetic text artifact
+    mode: single_turn
+    input:
+      message: Use the file tool to create output/summary.txt containing exactly synthetic audit summary followed by a newline.
+    execution:
+      runner: conversation
+      workdir: workspace
+      enabled_toolsets:
+        - file
+    expected:
+      files:
+        - path: workspace/output/summary.txt
+          exists: true
+          exact_text: "synthetic audit summary\n"
+          minimum_size_bytes: 10
+          maximum_size_bytes: 128
+      tool_trajectories:
+        - required_tools:
+            - file
+          minimum_tool_calls: 1
+          required_successful_tools:
+            - file
+    evaluators:
+      - evaluator_id: summary-file
+        kind: deterministic
+        required: true
+        config:
+          expectation_group: files
+      - evaluator_id: file-write-trace
+        kind: tool_trajectory
+        required: true
+
+  - case_id: transform-json-file
+    name: Transform synthetic JSON
+    mode: single_turn
+    input:
+      message: Read input/source.json and use the file tool to write output/result.json with name unchanged and active set to true.
+    execution:
+      runner: conversation
+      workdir: workspace
+      enabled_toolsets:
+        - file
+    fixture:
+      files:
+        - path: workspace/input/source.json
+          content: |
+            {"name":"synthetic-record","active":false}
+    expected:
+      json_values:
+        - target: workspace/output/result.json
+          root_type: object
+          required_keys:
+            - name
+            - active
+          values:
+            - path: name
+              expected: synthetic-record
+            - path: active
+              expected: true
+          forbidden_keys:
+            - secret
+      tool_trajectories:
+        - required_tools:
+            - file
+          minimum_tool_calls: 2
+          required_successful_tools:
+            - file
+    evaluators:
+      - evaluator_id: transformed-json
+        kind: deterministic
+        required: true
+        config:
+          expectation_group: json_values
+      - evaluator_id: json-file-trace
+        kind: tool_trajectory
+        required: true
+
+  - case_id: harmless-terminal
+    name: Run a harmless terminal command
+    mode: single_turn
+    input:
+      message: Use the terminal tool to run python -c "print('AUDIT_OK')" and include AUDIT_OK in your answer.
+    execution:
+      runner: conversation
+      workdir: workspace
+      enabled_toolsets:
+        - terminal
+    expected:
+      texts:
+        - target: final_output
+          contains: AUDIT_OK
+      tool_trajectories:
+        - required_tools:
+            - terminal
+          minimum_tool_calls: 1
+          maximum_tool_calls: 3
+          required_successful_tools:
+            - terminal
+    evaluators:
+      - evaluator_id: terminal-answer
+        kind: deterministic
+        required: true
+        config:
+          expectation_group: texts
+      - evaluator_id: terminal-trace
+        kind: tool_trajectory
+        required: true
+
+  - case_id: fixed-two-turn
+    name: Preserve context across two scripted turns
+    mode: scripted_multi_turn
+    input:
+      turns:
+        - role: user
+          message: Remember the synthetic code COMET-42. Reply only ACK.
+        - role: user
+          message: Reply with only the code I asked you to remember.
+    execution:
+      runner: conversation
+      workdir: workspace
+      enabled_toolsets: []
+    expected:
+      texts:
+        - target: final_output
+          exact: COMET-42
+    evaluators:
+      - evaluator_id: multi-turn-context
+        kind: deterministic
+        required: true
+        config:
+          expectation_group: texts

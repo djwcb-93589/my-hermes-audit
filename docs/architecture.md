@@ -1,16 +1,17 @@
-# P0 架构与依赖方向
+# 架构与依赖方向
 
 ## 核心规则
 
-`myhermes_audit` 是被测运行时之外的独立包。它可以描述输入、环境与结果，但不能导入 `hermes.*`，不能触发模型，也不能解释 MyHermes 内部数据库 schema。
+`myhermes_audit` 是被测运行时之外的独立包。其核心层可以描述输入、环境与结果，但不能导入 `hermes.*`、触发模型或解释 MyHermes 内部数据库 schema；只有隔离适配层能够启动真实运行。
 
 ```text
-myhermes_audit core
-  contracts / datasets / sandbox / fingerprint / ports / CLI
-                         ↑
-              runners / integrations          （P0 尚未实现）
-                         ↓
-              my-hermes public runtime         （被测项目）
+contracts / datasets / sandbox / validators / reports / fingerprint
+                              ↑
+                        runner ports
+                              ↑
+                integrations.myhermes adapter
+                              ↓
+                    my-hermes public runtime
 ```
 
 中间适配层是唯一允许同时认识两侧的层：向上实现 Audit ports 并产出 Audit 合同，向下调用 MyHermes 的公共运行入口。核心层不知道 MyHermes 类名、模型 SDK、SQLite 表或 Background Review driver。
@@ -23,8 +24,13 @@ myhermes_audit core
 | `datasets` | 安全 YAML 读取、严格校验、source 路径解析 | 读取或复制 Fixture 内容 |
 | `sandbox` | Trial 目录隔离、环境覆盖值、受控 Fixture I/O、所有权清理 | 修改全局环境、初始化 MyHermes DB |
 | `fingerprint` | canonical hash、只读 Git 状态、Audit 平台指纹 | checkout、commit、修改 index |
-| `ports` | 未来 Memory/Review adapter 的异步形状 | Provider 或 Runner 实现 |
-| `cli` | `validate` 与 `schema` 静态操作 | `run`、`report`、`compare` |
+| `ports` / `runners/base` | Subject-neutral 扩展与 Trial runner 形状 | MyHermes 导入 |
+| `validators` | 文件、文本、JSON、工具轨迹客观校验 | 模型语义评分 |
+| `reports` | Trial/Case 聚合、nearest-rank 百分位、JSON/终端输出 | 基线比较 |
+| `integrations/myhermes` | Worker 协议、配置、公开 Observation、生命周期 | 核心合同反向依赖 |
+| `cli` | `validate`、`schema` 与 `run` | 并行调度、CI |
+
+父进程模块不导入 `hermes.*`。Worker 在确认 cwd、环境、配置和 Artifact 路径都属于当前 Trial 后才首次导入 MyHermes。每个 Trial 进程退出后，全局配置、模型客户端与注册表状态随进程一起消失，不需要 reload 或清理 `sys.modules`。
 
 ## 与 MyHermes 当前语义的对齐
 
@@ -37,3 +43,5 @@ myhermes_audit core
 ## 扩展边界
 
 任意 JSON 只允许出现在窄作用域：Trial metadata、Execution config overrides、单个 evaluator config、Memory filters/metadata 和少数结果 metadata。Suite、Case、Fixture、Expected、Review 与 Result 的领域结构不能整体退化为无约束字典。
+
+只有 `integrations/myhermes/*` 与 `runners/myhermes.py` 可以认识 MyHermes 边界。Orchestrator 只消费 `TrialRunnerPort`，因此 Validator、聚合和报告不依赖 MyHermes 的 Python 类型或 SQLite 私有表。

@@ -1,0 +1,275 @@
+"""P1 evaluator planning and deterministic validator dispatch."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+from pydantic import Field, StrictBool, model_validator
+
+from myhermes_audit.contracts import AuditCase, MetricResult
+from myhermes_audit.contracts.common import ContractModel, Identifier, NonEmptyText
+from myhermes_audit.contracts.suite import (
+    EvaluatorKind,
+    EvaluatorSpec,
+    ToolTrajectoryExpectation,
+)
+from myhermes_audit.errors import UnsupportedCaseError
+from myhermes_audit.validators.base import (
+    ValidationContext,
+    validator_error_metric,
+)
+from myhermes_audit.validators.file import FileValidator
+from myhermes_audit.validators.json_file import JsonFileValidator
+from myhermes_audit.validators.text import TextValidator
+from myhermes_audit.validators.tool_trajectory import ToolTrajectoryValidator
+
+
+_DETERMINISTIC_GROUPS = frozenset({"all", "files", "texts", "json_values"})
+
+
+class EvaluatorValidationResult(ContractModel):
+    evaluator_id: Identifier
+    required: StrictBool
+    passed: StrictBool
+    metric_names: list[NonEmptyText] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_metric_names(self) -> "EvaluatorValidationResult":
+        if len(self.metric_names) != len(set(self.metric_names)):
+            raise ValueError("metric_names must be unique")
+        return self
+
+
+class ValidatorResultsArtifact(ContractModel):
+    trial_id: Identifier
+    case_id: Identifier
+    evaluator_results: list[EvaluatorValidationResult] = Field(default_factory=list)
+    metrics: list[MetricResult] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_results(self) -> "ValidatorResultsArtifact":
+        evaluator_ids = [item.evaluator_id for item in self.evaluator_results]
+        if len(evaluator_ids) != len(set(evaluator_ids)):
+            raise ValueError("evaluator_results must have unique evaluator_id values")
+        metric_names = [item.metric_name for item in self.metrics]
+        if len(metric_names) != len(set(metric_names)):
+            raise ValueError("validator metrics must have unique metric_name values")
+        declared = {
+            name
+            for evaluator in self.evaluator_results
+            for name in evaluator.metric_names
+        }
+        if declared != set(metric_names):
+            raise ValueError("evaluator metric_names must cover the metrics exactly")
+        return self
+
+    @property
+    def hard_gates_passed(self) -> bool:
+        return all(item.passed for item in self.evaluator_results if item.required)
+
+
+def preflight_evaluators(case: AuditCase) -> None:
+    """Reject unsupported or ambiguous evaluator declarations before execution."""
+
+    covered_groups: set[str] = set()
+    tool_trajectory_covered = False
+    for evaluator in case.evaluators:
+        if evaluator.kind is EvaluatorKind.DETERMINISTIC:
+            group = _deterministic_group(evaluator, case_id=case.case_id)
+            selected = _deterministic_expectations(case, group)
+            if not selected:
+                raise UnsupportedCaseError(
+                    "deterministic evaluator selects no expectations",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                    expectation_group=group,
+                )
+            if group == "all":
+                covered_groups.update({"files", "texts", "json_values"})
+            else:
+                covered_groups.add(group)
+            continue
+        if evaluator.kind is EvaluatorKind.TOOL_TRAJECTORY:
+            _validate_tool_config(evaluator, case_id=case.case_id)
+            if not case.expected.tool_trajectories:
+                raise UnsupportedCaseError(
+                    "tool_trajectory evaluator selects no expectations",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            if any(
+                not _has_p1_tool_constraint(expectation)
+                for expectation in case.expected.tool_trajectories
+            ):
+                raise UnsupportedCaseError(
+                    "tool_trajectory expectations must declare a P1 constraint",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            tool_trajectory_covered = True
+            continue
+        raise UnsupportedCaseError(
+            "evaluator kind is outside the P1 boundary",
+            case_id=case.case_id,
+            evaluator_id=evaluator.evaluator_id,
+            evaluator_kind=evaluator.kind.value,
+        )
+
+    orphan_groups = []
+    for group, values in (
+        ("files", case.expected.files),
+        ("texts", case.expected.texts),
+        ("json_values", case.expected.json_values),
+    ):
+        if values and group not in covered_groups:
+            orphan_groups.append(group)
+    if case.expected.tool_trajectories and not tool_trajectory_covered:
+        orphan_groups.append("tool_trajectories")
+    if orphan_groups:
+        raise UnsupportedCaseError(
+            "P1 expectations must be attached to an evaluator",
+            case_id=case.case_id,
+            expectation_groups=orphan_groups,
+        )
+
+
+def evaluate_case(
+    case: AuditCase,
+    context: ValidationContext,
+    *,
+    trial_id: str,
+) -> ValidatorResultsArtifact:
+    """Run every declared evaluator and preserve failures as explicit metrics."""
+
+    evaluator_results: list[EvaluatorValidationResult] = []
+    metrics: list[MetricResult] = []
+    for evaluator in case.evaluators:
+        current = _evaluate_one(case, evaluator, context)
+        metrics.extend(current)
+        evaluator_results.append(
+            EvaluatorValidationResult(
+                evaluator_id=evaluator.evaluator_id,
+                required=evaluator.required,
+                passed=all(metric.passed is True for metric in current),
+                metric_names=[metric.metric_name for metric in current],
+            )
+        )
+    return ValidatorResultsArtifact(
+        trial_id=trial_id,
+        case_id=case.case_id,
+        evaluator_results=evaluator_results,
+        metrics=metrics,
+    )
+
+
+def _evaluate_one(
+    case: AuditCase,
+    evaluator: EvaluatorSpec,
+    context: ValidationContext,
+) -> list[MetricResult]:
+    if evaluator.kind is EvaluatorKind.DETERMINISTIC:
+        group = _deterministic_group(evaluator, case_id=case.case_id)
+        selected = _deterministic_expectations(case, group)
+    elif evaluator.kind is EvaluatorKind.TOOL_TRAJECTORY:
+        _validate_tool_config(evaluator, case_id=case.case_id)
+        selected = [
+            ("tool_trajectory", index, expectation, ToolTrajectoryValidator())
+            for index, expectation in enumerate(
+                case.expected.tool_trajectories,
+                start=1,
+            )
+        ]
+    else:
+        raise UnsupportedCaseError(
+            "evaluator kind is outside the P1 boundary",
+            evaluator_kind=evaluator.kind.value,
+        )
+
+    results: list[MetricResult] = []
+    for kind, index, expectation, validator in selected:
+        metric_name = f"{evaluator.evaluator_id}.{kind}.{index}"
+        try:
+            result = validator.validate(
+                expectation,
+                context,
+                metric_name=metric_name,
+            )
+        except Exception as exc:
+            source = (
+                "runtime"
+                if evaluator.kind is EvaluatorKind.TOOL_TRAJECTORY
+                else "deterministic"
+            )
+            from myhermes_audit.contracts import MetricSource
+
+            result = validator_error_metric(
+                name=metric_name,
+                source=MetricSource(source),
+                error=exc,
+            )
+        results.append(result)
+    return results
+
+
+def _deterministic_group(evaluator: EvaluatorSpec, *, case_id: str) -> str:
+    unknown = set(evaluator.config) - {"expectation_group"}
+    group = evaluator.config.get("expectation_group", "all")
+    if unknown or type(group) is not str or group not in _DETERMINISTIC_GROUPS:
+        raise UnsupportedCaseError(
+            "invalid deterministic evaluator config",
+            case_id=case_id,
+            evaluator_id=evaluator.evaluator_id,
+        )
+    return group
+
+
+def _validate_tool_config(evaluator: EvaluatorSpec, *, case_id: str) -> None:
+    if evaluator.config:
+        raise UnsupportedCaseError(
+            "P1 tool_trajectory evaluator config must be empty",
+            case_id=case_id,
+            evaluator_id=evaluator.evaluator_id,
+        )
+
+
+def _has_p1_tool_constraint(
+    expectation: ToolTrajectoryExpectation,
+) -> bool:
+    return any(
+        (
+            bool(expectation.required_tools),
+            bool(expectation.forbidden_tools),
+            expectation.minimum_tool_calls is not None,
+            expectation.maximum_tool_calls is not None,
+            bool(expectation.required_successful_tools),
+        )
+    )
+
+
+def _deterministic_expectations(
+    case: AuditCase,
+    group: str,
+) -> list[tuple[str, int, object, object]]:
+    selected: list[tuple[str, int, object, object]] = []
+    groups: Iterable[tuple[str, list, object]] = (
+        ("file", case.expected.files, FileValidator()),
+        ("text", case.expected.texts, TextValidator()),
+        ("json", case.expected.json_values, JsonFileValidator()),
+    )
+    aliases = {"file": "files", "text": "texts", "json": "json_values"}
+    for kind, expectations, validator in groups:
+        if group not in {"all", aliases[kind]}:
+            continue
+        selected.extend(
+            (kind, index, expectation, validator)
+            for index, expectation in enumerate(expectations, start=1)
+        )
+    return selected
+
+
+__all__ = (
+    "EvaluatorValidationResult",
+    "ValidatorResultsArtifact",
+    "evaluate_case",
+    "preflight_evaluators",
+)

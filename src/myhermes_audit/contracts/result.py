@@ -89,16 +89,60 @@ class TrialWarning(ContractModel):
     details: JsonObject = Field(default_factory=dict)
 
 
+class TurnResult(ContractModel):
+    turn_number: PositiveInt
+    user_message: NonEmptyText
+    final_output: StrictStr | None = None
+    runtime_status: NonEmptyText
+    error_type: Identifier | None = None
+    started_at: UtcDatetime
+    finished_at: UtcDatetime
+    duration_ms: NonNegativeInt
+    run_id: Identifier | None = None
+
+    @model_validator(mode="after")
+    def validate_turn_result(self) -> "TurnResult":
+        if self.finished_at < self.started_at:
+            raise ValueError("finished_at cannot be before started_at")
+        return self
+
+
+class TrialRuntimeSummary(ContractModel):
+    iterations: NonNegativeInt = 0
+    tool_batches: NonNegativeInt = 0
+    tool_call_count: NonNegativeInt = 0
+    tool_names: list[NonEmptyText] = Field(default_factory=list)
+    prompt_tokens: NonNegativeInt | None = None
+    completion_tokens: NonNegativeInt | None = None
+    total_tokens: NonNegativeInt | None = None
+
+    @model_validator(mode="after")
+    def validate_runtime_summary(self) -> "TrialRuntimeSummary":
+        if len(self.tool_names) != len(set(self.tool_names)):
+            raise ValueError("tool_names must be unique in first-seen order")
+        if (
+            self.prompt_tokens is not None
+            and self.completion_tokens is not None
+            and self.total_tokens is not None
+            and self.total_tokens != self.prompt_tokens + self.completion_tokens
+        ):
+            raise ValueError("total_tokens must equal prompt_tokens + completion_tokens")
+        return self
+
+
 class TrialResult(ContractModel):
     trial_id: Identifier
     run_id: Identifier
     case_id: Identifier
     trial_number: NonNegativeInt
     status: TrialStatus
+    passed: StrictBool | None = None
     final_output: StrictStr | None = None
     started_at: UtcDatetime | None = None
     finished_at: UtcDatetime | None = None
     duration_ms: NonNegativeInt | None = None
+    turns: list[TurnResult] = Field(default_factory=list)
+    runtime: TrialRuntimeSummary | None = None
     metrics: list[MetricResult] = Field(default_factory=list)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     warnings: list[TrialWarning] = Field(default_factory=list)
@@ -122,10 +166,16 @@ class TrialResult(ContractModel):
         } and self.error is None:
             raise ValueError("failed and environment_error trials require error")
         if self.status in {TrialStatus.PENDING, TrialStatus.RUNNING}:
-            if self.error is not None or self.final_output is not None:
+            if (
+                self.error is not None
+                or self.final_output is not None
+                or self.passed is not None
+            ):
                 raise ValueError(
                     "pending and running trials cannot contain terminal results"
                 )
+        if self.status is not TrialStatus.COMPLETED and self.passed is True:
+            raise ValueError("only completed trials can pass")
         if self.status is TrialStatus.TIMEOUT:
             if self.error is None or self.error.error_type != "timeout":
                 raise ValueError("timeout trials require a stable timeout error")
@@ -143,6 +193,15 @@ class TrialResult(ContractModel):
         artifact_ids = [artifact.artifact_id for artifact in self.artifacts]
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("artifact_id must be unique within a TrialResult")
+        artifact_paths = [artifact.relative_path for artifact in self.artifacts]
+        if len(artifact_paths) != len(set(artifact_paths)):
+            raise ValueError("artifact paths must be unique within a TrialResult")
+        metric_names = [metric.metric_name for metric in self.metrics]
+        if len(metric_names) != len(set(metric_names)):
+            raise ValueError("metric names must be unique within a TrialResult")
+        turn_numbers = [turn.turn_number for turn in self.turns]
+        if turn_numbers != list(range(1, len(turn_numbers) + 1)):
+            raise ValueError("turn numbers must be contiguous from 1")
         return self
 
 
@@ -202,6 +261,10 @@ class AuditSummary(ContractModel):
     trial_count: NonNegativeInt
     passed_count: NonNegativeInt
     pass_rate: StrictFloat = Field(ge=0, le=1)
+    tool_correctness_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
+    duration_p50_ms: NonNegativeInt | None = None
+    duration_p95_ms: NonNegativeInt | None = None
+    total_tokens: NonNegativeInt | None = None
     metadata: JsonObject = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -210,6 +273,20 @@ class AuditSummary(ContractModel):
             raise ValueError("passed_count cannot exceed trial_count")
         if not math.isfinite(self.pass_rate):
             raise ValueError("pass_rate must be finite")
+        expected_rate = (
+            self.passed_count / self.trial_count
+            if self.trial_count
+            else 0.0
+        )
+        if not math.isclose(
+            self.pass_rate,
+            expected_rate,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("pass_rate must equal passed_count / trial_count")
+        if self.case_count == 0 and self.trial_count != 0:
+            raise ValueError("trials require at least one case")
         return self
 
 
@@ -237,4 +314,24 @@ class AuditRunResult(ContractModel):
         trial_ids = [trial.trial_id for trial in self.trials]
         if len(trial_ids) != len(set(trial_ids)):
             raise ValueError("trial_id must be unique within an AuditRunResult")
+        run_ids = [trial.run_id for trial in self.trials]
+        if len(run_ids) != len(set(run_ids)):
+            raise ValueError("Trial run_id must be unique within an AuditRunResult")
+        if self.summary.case_count != len(self.cases):
+            raise ValueError("summary.case_count must match case aggregates")
+        if self.summary.trial_count != len(self.trials):
+            raise ValueError("summary.trial_count must match trials")
+        passed_count = sum(trial.passed is True for trial in self.trials)
+        if self.summary.passed_count != passed_count:
+            raise ValueError("summary.passed_count must match passed trials")
+        aggregate_by_id = {case.case_id: case for case in self.cases}
+        if any(trial.case_id not in aggregate_by_id for trial in self.trials):
+            raise ValueError("every trial must belong to a case aggregate")
+        for case_id, aggregate in aggregate_by_id.items():
+            case_trials = [trial for trial in self.trials if trial.case_id == case_id]
+            if aggregate.trial_count != len(case_trials):
+                raise ValueError("case trial_count must match its trials")
+            case_passed = sum(trial.passed is True for trial in case_trials)
+            if aggregate.passed_count != case_passed:
+                raise ValueError("case passed_count must match its trials")
         return self

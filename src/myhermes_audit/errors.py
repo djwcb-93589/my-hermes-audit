@@ -121,3 +121,54 @@ class FingerprintError(AuditError):
         self.operation = operation
         self.repository = repository
         self.returncode = returncode
+
+
+class RunnerError(AuditError):
+    def __init__(self, message: str, *, code: str = "runner_error", **details: Any) -> None:
+        super().__init__(message, code=code, details=details)
+
+
+class SubjectPreflightError(RunnerError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="subject_preflight_error", **details)
+
+
+class UnsupportedCaseError(RunnerError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="unsupported_case", **details)
+
+
+class WorkerProtocolError(RunnerError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="worker_protocol_error", **details)
+
+
+class WorkerProcessError(RunnerError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="worker_process_error", **details)
+
+
+class WorkerTimeoutError(WorkerProcessError):
+    def __init__(self, message: str = "MyHermes worker timed out", **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "worker_timeout"
+
+
+class FixtureMaterializationError(RunnerError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="fixture_materialization_error", **details)
+
+
+class ConfigBuildError(RunnerError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="config_build_error", **details)
+
+
+class ValidatorError(RunnerError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="validator_error", **details)
+
+
+class ReportError(RunnerError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="report_error", **details)
