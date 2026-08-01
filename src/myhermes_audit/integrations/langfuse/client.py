@@ -71,7 +71,7 @@ from myhermes_audit.security import (
 from myhermes_audit.serialization import canonical_sha256
 
 
-LANGFUSE_ADAPTER_VERSION = "langfuse-v4-runner-replay-v2"
+LANGFUSE_ADAPTER_VERSION = "langfuse-v4-runner-replay-v3"
 
 
 class LangfuseV4Adapter:
@@ -369,14 +369,45 @@ class LangfuseV4Adapter:
             identity.audit_run_id,
         )
         store = PublicationManifestStore(manifest_path)
-        manifest = store.create(
+        manifest = store.load_or_create(
             audit_run_id=identity.audit_run_id,
             experiment_name=identity.experiment_name,
             dataset_name=identity.dataset_name,
+            score_submission_supported=(
+                self._capability_report.score_submission_supported
+            ),
+            score_confirmation_supported=(
+                self._capability_report.score_confirmation_supported
+            ),
         )
+        prior_run_id = manifest.remote_ids.get("dataset_run_id")
+        if prior_run_id is not None and not isinstance(prior_run_id, str):
+            raise PublicationManifestError(
+                "publication Manifest contains an invalid Dataset Run identity"
+            )
+        prior_run_url = manifest.remote_ids.get("dataset_run_url")
+        if prior_run_url is not None and not isinstance(prior_run_url, str):
+            raise PublicationManifestError(
+                "publication Manifest contains an invalid Dataset Run URL"
+            )
+        if isinstance(prior_run_url, str):
+            parsed_prior_url = urlsplit(prior_run_url)
+            if (
+                parsed_prior_url.scheme not in {"http", "https"}
+                or not parsed_prior_url.netloc
+                or parsed_prior_url.username is not None
+                or parsed_prior_url.password is not None
+                or parsed_prior_url.query
+                or parsed_prior_url.fragment
+            ):
+                raise PublicationManifestError(
+                    "publication Manifest contains an unsafe Dataset Run URL"
+                )
         self._dataset_items = items
         self._manifest_store = store
         self._manifest = manifest
+        self._remote_run_id = prior_run_id
+        self._remote_run_url = prior_run_url
         self._active_experiment = active_request
         return identity
 
@@ -394,6 +425,8 @@ class LangfuseV4Adapter:
             self._record_trial_setup_error(error, request.trial.trial_id)
             raise error
         local_trace_id = _local_trace_id(request)
+        publication_key = _trial_publication_key(request, dataset_item_id)
+        content_fingerprint = _trial_content_fingerprint(request, dataset_item_id)
         prior = self._trial_record(request.trial.trial_id)
         if prior is not None:
             try:
@@ -402,6 +435,8 @@ class LangfuseV4Adapter:
                     request,
                     dataset_item_id=dataset_item_id,
                     local_trace_id=local_trace_id,
+                    publication_key=publication_key,
+                    content_fingerprint=content_fingerprint,
                 )
             except AuditError as error:
                 self._record_trial_setup_error(
@@ -413,11 +448,18 @@ class LangfuseV4Adapter:
             if prior.status is PublicationItemStatus.CONFIRMED:
                 return _receipt_from_record(prior, self._remote_run_url)
         else:
+            created_at = datetime.now(timezone.utc)
             prior = TrialPublicationRecord(
+                publication_key=publication_key,
+                audit_run_id=request.experiment.audit_run_id,
                 trial_id=request.trial.trial_id,
                 case_id=request.trial.case_id,
                 dataset_item_id=dataset_item_id,
                 local_trace_id=local_trace_id,
+                content_fingerprint=content_fingerprint,
+                created_at=created_at,
+                updated_at=created_at,
+                confirmation_supported=True,
             )
             self._write_manifest(
                 _replace_trial_record(self._require_manifest(), prior)
@@ -465,6 +507,7 @@ class LangfuseV4Adapter:
                 "status": PublicationItemStatus.PUBLISHING,
                 "attempt_count": prior.attempt_count + 1,
                 "last_attempt_at": attempt_at,
+                "updated_at": attempt_at,
                 "confirmed_at": None,
                 "error": None,
             }
@@ -478,6 +521,7 @@ class LangfuseV4Adapter:
         )
 
         remote_attempted = False
+        runner_returned = False
         try:
             captured: dict[str, str] = {}
 
@@ -533,6 +577,7 @@ class LangfuseV4Adapter:
                     "replay_only": "true",
                 },
             )
+            runner_returned = True
             receipt = self._map_experiment_result(
                 result,
                 request=request,
@@ -546,7 +591,9 @@ class LangfuseV4Adapter:
                     "remote_trace_id": receipt.trace_id,
                     "remote_observation_id": receipt.observation_id,
                     "dataset_run_id": receipt.dataset_run_id,
+                    "experiment_id": receipt.experiment_id,
                     "experiment_item_key": receipt.experiment_item_key,
+                    "updated_at": confirmed_at,
                     "confirmed_at": confirmed_at,
                     "error": None,
                 }
@@ -556,6 +603,7 @@ class LangfuseV4Adapter:
             remote_ids.update(
                 {
                     "dataset_run_id": receipt.dataset_run_id,
+                    "experiment_id": receipt.experiment_id,
                     f"trial:{receipt.trial_id}:trace_id": receipt.trace_id,
                     f"trial:{receipt.trial_id}:observation_id": receipt.observation_id,
                 }
@@ -587,9 +635,14 @@ class LangfuseV4Adapter:
                 update={
                     "status": (
                         PublicationItemStatus.UNCERTAIN
-                        if remote_attempted
+                        if (
+                            runner_returned
+                            or bool(captured)
+                            or (remote_attempted and _is_retryable(exc))
+                        )
                         else PublicationItemStatus.FAILED
                     ),
+                    "updated_at": datetime.now(timezone.utc),
                     "error": error,
                 }
             )
@@ -729,6 +782,12 @@ class LangfuseV4Adapter:
             item.status is PublicationItemStatus.CONFIRMED
             for item in manifest.trial_publications
         )
+        recorded_score_ids = {
+            item.identity.score_id for item in manifest.score_publications
+        }
+        unrecorded_conflicts = sum(
+            item not in recorded_score_ids for item in self._conflicted_score_ids
+        )
         return LangfusePublicationCounts(
             published_trial_count=published_trials,
             associated_experiment_item_count=published_trials,
@@ -745,7 +804,7 @@ class LangfuseV4Adapter:
                 item.status is PublicationItemStatus.FAILED
                 for item in manifest.score_publications
             )
-            + len(self._conflicted_score_ids),
+            + unrecorded_conflicts,
         )
 
     def flush(self) -> None:
@@ -857,6 +916,8 @@ class LangfuseV4Adapter:
                 or not parsed_url.netloc
                 or parsed_url.username is not None
                 or parsed_url.password is not None
+                or parsed_url.query
+                or parsed_url.fragment
             ):
                 raise ExperimentAssociationError(
                     "Experiment Runner returned an unsafe Dataset Run URL",
@@ -877,6 +938,7 @@ class LangfuseV4Adapter:
             trace_id=trace_id,
             observation_id=observation_id,
             dataset_run_id=dataset_run_id,
+            experiment_id=experiment_id,
             url=url,
         )
 
@@ -920,9 +982,21 @@ class LangfuseV4Adapter:
             stable_timestamp=stable_timestamp,
             value_hash=value_hash,
         )
+        publication_key = _score_publication_key(
+            request,
+            receipt,
+            score_id=score_id,
+        )
         existing = self._score_record(score_id)
         if existing is not None:
-            if _identity_key(existing.identity) != _identity_key(identity):
+            if (
+                existing.publication_key != publication_key
+                or existing.audit_run_id != request.experiment.audit_run_id
+                or existing.dataset_item_id != receipt.dataset_item_id
+                or existing.dataset_run_id != receipt.dataset_run_id
+                or existing.experiment_id != receipt.experiment_id
+                or _identity_key(existing.identity) != _identity_key(identity)
+            ):
                 error = ScoreIdentityError(
                     "stable Score ID maps to different identity fields",
                     score_id=score_id,
@@ -941,11 +1015,46 @@ class LangfuseV4Adapter:
                 )
                 self._record_score_conflict(error, request.trial.trial_id)
                 raise error
+            if existing.content_fingerprint != value_hash:
+                error = ScorePublicationConflictError(
+                    "Score publication fingerprint conflicts with its stable identity",
+                    score_id=score_id,
+                    trial_id=request.trial.trial_id,
+                )
+                self._record_score_conflict(error, request.trial.trial_id)
+                raise error
+            confirmation_supported = (
+                self._capability_report.score_confirmation_supported
+            )
+            if existing.confirmation_supported != confirmation_supported:
+                existing = existing.model_copy(
+                    update={
+                        "confirmation_supported": confirmation_supported,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                )
+                self._write_manifest(
+                    _replace_score_record(self._require_manifest(), existing)
+                )
             return existing
 
         stable_timestamps = dict(manifest.stable_timestamps)
         stable_timestamps[timestamp_key] = stable_timestamp
-        record = ScorePublicationRecord(identity=identity)
+        created_at = datetime.now(timezone.utc)
+        record = ScorePublicationRecord(
+            publication_key=publication_key,
+            audit_run_id=request.experiment.audit_run_id,
+            dataset_item_id=receipt.dataset_item_id,
+            dataset_run_id=receipt.dataset_run_id,
+            experiment_id=receipt.experiment_id,
+            content_fingerprint=value_hash,
+            created_at=created_at,
+            updated_at=created_at,
+            confirmation_supported=(
+                self._capability_report.score_confirmation_supported
+            ),
+            identity=identity,
+        )
         manifest = _replace_score_record(manifest, record)
         self._write_manifest(
             _update_manifest(
@@ -968,6 +1077,7 @@ class LangfuseV4Adapter:
                 "status": PublicationItemStatus.PUBLISHING,
                 "attempt_count": record.attempt_count + 1,
                 "last_attempt_at": attempt_at,
+                "updated_at": attempt_at,
                 "confirmed_at": None,
                 "error": None,
             }
@@ -979,7 +1089,8 @@ class LangfuseV4Adapter:
                 status=PublicationManifestStatus.PUBLISHING,
             )
         )
-        remote_attempted = False
+        submission_returned = False
+        recorded_confirmation_error: AuditError | None = None
         try:
             metadata = {
                 key: value
@@ -998,7 +1109,6 @@ class LangfuseV4Adapter:
                 score.comment,
                 sensitive_values=self._sensitive_values,
             )
-            remote_attempted = True
             self._client.create_score(
                 name=score.name,
                 value=score.value,
@@ -1010,23 +1120,52 @@ class LangfuseV4Adapter:
                 metadata=metadata,
                 timestamp=record.identity.stable_timestamp,
             )
+            submission_returned = True
             self._client.flush()
-            confirmed = publishing.model_copy(
+            if self._capability_report.score_confirmation_supported:
+                recorded_confirmation_error = ScoreIdempotencyError(
+                    "Langfuse Score confirmation is advertised but no supported "
+                    "high-level verifier is configured",
+                    score_id=record.identity.score_id,
+                    trial_id=request.trial.trial_id,
+                    retryable=False,
+                    confirmation_supported=True,
+                )
+            else:
+                recorded_confirmation_error = ScoreIdempotencyError(
+                    "Langfuse Score was submitted but the supported high-level SDK "
+                    "cannot reliably confirm remote persistence",
+                    score_id=record.identity.score_id,
+                    trial_id=request.trial.trial_id,
+                    retryable=True,
+                    confirmation_supported=False,
+                )
+            error = _publish_error(
+                phase="score_confirmation",
+                error=recorded_confirmation_error,
+                trial_id=request.trial.trial_id,
+            )
+            uncertain = publishing.model_copy(
                 update={
-                    "status": PublicationItemStatus.CONFIRMED,
-                    "remote_id": record.identity.score_id,
-                    "confirmed_at": datetime.now(timezone.utc),
-                    "error": None,
+                    "status": PublicationItemStatus.UNCERTAIN,
+                    "remote_id": None,
+                    "updated_at": datetime.now(timezone.utc),
+                    "confirmed_at": None,
+                    "error": error,
                 }
             )
-            manifest = _replace_score_record(self._require_manifest(), confirmed)
+            manifest = _replace_score_record(self._require_manifest(), uncertain)
             self._write_manifest(
                 _update_manifest(
                     manifest,
-                    last_error=_last_unresolved_error(manifest),
+                    status=_error_manifest_status(manifest),
+                    last_error=error,
                 )
             )
+            raise recorded_confirmation_error
         except Exception as exc:
+            if exc is recorded_confirmation_error:
+                raise
             mapped = (
                 exc
                 if isinstance(exc, AuditError)
@@ -1048,9 +1187,10 @@ class LangfuseV4Adapter:
                 update={
                     "status": (
                         PublicationItemStatus.UNCERTAIN
-                        if remote_attempted
+                        if submission_returned or _is_retryable(exc)
                         else PublicationItemStatus.FAILED
                     ),
+                    "updated_at": datetime.now(timezone.utc),
                     "error": error,
                 }
             )
@@ -1091,6 +1231,18 @@ class LangfuseV4Adapter:
             error=error,
             trial_id=trial_id,
         )
+        if isinstance(score_id, str) and score_id:
+            record = self._score_record(score_id)
+            if record is not None:
+                failed = record.model_copy(
+                    update={
+                        "status": PublicationItemStatus.FAILED,
+                        "updated_at": datetime.now(timezone.utc),
+                        "confirmed_at": None,
+                        "error": publish_error,
+                    }
+                )
+                manifest = _replace_score_record(manifest, failed)
         self._write_manifest(
             _update_manifest(
                 manifest,
@@ -1113,9 +1265,11 @@ class LangfuseV4Adapter:
         )
         manifest = self._require_manifest()
         if record is not None:
+            failed_at = datetime.now(timezone.utc)
             failed = record.model_copy(
                 update={
                     "status": PublicationItemStatus.FAILED,
+                    "updated_at": failed_at,
                     "confirmed_at": None,
                     "error": publish_error,
                 }
@@ -1308,6 +1462,35 @@ def _local_trace_id(request: LangfuseTrialRequest) -> str:
     ).hexdigest()[:32]
 
 
+def _trial_publication_key(
+    request: LangfuseTrialRequest,
+    dataset_item_id: str,
+) -> str:
+    return canonical_sha256(
+        {
+            "audit_run_id": request.experiment.audit_run_id,
+            "trial_id": request.trial.trial_id,
+            "dataset_item_id": dataset_item_id,
+            "experiment_name": request.experiment.experiment_name,
+        }
+    )
+
+
+def _trial_content_fingerprint(
+    request: LangfuseTrialRequest,
+    dataset_item_id: str,
+) -> str:
+    return canonical_sha256(
+        {
+            "trial": request.trial.model_dump(mode="json"),
+            "dataset_item_id": dataset_item_id,
+            "data_classification": request.data_classification.value,
+            "no_content": request.no_content,
+            "adapter_version": LANGFUSE_ADAPTER_VERSION,
+        }
+    )
+
+
 def _score_id(
     *,
     trace_id: str,
@@ -1319,6 +1502,24 @@ def _score_id(
         (trace_id, score_name, evaluator_version, trial_id)
     )
     return sha256(stable_input.encode("utf-8")).hexdigest()
+
+
+def _score_publication_key(
+    request: LangfuseTrialRequest,
+    receipt: LangfuseTrialPublishReceipt,
+    *,
+    score_id: str,
+) -> str:
+    return canonical_sha256(
+        {
+            "audit_run_id": request.experiment.audit_run_id,
+            "trial_id": request.trial.trial_id,
+            "dataset_item_id": receipt.dataset_item_id,
+            "dataset_run_id": receipt.dataset_run_id,
+            "experiment_id": receipt.experiment_id,
+            "score_id": score_id,
+        }
+    )
 
 
 def _safe_score_comment(
@@ -1350,11 +1551,16 @@ def _validate_trial_record(
     *,
     dataset_item_id: str,
     local_trace_id: str,
+    publication_key: str,
+    content_fingerprint: str,
 ) -> None:
     if (
-        record.case_id != request.trial.case_id
+        record.publication_key != publication_key
+        or record.audit_run_id != request.experiment.audit_run_id
+        or record.case_id != request.trial.case_id
         or record.dataset_item_id != dataset_item_id
         or record.local_trace_id != local_trace_id
+        or record.content_fingerprint != content_fingerprint
     ):
         raise PublicationStateError(
             "Trial publication state conflicts with the replay payload",
@@ -1372,6 +1578,7 @@ def _receipt_from_record(
             record.remote_trace_id,
             record.remote_observation_id,
             record.dataset_run_id,
+            record.experiment_id,
             record.experiment_item_key,
         )
     ):
@@ -1386,6 +1593,7 @@ def _receipt_from_record(
         trace_id=record.remote_trace_id,
         observation_id=record.remote_observation_id,
         dataset_run_id=record.dataset_run_id,
+        experiment_id=record.experiment_id,
         url=url,
     )
 
@@ -1502,6 +1710,8 @@ def _publish_error(
 
 
 def _is_retryable(error: BaseException) -> bool:
+    if isinstance(error, AuditError) and error.details.get("retryable") is True:
+        return True
     status = getattr(error, "status_code", None)
     if status in {408, 409, 429} or (type(status) is int and status >= 500):
         return True

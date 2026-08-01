@@ -19,7 +19,9 @@ from myhermes_audit.errors import (
 LANGFUSE_MINIMUM_VERSION = "4.7.0"
 LANGFUSE_MAXIMUM_MAJOR = 5
 LANGFUSE_VERSION_RANGE = f">={LANGFUSE_MINIMUM_VERSION},<{LANGFUSE_MAXIMUM_MAJOR}"
-SCORE_IDEMPOTENCY_STRATEGY = "stable_score_id_create_or_update_then_flush"
+SCORE_IDEMPOTENCY_STRATEGY = (
+    "stable_score_id_submission_with_uncertain_remote_confirmation"
+)
 _MINIMUM_VERSION_PARTS = (4, 7, 0)
 _FINAL_VERSION_RE = re.compile(
     r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
@@ -46,6 +48,8 @@ def probe_langfuse_capabilities() -> LangfuseCapabilityReport:
             ],
             experiment_strategy=ExperimentStrategy.RUNNER_REPLAY,
             score_idempotency_strategy=SCORE_IDEMPOTENCY_STRATEGY,
+            score_submission_supported=False,
+            score_confirmation_supported=False,
         )
 
     try:
@@ -65,6 +69,8 @@ def probe_langfuse_capabilities() -> LangfuseCapabilityReport:
             ],
             experiment_strategy=ExperimentStrategy.RUNNER_REPLAY,
             score_idempotency_strategy=SCORE_IDEMPOTENCY_STRATEGY,
+            score_submission_supported=False,
+            score_confirmation_supported=False,
         )
 
     client_type = getattr(langfuse, "Langfuse", None)
@@ -88,6 +94,20 @@ def probe_langfuse_capabilities() -> LangfuseCapabilityReport:
     warnings.append(
         "Experiment publication uses the official runner with a local-result replay task."
     )
+    score_submission_supported = capabilities.get(
+        "score_submission_supported",
+        False,
+    )
+    if score_submission_supported:
+        warnings.append(
+            "The supported high-level SDK can submit Scores but does not provide a "
+            "public remote-confirmation method; submitted Scores remain uncertain."
+        )
+    else:
+        warnings.append(
+            "The installed SDK does not expose the required public Score submission "
+            "method."
+        )
     return LangfuseCapabilityReport(
         installed=True,
         version=version,
@@ -98,6 +118,8 @@ def probe_langfuse_capabilities() -> LangfuseCapabilityReport:
         warnings=warnings,
         experiment_strategy=ExperimentStrategy.RUNNER_REPLAY,
         score_idempotency_strategy=SCORE_IDEMPOTENCY_STRATEGY,
+        score_submission_supported=score_submission_supported,
+        score_confirmation_supported=False,
     )
 
 
@@ -209,7 +231,7 @@ def _capability_flags(client_type: Any, langfuse_module: Any) -> dict[str, bool]
             propagate_attributes,
             {"session_id", "metadata", "tags", "trace_name"},
         ),
-        "score_create_or_update": _has_method(
+        "score_submission_supported": _has_method(
             client_type,
             "create_score",
             {

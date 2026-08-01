@@ -36,6 +36,8 @@ class PublicationManifestStore:
         audit_run_id: str,
         experiment_name: str,
         dataset_name: str,
+        score_submission_supported: bool = False,
+        score_confirmation_supported: bool = False,
     ) -> LangfusePublicationManifest:
         if self.path.exists() or self.path.is_symlink():
             raise PublicationManifestError(
@@ -49,9 +51,60 @@ class PublicationManifestStore:
             dataset_name=dataset_name,
             created_at=now,
             updated_at=now,
+            score_submission_supported=score_submission_supported,
+            score_confirmation_supported=score_confirmation_supported,
             status=PublicationManifestStatus.PENDING,
         )
         return self.write(manifest)
+
+    def load_or_create(
+        self,
+        *,
+        audit_run_id: str,
+        experiment_name: str,
+        dataset_name: str,
+        score_submission_supported: bool = False,
+        score_confirmation_supported: bool = False,
+    ) -> LangfusePublicationManifest:
+        if self.path.is_symlink():
+            raise PublicationManifestError(
+                "publication Manifest cannot be a symbolic link",
+                path=str(self.path),
+            )
+        if not self.path.exists() and not self.path.is_symlink():
+            return self.create(
+                audit_run_id=audit_run_id,
+                experiment_name=experiment_name,
+                dataset_name=dataset_name,
+                score_submission_supported=score_submission_supported,
+                score_confirmation_supported=score_confirmation_supported,
+            )
+        manifest = self.read()
+        if (
+            manifest.audit_run_id != audit_run_id
+            or manifest.experiment_name != experiment_name
+            or manifest.dataset_name != dataset_name
+        ):
+            raise PublicationManifestError(
+                "publication Manifest identity conflicts with the Audit run",
+                path=str(self.path),
+            )
+        if (
+            manifest.score_submission_supported != score_submission_supported
+            or manifest.score_confirmation_supported
+            != score_confirmation_supported
+        ):
+            payload = manifest.model_dump(mode="python")
+            payload.update(
+                {
+                    "score_submission_supported": score_submission_supported,
+                    "score_confirmation_supported": score_confirmation_supported,
+                }
+            )
+            manifest = self.write(
+                LangfusePublicationManifest.model_validate(payload)
+            )
+        return manifest
 
     def read(self) -> LangfusePublicationManifest:
         try:

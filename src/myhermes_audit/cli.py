@@ -207,10 +207,6 @@ def _schema_command(output: Path | None) -> int:
 
 
 def _run_command(arguments: argparse.Namespace) -> int:
-    from myhermes_audit.integrations.langfuse import (
-        LangfuseV4Adapter,
-        build_dataset_sync_plan,
-    )
     from myhermes_audit.integrations.judge import OpenAICompatibleJudgeAdapter
     from myhermes_audit.judges import JudgeService
     from myhermes_audit.reports import (
@@ -233,24 +229,9 @@ def _run_command(arguments: argparse.Namespace) -> int:
         subject_config=arguments.subject_config,
     )
     judge_adapter = None
-    langfuse_adapter = None
     try:
         if arguments.judge:
             judge_adapter = OpenAICompatibleJudgeAdapter.from_environment()
-        langfuse_dataset = None
-        if arguments.langfuse:
-            plan = build_dataset_sync_plan(
-                suite,
-                dataset_name=arguments.dataset_name,
-                dry_run=False,
-                no_content=arguments.langfuse_no_content,
-            )
-            langfuse_adapter = LangfuseV4Adapter.from_environment(
-                report_path=output
-            )
-            langfuse_adapter.check_connection()
-            langfuse_dataset = langfuse_adapter.sync_dataset(plan)
-
         runner = MyHermesTrialRunner(
             subject_repo=arguments.subject_repo,
             subject_config=arguments.subject_config,
@@ -260,17 +241,33 @@ def _run_command(arguments: argparse.Namespace) -> int:
             runner=runner,
             subject_repo=arguments.subject_repo,
             judge_service=JudgeService(judge_adapter),
-            langfuse=langfuse_adapter,
-            langfuse_dataset=langfuse_dataset,
-            experiment_name=arguments.experiment_name,
-            langfuse_no_content=arguments.langfuse_no_content,
         )
         outcome = orchestrator.run(
             suite,
             cases=selected,
             preserve_on_failure=arguments.preserve_on_failure,
         )
+        # Persist the complete local fact before importing or calling Langfuse.
         write_json_report(output, outcome.result)
+        if arguments.langfuse:
+            from myhermes_audit.integrations.langfuse.publisher import (
+                publish_audit_result,
+            )
+
+            published_result = publish_audit_result(
+                suite=suite,
+                cases=selected,
+                result=outcome.result,
+                report_path=output,
+                dataset_name=arguments.dataset_name,
+                experiment_name=arguments.experiment_name,
+                no_content=arguments.langfuse_no_content,
+            )
+            outcome = type(outcome)(
+                result=published_result,
+                preserved_sandboxes=outcome.preserved_sandboxes,
+            )
+            write_json_report(output, outcome.result)
         sys.stdout.write(render_console_summary(outcome.result))
         print(f"Report:             {output}")
         if outcome.preserved_sandboxes:
@@ -283,12 +280,8 @@ def _run_command(arguments: argparse.Namespace) -> int:
         has_integration_failure = bool(outcome.result.integration_errors)
         return 1 if has_trial_failure or has_integration_failure else 0
     finally:
-        try:
-            if judge_adapter is not None:
-                judge_adapter.shutdown()
-        finally:
-            if langfuse_adapter is not None:
-                langfuse_adapter.shutdown()
+        if judge_adapter is not None:
+            judge_adapter.shutdown()
 
 
 def _sync_command(arguments: argparse.Namespace) -> int:
@@ -403,6 +396,14 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
             "Langfuse Score idempotency: "
             f"{langfuse_capability.score_idempotency_strategy}"
         )
+        print(
+            "Langfuse Score submission supported: "
+            f"{'yes' if langfuse_capability.score_submission_supported else 'no'}"
+        )
+        print(
+            "Langfuse Score confirmation supported: "
+            f"{'yes' if langfuse_capability.score_confirmation_supported else 'no'}"
+        )
         for name in (
             "dataset_read",
             "dataset_create",
@@ -410,7 +411,7 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
             "experiment_runner",
             "experiment_item_association",
             "trace_observation",
-            "score_create_or_update",
+            "score_submission_supported",
         ):
             print(
                 f"Langfuse capability {name}: "
@@ -453,6 +454,15 @@ def _validate_run_integration_options(arguments: argparse.Namespace) -> None:
                 code="langfuse_config_error",
                 details={"missing_options": missing},
             )
+        dataset_name = arguments.dataset_name.strip()
+        if len(dataset_name) > 200 or any(
+            ord(character) < 32 for character in dataset_name
+        ):
+            raise AuditError(
+                "--dataset-name must be a safe name up to 200 characters",
+                code="langfuse_config_error",
+                details={"field": "--dataset-name"},
+            )
         experiment_name = arguments.experiment_name.strip()
         if len(experiment_name) > 200 or any(
             ord(character) < 32 for character in experiment_name
@@ -462,6 +472,7 @@ def _validate_run_integration_options(arguments: argparse.Namespace) -> None:
                 code="langfuse_config_error",
                 details={"field": "--experiment-name"},
             )
+        arguments.dataset_name = dataset_name
         arguments.experiment_name = experiment_name
         return
     unused = []

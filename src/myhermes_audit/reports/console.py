@@ -15,6 +15,12 @@ def render_console_summary(result: AuditRunResult) -> str:
         f"MyHermes Audit: {result.suite_id}",
         "",
         f"Subject commit:    {result.subject_fingerprint.git_commit}",
+        "Local execution:   "
+        + (
+            "unknown"
+            if result.local_execution_status is None
+            else result.local_execution_status.value
+        ),
         f"Cases:             {summary.case_count}",
         f"Trials:            {summary.trial_count}",
         f"Passed:            {summary.passed_count}",
@@ -35,9 +41,15 @@ def render_console_summary(result: AuditRunResult) -> str:
         lines.append(f"Langfuse errors:   {len(result.integration_errors)}")
     publication = result.langfuse_publish_result
     if publication is not None:
+        remote_status = result.remote_publication_status or publication.status
+        manifest_path = (
+            "unavailable"
+            if publication.publication_manifest is None
+            else publication.publication_manifest.path
+        )
         lines.extend(
             (
-                f"Langfuse publish:   {publication.status.value}",
+                f"Remote publication: {remote_status.value}",
                 f"Langfuse dataset:   {publication.dataset_sync_status.value}",
                 "Langfuse traces:    "
                 f"{publication.published_trial_count}/{summary.trial_count}",
@@ -56,7 +68,7 @@ def render_console_summary(result: AuditRunResult) -> str:
                 f"- skipped: {publication.skipped_score_count}",
                 f"- uncertain: {publication.uncertain_score_count}",
                 f"- failed: {publication.failed_score_count}",
-                "Publication Manifest: " + publication.publication_manifest.path,
+                "Publication Manifest: " + manifest_path,
             )
         )
     failures = [trial for trial in result.trials if trial.passed is not True]

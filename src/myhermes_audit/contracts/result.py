@@ -33,6 +33,7 @@ from myhermes_audit.contracts.langfuse import (
     LangfuseExperimentIdentity,
     LangfusePublishError,
     LangfusePublishResult,
+    LangfusePublishStatus,
 )
 
 
@@ -44,6 +45,11 @@ class TrialStatus(str, Enum):
     CANCELLED = "cancelled"
     TIMEOUT = "timeout"
     ENVIRONMENT_ERROR = "environment_error"
+
+
+class LocalExecutionStatus(str, Enum):
+    COMPLETED = "completed"
+    COMPLETED_WITH_FAILURES = "completed_with_failures"
 
 
 class MetricSource(str, Enum):
@@ -417,6 +423,8 @@ class AuditRunResult(ContractModel):
     cases: list[CaseAggregate] = Field(default_factory=list)
     summary: AuditSummary
     judge_summary: JudgeRunSummary = Field(default_factory=JudgeRunSummary)
+    local_execution_status: LocalExecutionStatus | None = None
+    remote_publication_status: LangfusePublishStatus | None = None
     experiment_identity: LangfuseExperimentIdentity | None = None
     langfuse_publish_result: LangfusePublishResult | None = None
     integration_errors: list[LangfusePublishError] = Field(default_factory=list)
@@ -438,13 +446,35 @@ class AuditRunResult(ContractModel):
             raise ValueError("summary.case_count must match case aggregates")
         if self.summary.trial_count != len(self.trials):
             raise ValueError("summary.trial_count must match trials")
+        expected_local_status = (
+            LocalExecutionStatus.COMPLETED
+            if self.summary.passed_count == self.summary.trial_count
+            else LocalExecutionStatus.COMPLETED_WITH_FAILURES
+        )
+        if self.local_execution_status is None:
+            object.__setattr__(self, "local_execution_status", expected_local_status)
+        elif self.local_execution_status is not expected_local_status:
+            raise ValueError("local_execution_status must match local Trial results")
         if self.langfuse_publish_result is None and (
-            self.experiment_identity is not None or self.integration_errors
+            self.remote_publication_status is not None
+            or self.experiment_identity is not None
+            or self.integration_errors
         ):
             raise ValueError(
-                "Langfuse identity/errors require a publication result"
+                "remote publication status/identity/errors require a publication result"
             )
         if self.langfuse_publish_result is not None:
+            expected_remote_status = self.langfuse_publish_result.status
+            if self.remote_publication_status is None:
+                object.__setattr__(
+                    self,
+                    "remote_publication_status",
+                    expected_remote_status,
+                )
+            elif self.remote_publication_status is not expected_remote_status:
+                raise ValueError(
+                    "remote_publication_status must match the publication result"
+                )
             if self.experiment_identity != self.langfuse_publish_result.experiment:
                 raise ValueError(
                     "experiment_identity must match the Langfuse publication result"

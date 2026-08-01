@@ -157,6 +157,7 @@ class LangfuseTrialPublishReceipt(ContractModel):
     trace_id: NonEmptyText
     observation_id: NonEmptyText
     dataset_run_id: NonEmptyText
+    experiment_id: NonEmptyText
     url: StrictStr | None = None
 
 
@@ -181,15 +182,22 @@ class LangfusePublishError(ContractModel):
 
 
 class TrialPublicationRecord(ContractModel):
+    publication_key: Sha256Digest
+    audit_run_id: Identifier
     trial_id: Identifier
     case_id: Identifier
     dataset_item_id: NonEmptyText
     local_trace_id: NonEmptyText
+    content_fingerprint: Sha256Digest
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
+    confirmation_supported: StrictBool = True
     status: PublicationItemStatus = PublicationItemStatus.PENDING
     attempt_count: NonNegativeInt = 0
     remote_trace_id: StrictStr | None = None
     remote_observation_id: StrictStr | None = None
     dataset_run_id: StrictStr | None = None
+    experiment_id: StrictStr | None = None
     experiment_item_key: StrictStr | None = None
     last_attempt_at: UtcDatetime | None = None
     confirmed_at: UtcDatetime | None = None
@@ -201,8 +209,11 @@ class TrialPublicationRecord(ContractModel):
             self.remote_trace_id,
             self.remote_observation_id,
             self.dataset_run_id,
+            self.experiment_id,
             self.experiment_item_key,
         )
+        if self.updated_at < self.created_at:
+            raise ValueError("Trial publication update cannot precede creation")
         if self.status is PublicationItemStatus.CONFIRMED:
             if any(value is None for value in remote_values) or self.confirmed_at is None:
                 raise ValueError("confirmed Trial publication requires all remote identities")
@@ -217,6 +228,15 @@ class TrialPublicationRecord(ContractModel):
 
 
 class ScorePublicationRecord(ContractModel):
+    publication_key: Sha256Digest
+    audit_run_id: Identifier
+    dataset_item_id: NonEmptyText
+    dataset_run_id: NonEmptyText
+    experiment_id: NonEmptyText
+    content_fingerprint: Sha256Digest
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
+    confirmation_supported: StrictBool
     identity: ScorePublicationIdentity
     status: PublicationItemStatus = PublicationItemStatus.PENDING
     attempt_count: NonNegativeInt = 0
@@ -227,7 +247,13 @@ class ScorePublicationRecord(ContractModel):
 
     @model_validator(mode="after")
     def validate_publication_state(self) -> "ScorePublicationRecord":
+        if self.updated_at < self.created_at:
+            raise ValueError("Score publication update cannot precede creation")
         if self.status is PublicationItemStatus.CONFIRMED:
+            if not self.confirmation_supported:
+                raise ValueError(
+                    "confirmed Score publication requires confirmation capability"
+                )
             if self.remote_id is None or self.confirmed_at is None:
                 raise ValueError("confirmed Score publication requires remote identity")
             if self.error is not None:
@@ -250,6 +276,8 @@ class LangfusePublicationManifest(ContractModel):
     score_publications: list[ScorePublicationRecord] = Field(default_factory=list)
     remote_ids: JsonObject = Field(default_factory=dict)
     stable_timestamps: dict[NonEmptyText, UtcDatetime] = Field(default_factory=dict)
+    score_submission_supported: StrictBool = False
+    score_confirmation_supported: StrictBool = False
     status: PublicationManifestStatus = PublicationManifestStatus.PENDING
     last_error: LangfusePublishError | None = None
 
@@ -257,12 +285,38 @@ class LangfusePublicationManifest(ContractModel):
     def validate_manifest(self) -> "LangfusePublicationManifest":
         if self.updated_at < self.created_at:
             raise ValueError("Manifest updated_at cannot precede created_at")
+        if self.score_confirmation_supported and not self.score_submission_supported:
+            raise ValueError("Manifest Score confirmation requires submission support")
         trial_ids = [item.trial_id for item in self.trial_publications]
         if len(trial_ids) != len(set(trial_ids)):
             raise ValueError("Manifest Trial identities must be unique")
+        trial_keys = [item.publication_key for item in self.trial_publications]
+        if len(trial_keys) != len(set(trial_keys)):
+            raise ValueError("Manifest Trial publication keys must be unique")
         score_ids = [item.identity.score_id for item in self.score_publications]
         if len(score_ids) != len(set(score_ids)):
             raise ValueError("Manifest Score identities must be unique")
+        score_keys = [item.publication_key for item in self.score_publications]
+        if len(score_keys) != len(set(score_keys)):
+            raise ValueError("Manifest Score publication keys must be unique")
+        if any(
+            item.audit_run_id != self.audit_run_id
+            for item in (*self.trial_publications, *self.score_publications)
+        ):
+            raise ValueError("Manifest publications must match the Audit run")
+        trial_by_id = {item.trial_id: item for item in self.trial_publications}
+        for score in self.score_publications:
+            trial = trial_by_id.get(score.identity.trial_id)
+            if trial is None:
+                raise ValueError("Manifest Score publication requires its Trial record")
+            if (
+                score.dataset_item_id != trial.dataset_item_id
+                or score.dataset_run_id != trial.dataset_run_id
+                or score.experiment_id != trial.experiment_id
+            ):
+                raise ValueError(
+                    "Manifest Score publication must match its Trial remote identities"
+                )
         if self.status is PublicationManifestStatus.PUBLISHED:
             if self.last_error:
                 raise ValueError("published Manifest cannot contain a last error")
@@ -301,6 +355,8 @@ class LangfuseCapabilityReport(ContractModel):
     warnings: list[NonEmptyText] = Field(default_factory=list)
     experiment_strategy: ExperimentStrategy
     score_idempotency_strategy: NonEmptyText
+    score_submission_supported: StrictBool
+    score_confirmation_supported: StrictBool
 
     @model_validator(mode="after")
     def validate_capabilities(self) -> "LangfuseCapabilityReport":
@@ -313,6 +369,15 @@ class LangfuseCapabilityReport(ContractModel):
             raise ValueError("compatible SDK must be installed with every capability")
         if not self.installed and self.version is not None:
             raise ValueError("uninstalled SDK cannot report a version")
+        if self.score_confirmation_supported and not self.score_submission_supported:
+            raise ValueError("Score confirmation requires Score submission support")
+        if (
+            self.capabilities.get("score_submission_supported", False)
+            is not self.score_submission_supported
+        ):
+            raise ValueError(
+                "Score submission field must match the capability flags"
+            )
         return self
 
 
@@ -335,7 +400,7 @@ class LangfusePublishResult(ContractModel):
     skipped_score_count: NonNegativeInt = 0
     uncertain_score_count: NonNegativeInt = 0
     failed_score_count: NonNegativeInt = 0
-    publication_manifest: PublicationManifestRef
+    publication_manifest: PublicationManifestRef | None = None
     errors: list[LangfusePublishError] = Field(default_factory=list)
     warnings: list[NonEmptyText] = Field(default_factory=list)
 
