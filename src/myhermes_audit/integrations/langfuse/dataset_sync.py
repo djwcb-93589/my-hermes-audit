@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import mimetypes
 import os
 import uuid
+from pathlib import PurePosixPath
 
 from myhermes_audit.contracts import (
     AuditCase,
@@ -26,6 +26,19 @@ from myhermes_audit.serialization import canonical_sha256
 
 
 _DATASET_ITEM_NAMESPACE = uuid.UUID("6a1dc734-14f4-5e72-9b75-9d30e373e34b")
+_SAFE_FIXTURE_CONTENT_TYPES = {
+    ".csv": "text/csv",
+    ".html": "text/html",
+    ".json": "application/json",
+    ".jsonl": "application/x-ndjson",
+    ".md": "text/markdown",
+    ".py": "text/x-python",
+    ".toml": "application/toml",
+    ".txt": "text/plain",
+    ".xml": "application/xml",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+}
 
 
 def build_dataset_sync_plan(
@@ -79,6 +92,10 @@ def build_dataset_sync_plan(
             no_content=no_content,
             sensitive_values=sensitive_values,
         )
+        fixture_summary = _fixture_manifest_summary(
+            case,
+            synthetic=classification is DataClassification.SYNTHETIC,
+        )
         publication_metadata = {
             "audit_suite_id": suite.suite_id,
             "audit_suite_sha256": suite_hash,
@@ -90,10 +107,7 @@ def build_dataset_sync_plan(
                 no_content or classification is DataClassification.SENSITIVE
             ),
             "fixture_content_uploaded": False,
-            "fixture_files": _fixture_file_summaries(
-                case,
-                synthetic=classification is DataClassification.SYNTHETIC,
-            ),
+            **fixture_summary,
             "memory_fixture_uploaded": False,
             "skill_content_uploaded": False,
             "database_fixture_uploaded": False,
@@ -206,18 +220,18 @@ def _case_expectations(case: AuditCase) -> dict:
     }
 
 
-def _fixture_file_summaries(
+def _fixture_manifest_summary(
     case: AuditCase,
     *,
     synthetic: bool,
-) -> list[dict]:
+) -> dict[str, int | str]:
     summaries = []
     for fixture in case.fixture.files:
+        target = PurePosixPath(fixture.path.replace("\\", "/")).as_posix()
         if fixture.content is not None:
             content = fixture.content.encode("utf-8")
             digest = hashlib.sha256(content).hexdigest()
             size_bytes = len(content)
-            source_id = "inline"
         else:
             source = fixture.resolved_source
             if source is None:
@@ -241,22 +255,36 @@ def _fixture_file_summaries(
                     exception_type=type(exc).__name__,
                 ) from exc
             digest = hasher.hexdigest()
-            source_id = fixture.source or "resolved-source"
         summaries.append(
             {
-                "target": fixture.path,
-                "source_id": source_id,
+                "target": target,
                 "sha256": digest,
                 "size_bytes": size_bytes,
-                "content_type": (
-                    mimetypes.guess_type(fixture.path)[0]
-                    or "application/octet-stream"
-                ),
+                "content_type": _safe_fixture_content_type(target),
                 "synthetic": synthetic,
-                "content_uploaded": False,
             }
         )
-    return summaries
+    summaries.sort(
+        key=lambda item: (
+            item["target"],
+            item["sha256"],
+            item["size_bytes"],
+            item["content_type"],
+            item["synthetic"],
+        )
+    )
+    return {
+        "fixture_file_count": len(summaries),
+        "fixture_total_bytes": sum(item["size_bytes"] for item in summaries),
+        "fixture_manifest_sha256": canonical_sha256(summaries),
+    }
+
+
+def _safe_fixture_content_type(target: str) -> str:
+    return _SAFE_FIXTURE_CONTENT_TYPES.get(
+        PurePosixPath(target).suffix.lower(),
+        "application/octet-stream",
+    )
 
 
 def _without_schema(value) -> dict:

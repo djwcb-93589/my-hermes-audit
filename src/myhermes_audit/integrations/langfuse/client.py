@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib
+import math
 import os
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -39,9 +41,16 @@ from myhermes_audit.errors import (
     LangfuseConnectionError,
     PublicationManifestError,
     PublicationStateError,
-    ScoreIdempotencyError,
-    ScoreIdentityError,
-    ScorePublicationConflictError,
+    ScoreAuthenticationError,
+    ScoreCapabilityError,
+    ScoreConfirmationTimeoutError,
+    ScoreIdentityConflictError,
+    ScorePermissionError,
+    ScoreRateLimitError,
+    ScoreTargetError,
+    ScoreTimeoutError,
+    ScoreTransportError,
+    ScoreValidationError,
 )
 from myhermes_audit.integrations.langfuse.capability import (
     require_langfuse_capabilities,
@@ -49,6 +58,7 @@ from myhermes_audit.integrations.langfuse.capability import (
 from myhermes_audit.integrations.langfuse.manifest import (
     PublicationManifestStore,
     publication_manifest_path,
+    publication_status_from_records,
 )
 from myhermes_audit.integrations.langfuse.redaction import project_remote_content
 from myhermes_audit.integrations.langfuse.score_mapper import (
@@ -72,6 +82,13 @@ from myhermes_audit.serialization import canonical_sha256
 
 
 LANGFUSE_ADAPTER_VERSION = "langfuse-v4-runner-replay-v3"
+_SCORE_CONFIRMATION_BACKOFF_SECONDS = (0.1, 0.25, 0.5, 1.0)
+_SCORE_SUBJECT_FIELDS = (
+    "trace_id",
+    "session_id",
+    "observation_id",
+    "dataset_run_id",
+)
 
 
 class LangfuseV4Adapter:
@@ -86,13 +103,27 @@ class LangfuseV4Adapter:
         sensitive_values: tuple[str, ...],
         capability_report: LangfuseCapabilityReport,
         report_path: Path | None,
+        request_timeout_seconds: int = 5,
     ) -> None:
+        if (
+            type(request_timeout_seconds) is not int
+            or request_timeout_seconds < 1
+            or request_timeout_seconds > 600
+        ):
+            raise LangfuseConfigError(
+                "Score request timeout must be between 1 and 600 seconds",
+                field="LANGFUSE_TIMEOUT",
+            )
         self._client = client
         self._propagate_attributes = propagate_attributes
         self._not_found_error = not_found_error
         self._sensitive_values = sensitive_values
         self._capability_report = capability_report
         self._report_path = report_path
+        self._request_timeout_seconds = request_timeout_seconds
+        self._score_confirmation_deadline_seconds = (
+            request_timeout_seconds + min(30, request_timeout_seconds * 2)
+        )
         self._active_experiment: LangfuseExperimentRequest | None = None
         self._dataset_items: dict[str, Any] = {}
         self._manifest_store: PublicationManifestStore | None = None
@@ -173,6 +204,7 @@ class LangfuseV4Adapter:
                 if report_path is None
                 else Path(report_path).expanduser().resolve(strict=False)
             ),
+            request_timeout_seconds=timeout,
         )
 
     @property
@@ -663,7 +695,7 @@ class LangfuseV4Adapter:
     ) -> int:
         self._validate_active_experiment(request.experiment)
         if receipt.trial_id != request.trial.trial_id:
-            raise ScoreIdentityError(
+            raise ScoreIdentityConflictError(
                 "Score publication receipt does not match the Trial",
                 trial_id=request.trial.trial_id,
             )
@@ -678,19 +710,21 @@ class LangfuseV4Adapter:
                 trial_id=request.trial.trial_id,
             )
         projections = project_scores(request.trial)
-        prepared: list[tuple[ScoreProjection, ScorePublicationRecord]] = []
-        for score in projections:
-            record = self._prepare_score_record(request, receipt, score)
-            prepared.append((score, record))
         published_count = 0
         first_error: Exception | None = None
-        for score, record in prepared:
-            if record.status is PublicationItemStatus.CONFIRMED:
-                self._skipped_score_count += 1
-                continue
+        for score in projections:
             try:
+                record = self._prepare_score_record(request, receipt, score)
+                if record.status is PublicationItemStatus.CONFIRMED:
+                    self._skipped_score_count += 1
+                    continue
                 self._publish_one_score(request, receipt, score, record)
             except Exception as exc:
+                if isinstance(
+                    exc,
+                    (PublicationManifestError, PublicationStateError),
+                ):
+                    raise
                 if first_error is None:
                     first_error = exc
             else:
@@ -739,18 +773,19 @@ class LangfuseV4Adapter:
             self._active_experiment = None
             self._finished = True
             raise error
+        derived_status = publication_status_from_records(manifest)
         all_confirmed = (
-            len(confirmed_trials) == len(manifest.trial_publications)
-            and all(
-                item.status is PublicationItemStatus.CONFIRMED
-                for item in manifest.score_publications
-            )
+            derived_status is PublicationManifestStatus.PUBLISHED
             and manifest.last_error is None
         )
         final_status = (
             PublicationManifestStatus.PUBLISHED
             if all_confirmed
-            else PublicationManifestStatus.PARTIALLY_PUBLISHED
+            else (
+                PublicationManifestStatus.PARTIALLY_PUBLISHED
+                if confirmed_trials
+                else PublicationManifestStatus.FAILED
+            )
         )
         self._write_manifest(
             _update_manifest(
@@ -997,7 +1032,7 @@ class LangfuseV4Adapter:
                 or existing.experiment_id != receipt.experiment_id
                 or _identity_key(existing.identity) != _identity_key(identity)
             ):
-                error = ScoreIdentityError(
+                error = ScoreIdentityConflictError(
                     "stable Score ID maps to different identity fields",
                     score_id=score_id,
                     trial_id=request.trial.trial_id,
@@ -1005,7 +1040,7 @@ class LangfuseV4Adapter:
                 self._record_score_conflict(error, request.trial.trial_id)
                 raise error
             if existing.identity.value_hash != value_hash:
-                error = ScorePublicationConflictError(
+                error = ScoreIdentityConflictError(
                     "Score identity already exists with a different value hash; "
                     "increment evaluator_version before publishing",
                     score_id=score_id,
@@ -1016,7 +1051,7 @@ class LangfuseV4Adapter:
                 self._record_score_conflict(error, request.trial.trial_id)
                 raise error
             if existing.content_fingerprint != value_hash:
-                error = ScorePublicationConflictError(
+                error = ScoreIdentityConflictError(
                     "Score publication fingerprint conflicts with its stable identity",
                     score_id=score_id,
                     trial_id=request.trial.trial_id,
@@ -1071,6 +1106,7 @@ class LangfuseV4Adapter:
         score: ScoreProjection,
         record: ScorePublicationRecord,
     ) -> None:
+        was_uncertain = record.status is PublicationItemStatus.UNCERTAIN
         attempt_at = datetime.now(timezone.utc)
         publishing = record.model_copy(
             update={
@@ -1089,9 +1125,20 @@ class LangfuseV4Adapter:
                 status=PublicationManifestStatus.PUBLISHING,
             )
         )
+        deadline = time.monotonic() + self._score_confirmation_deadline_seconds
+        submission_attempted = False
         submission_returned = False
-        recorded_confirmation_error: AuditError | None = None
         try:
+            if not (
+                self._capability_report.score_submission_supported
+                and self._capability_report.score_confirmation_supported
+            ):
+                raise ScoreCapabilityError(
+                    "Langfuse Score publication requires public create and query APIs",
+                    score_id=record.identity.score_id,
+                    trial_id=request.trial.trial_id,
+                )
+            target = _build_trial_score_target(trace_id=receipt.trace_id)
             metadata = {
                 key: value
                 for key, value in {
@@ -1100,6 +1147,9 @@ class LangfuseV4Adapter:
                     "evaluator_version": score.evaluator_version,
                     "trial_id": request.trial.trial_id,
                     "case_id": request.trial.case_id,
+                    "dataset_item_id": receipt.dataset_item_id,
+                    "dataset_run_id": receipt.dataset_run_id,
+                    "experiment_id": receipt.experiment_id,
                     "adapter_version": LANGFUSE_ADAPTER_VERSION,
                     "value_hash": record.identity.value_hash,
                 }.items()
@@ -1109,92 +1159,79 @@ class LangfuseV4Adapter:
                 score.comment,
                 sensitive_values=self._sensitive_values,
             )
-            self._client.create_score(
-                name=score.name,
-                value=score.value,
-                dataset_run_id=receipt.dataset_run_id,
-                trace_id=receipt.trace_id,
-                score_id=record.identity.score_id,
-                data_type="NUMERIC",
-                comment=comment,
-                metadata=metadata,
-                timestamp=record.identity.stable_timestamp,
-            )
-            submission_returned = True
-            self._client.flush()
-            if self._capability_report.score_confirmation_supported:
-                recorded_confirmation_error = ScoreIdempotencyError(
-                    "Langfuse Score confirmation is advertised but no supported "
-                    "high-level verifier is configured",
-                    score_id=record.identity.score_id,
-                    trial_id=request.trial.trial_id,
-                    retryable=False,
-                    confirmation_supported=True,
+            if was_uncertain:
+                existing = self._read_remote_score(
+                    score,
+                    publishing,
+                    deadline=deadline,
                 )
+                if existing is not None:
+                    self._confirm_score_record(publishing)
+                    return
+
+            scores_api = self._public_scores_api()
+            request_options = self._score_request_options(deadline)
+            submission_attempted = True
+            try:
+                response = scores_api.create(
+                    name=score.name,
+                    value=score.value,
+                    id=record.identity.score_id,
+                    **target,
+                    data_type="NUMERIC",
+                    comment=comment,
+                    metadata=metadata,
+                    request_options=request_options,
+                )
+            except Exception as exc:
+                if _http_status(exc) != 409:
+                    raise
             else:
-                recorded_confirmation_error = ScoreIdempotencyError(
-                    "Langfuse Score was submitted but the supported high-level SDK "
-                    "cannot reliably confirm remote persistence",
-                    score_id=record.identity.score_id,
-                    trial_id=request.trial.trial_id,
-                    retryable=True,
-                    confirmation_supported=False,
-                )
-            error = _publish_error(
-                phase="score_confirmation",
-                error=recorded_confirmation_error,
+                submission_returned = True
+                response_id = getattr(response, "id", None)
+                if response_id != record.identity.score_id:
+                    raise ScoreIdentityConflictError(
+                        "Langfuse Score creation returned an unexpected identity",
+                        score_id=record.identity.score_id,
+                        trial_id=request.trial.trial_id,
+                    )
+
+            self._confirm_remote_score_until_deadline(
+                score,
+                publishing,
+                deadline=deadline,
+            )
+            self._confirm_score_record(publishing)
+        except Exception as exc:
+            mapped = self._map_score_exception(
+                exc,
+                score_id=record.identity.score_id,
                 trial_id=request.trial.trial_id,
             )
-            uncertain = publishing.model_copy(
+            status = _score_failure_status(
+                mapped,
+                was_uncertain=was_uncertain,
+                submission_attempted=submission_attempted,
+                submission_returned=submission_returned,
+            )
+            error = _publish_error(
+                phase=(
+                    "score_confirmation"
+                    if mapped.code == "score_confirmation_timeout"
+                    else "scores"
+                ),
+                error=mapped,
+                trial_id=request.trial.trial_id,
+            )
+            converged = publishing.model_copy(
                 update={
-                    "status": PublicationItemStatus.UNCERTAIN,
-                    "remote_id": None,
+                    "status": status,
                     "updated_at": datetime.now(timezone.utc),
                     "confirmed_at": None,
                     "error": error,
                 }
             )
-            manifest = _replace_score_record(self._require_manifest(), uncertain)
-            self._write_manifest(
-                _update_manifest(
-                    manifest,
-                    status=_error_manifest_status(manifest),
-                    last_error=error,
-                )
-            )
-            raise recorded_confirmation_error
-        except Exception as exc:
-            if exc is recorded_confirmation_error:
-                raise
-            mapped = (
-                exc
-                if isinstance(exc, AuditError)
-                else ScoreIdempotencyError(
-                    "Langfuse Score delivery could not be confirmed: "
-                    + sanitize_external_error(exc, self._sensitive_values),
-                    score_id=record.identity.score_id,
-                    trial_id=request.trial.trial_id,
-                    retryable=_is_retryable(exc),
-                    exception_type=type(exc).__name__,
-                )
-            )
-            error = _publish_error(
-                phase="scores",
-                error=mapped,
-                trial_id=request.trial.trial_id,
-            )
-            failed = publishing.model_copy(
-                update={
-                    "status": (
-                        PublicationItemStatus.UNCERTAIN
-                        if submission_returned or _is_retryable(exc)
-                        else PublicationItemStatus.FAILED
-                    ),
-                    "updated_at": datetime.now(timezone.utc),
-                    "error": error,
-                }
-            )
-            manifest = _replace_score_record(self._require_manifest(), failed)
+            manifest = _replace_score_record(self._require_manifest(), converged)
             self._write_manifest(
                 _update_manifest(
                     manifest,
@@ -1203,6 +1240,246 @@ class LangfuseV4Adapter:
                 )
             )
             raise mapped
+
+    def _public_scores_api(self) -> Any:
+        try:
+            api = self._client.api
+            scores_api = api.scores
+            if not callable(getattr(scores_api, "create", None)):
+                raise AttributeError("scores.create")
+            return scores_api
+        except (AttributeError, TypeError) as exc:
+            raise ScoreCapabilityError(
+                "Langfuse SDK does not expose the required public Score create API",
+                exception_type=type(exc).__name__,
+            ) from exc
+
+    def _public_scores_v3_api(self) -> Any:
+        try:
+            api = self._client.api
+            scores_v3_api = api.scores_v3
+            if not callable(getattr(scores_v3_api, "get_many_v3", None)):
+                raise AttributeError("scores_v3.get_many_v3")
+            return scores_v3_api
+        except (AttributeError, TypeError) as exc:
+            raise ScoreCapabilityError(
+                "Langfuse SDK does not expose the required public Score query API",
+                exception_type=type(exc).__name__,
+            ) from exc
+
+    def _score_request_options(self, deadline: float) -> dict[str, int]:
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            raise ScoreConfirmationTimeoutError(
+                "Langfuse Score confirmation deadline expired",
+            )
+        return {
+            "timeout_in_seconds": min(
+                self._request_timeout_seconds,
+                max(1, math.floor(remaining)),
+            ),
+            "max_retries": 0,
+        }
+
+    def _read_remote_score(
+        self,
+        score: ScoreProjection,
+        record: ScorePublicationRecord,
+        *,
+        deadline: float,
+    ) -> Any | None:
+        try:
+            response = self._public_scores_v3_api().get_many_v3(
+                limit=2,
+                fields="details,subject",
+                id=record.identity.score_id,
+                request_options=self._score_request_options(deadline),
+            )
+        except Exception as exc:
+            if _http_status(exc) == 404:
+                return None
+            raise
+        data = getattr(response, "data", None)
+        if not isinstance(data, list):
+            raise ScoreCapabilityError(
+                "Langfuse Score query returned no public result collection",
+                score_id=record.identity.score_id,
+                trial_id=record.identity.trial_id,
+            )
+        if not data:
+            return None
+        if len(data) != 1:
+            raise ScoreIdentityConflictError(
+                "Langfuse returned multiple Scores for one stable identity",
+                score_id=record.identity.score_id,
+                trial_id=record.identity.trial_id,
+            )
+        remote = data[0]
+        _validate_remote_score(remote, score=score, record=record)
+        return remote
+
+    def _confirm_remote_score_until_deadline(
+        self,
+        score: ScoreProjection,
+        record: ScorePublicationRecord,
+        *,
+        deadline: float,
+    ) -> Any:
+        last_retryable_error: AuditError | None = None
+        attempt = 0
+        while time.monotonic() < deadline:
+            try:
+                remote = self._read_remote_score(
+                    score,
+                    record,
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                mapped = self._map_score_exception(
+                    exc,
+                    score_id=record.identity.score_id,
+                    trial_id=record.identity.trial_id,
+                )
+                if not _is_retryable_score_confirmation_error(mapped):
+                    raise mapped
+                last_retryable_error = mapped
+            else:
+                if remote is not None:
+                    return remote
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            delay = _SCORE_CONFIRMATION_BACKOFF_SECONDS[
+                min(attempt, len(_SCORE_CONFIRMATION_BACKOFF_SECONDS) - 1)
+            ]
+            time.sleep(min(delay, remaining))
+            attempt += 1
+        if last_retryable_error is not None:
+            raise last_retryable_error
+        raise ScoreConfirmationTimeoutError(
+            "Langfuse Score was not visible before the confirmation deadline",
+            score_id=record.identity.score_id,
+            trial_id=record.identity.trial_id,
+        )
+
+    def _confirm_score_record(self, publishing: ScorePublicationRecord) -> None:
+        confirmed_at = datetime.now(timezone.utc)
+        confirmed = publishing.model_copy(
+            update={
+                "status": PublicationItemStatus.CONFIRMED,
+                "remote_id": publishing.identity.score_id,
+                "updated_at": confirmed_at,
+                "confirmed_at": confirmed_at,
+                "error": None,
+            }
+        )
+        manifest = _replace_score_record(self._require_manifest(), confirmed)
+        self._write_manifest(
+            _update_manifest(
+                manifest,
+                status=PublicationManifestStatus.PUBLISHING,
+                last_error=_last_unresolved_error(manifest),
+            )
+        )
+
+    def _map_score_exception(
+        self,
+        error: Exception,
+        *,
+        score_id: str,
+        trial_id: str,
+    ) -> AuditError:
+        if isinstance(error, AuditError):
+            return error
+        status = _http_status(error)
+        details: dict[str, Any] = {
+            "score_id": score_id,
+            "trial_id": trial_id,
+            "exception_type": type(error).__name__,
+        }
+        if status is not None:
+            details.update(
+                {
+                    "http_status": status,
+                    "http_status_class": f"{status // 100}xx",
+                }
+            )
+        if status in {400, 422}:
+            return ScoreValidationError(
+                "Langfuse rejected the Score request as invalid",
+                **details,
+            )
+        if status == 401:
+            return ScoreAuthenticationError(
+                "Langfuse rejected Score authentication",
+                **details,
+            )
+        if status == 403:
+            return ScorePermissionError(
+                "Langfuse denied permission to publish the Score",
+                **details,
+            )
+        if status == 429:
+            return ScoreRateLimitError(
+                "Langfuse rate-limited the Score request",
+                **details,
+            )
+        if status in {404, 405, 501}:
+            return ScoreCapabilityError(
+                "Langfuse does not expose the required public Score endpoint",
+                **details,
+            )
+        if status == 408:
+            return ScoreTimeoutError(
+                "Langfuse Score request timed out before its outcome was known",
+                **details,
+            )
+        if status == 409:
+            return ScoreIdentityConflictError(
+                "Langfuse reported a conflict for the stable Score identity",
+                **details,
+            )
+        if status is not None and status >= 500:
+            return ScoreTransportError(
+                "Langfuse Score service failed before the outcome was known",
+                **details,
+            )
+        error_name = type(error).__name__.lower()
+        if "timeout" in error_name:
+            return ScoreTimeoutError(
+                "Langfuse Score request timed out before its outcome was known",
+                **details,
+            )
+        if any(
+            marker in error_name
+            for marker in (
+                "connection",
+                "connect",
+                "network",
+                "protocol",
+                "readerror",
+                "writeerror",
+                "socket",
+            )
+        ):
+            return ScoreTransportError(
+                "Langfuse Score transport failed before its outcome was known",
+                **details,
+            )
+        if isinstance(error, (AttributeError, TypeError)):
+            return ScoreCapabilityError(
+                "Langfuse public Score API is incompatible with this adapter",
+                **details,
+            )
+        if isinstance(error, ValueError) or "validation" in error_name:
+            return ScoreValidationError(
+                "Langfuse Score request failed local validation",
+                **details,
+            )
+        return ScoreTransportError(
+            "Langfuse Score request failed before its outcome was known",
+            **details,
+        )
 
     def _map_trial_exception(
         self,
@@ -1522,6 +1799,119 @@ def _score_publication_key(
     )
 
 
+def _build_trial_score_target(
+    *,
+    trace_id: str | None,
+    session_id: str | None = None,
+    observation_id: str | None = None,
+    dataset_run_id: str | None = None,
+) -> dict[str, str]:
+    candidates = {
+        "trace_id": trace_id,
+        "session_id": session_id,
+        "observation_id": observation_id,
+        "dataset_run_id": dataset_run_id,
+    }
+    target = {
+        key: value
+        for key, value in candidates.items()
+        if (
+            isinstance(value, str)
+            and bool(value)
+            and value == value.strip()
+        )
+    }
+    supplied_count = sum(value is not None for value in candidates.values())
+    if len(target) != 1 or supplied_count != 1:
+        raise ScoreTargetError(
+            "A Score must identify exactly one non-empty remote subject",
+            target_count=supplied_count,
+        )
+    if next(iter(target)) not in _SCORE_SUBJECT_FIELDS:
+        raise ScoreTargetError(
+            "Score subject type is not supported",
+            target_count=1,
+        )
+    return target
+
+
+def _validate_remote_score(
+    remote: Any,
+    *,
+    score: ScoreProjection,
+    record: ScorePublicationRecord,
+) -> None:
+    details = {
+        "score_id": record.identity.score_id,
+        "trial_id": record.identity.trial_id,
+    }
+    if getattr(remote, "id", None) != record.identity.score_id:
+        raise ScoreIdentityConflictError(
+            "Remote Score identity does not match the stable local identity",
+            **details,
+        )
+    if getattr(remote, "name", None) != score.name:
+        raise ScoreIdentityConflictError(
+            "Remote Score name conflicts with the stable local identity",
+            **details,
+        )
+    data_type = _enum_or_scalar_value(getattr(remote, "data_type", None))
+    if data_type != "NUMERIC":
+        raise ScoreIdentityConflictError(
+            "Remote Score data type conflicts with the local projection",
+            **details,
+        )
+    remote_value = getattr(remote, "value", None)
+    if (
+        isinstance(remote_value, bool)
+        or not isinstance(remote_value, (int, float))
+        or not math.isclose(
+            float(remote_value),
+            float(score.value),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ScoreIdentityConflictError(
+            "Remote Score value conflicts with the local projection",
+            **details,
+        )
+    subject = getattr(remote, "subject", None)
+    if subject is None:
+        raise ScoreCapabilityError(
+            "Langfuse Score query omitted the requested subject details",
+            **details,
+        )
+    if (
+        _enum_or_scalar_value(getattr(subject, "kind", None)) != "trace"
+        or getattr(subject, "id", None) != record.identity.trace_id
+    ):
+        raise ScoreIdentityConflictError(
+            "Remote Score subject conflicts with the expected Trial Trace",
+            **details,
+        )
+    metadata = getattr(remote, "metadata", None)
+    if metadata is None:
+        raise ScoreCapabilityError(
+            "Langfuse Score query omitted the requested metadata details",
+            **details,
+        )
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("value_hash") != record.identity.value_hash
+        or metadata.get("evaluator_version") != score.evaluator_version
+    ):
+        raise ScoreIdentityConflictError(
+            "Remote Score metadata conflicts with the local projection",
+            **details,
+        )
+
+
+def _enum_or_scalar_value(value: Any) -> Any:
+    candidate = getattr(value, "value", value)
+    return candidate
+
+
 def _safe_score_comment(
     comment: str,
     *,
@@ -1641,6 +2031,12 @@ def _update_manifest(
 def _error_manifest_status(
     manifest: LangfusePublicationManifest,
 ) -> PublicationManifestStatus:
+    derived = publication_status_from_records(manifest)
+    if derived in {
+        PublicationManifestStatus.PARTIALLY_PUBLISHED,
+        PublicationManifestStatus.FAILED,
+    }:
+        return derived
     has_confirmed = any(
         item.status is PublicationItemStatus.CONFIRMED
         for item in (*manifest.trial_publications, *manifest.score_publications)
@@ -1696,7 +2092,15 @@ def _publish_error(
     metadata = {
         key: value
         for key, value in error.details.items()
-        if key in {"score_id", "exception_type", "published_count"}
+        if key
+        in {
+            "score_id",
+            "exception_type",
+            "published_count",
+            "http_status",
+            "http_status_class",
+            "target_count",
+        }
         and isinstance(value, (str, int, float, bool))
     }
     return LangfusePublishError(
@@ -1717,6 +2121,51 @@ def _is_retryable(error: BaseException) -> bool:
         return True
     name = type(error).__name__.lower()
     return any(marker in name for marker in ("timeout", "connection", "ratelimit"))
+
+
+def _score_failure_status(
+    error: AuditError,
+    *,
+    was_uncertain: bool,
+    submission_attempted: bool,
+    submission_returned: bool,
+) -> PublicationItemStatus:
+    if error.code in {
+        "score_target_error",
+        "score_validation_error",
+        "score_authentication_error",
+        "score_permission_error",
+        "score_identity_conflict",
+        "score_capability_error",
+    }:
+        return PublicationItemStatus.FAILED
+    if error.code == "score_rate_limit_error" and not submission_returned:
+        return PublicationItemStatus.FAILED
+    if was_uncertain or submission_returned:
+        return PublicationItemStatus.UNCERTAIN
+    if submission_attempted and error.code in {
+        "score_transport_error",
+        "score_timeout_error",
+        "score_confirmation_timeout",
+    }:
+        return PublicationItemStatus.UNCERTAIN
+    return PublicationItemStatus.FAILED
+
+
+def _is_retryable_score_confirmation_error(error: AuditError) -> bool:
+    return error.code in {
+        "score_rate_limit_error",
+        "score_transport_error",
+        "score_timeout_error",
+        "score_confirmation_timeout",
+    }
+
+
+def _http_status(error: BaseException) -> int | None:
+    status = getattr(error, "status_code", None)
+    if type(status) is int and 100 <= status <= 599:
+        return status
+    return None
 
 
 __all__ = ("LANGFUSE_ADAPTER_VERSION", "LangfuseV4Adapter")

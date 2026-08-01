@@ -37,6 +37,8 @@ from myhermes_audit.integrations.langfuse.dataset_sync import (
 from myhermes_audit.integrations.langfuse.manifest import (
     PublicationManifestStore,
     publication_manifest_path,
+    publication_status_from_records,
+    recover_interrupted_publications,
 )
 from myhermes_audit.ports.langfuse import (
     LangfuseExperimentRequest,
@@ -362,6 +364,9 @@ def _finalize_manifest(
         current = store.read() if manifest is not None else None
         if current is None:
             return None, None
+        current, recovered = recover_interrupted_publications(current)
+        if recovered:
+            current = store.write(current)
         unresolved = any(
             item.status is not PublicationItemStatus.CONFIRMED
             for item in (*current.trial_publications, *current.score_publications)
@@ -375,19 +380,18 @@ def _finalize_manifest(
                     retryable=True,
                 )
             )
+        record_status = publication_status_from_records(current)
         has_confirmed = any(
             item.status is PublicationItemStatus.CONFIRMED
             for item in (*current.trial_publications, *current.score_publications)
         )
-        status = (
-            PublicationManifestStatus.PUBLISHED
-            if not errors and not unresolved
-            else (
+        status = record_status
+        if errors:
+            status = (
                 PublicationManifestStatus.PARTIALLY_PUBLISHED
                 if has_confirmed
                 else PublicationManifestStatus.FAILED
             )
-        )
         payload = current.model_dump(mode="python")
         payload.update(
             {

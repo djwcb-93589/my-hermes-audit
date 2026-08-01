@@ -16,13 +16,14 @@ from myhermes_audit.errors import (
 )
 
 
-LANGFUSE_MINIMUM_VERSION = "4.7.0"
+# 4.14.2 is the first v4 release exposing both scores.create and scores_v3 lookup.
+LANGFUSE_MINIMUM_VERSION = "4.14.2"
 LANGFUSE_MAXIMUM_MAJOR = 5
 LANGFUSE_VERSION_RANGE = f">={LANGFUSE_MINIMUM_VERSION},<{LANGFUSE_MAXIMUM_MAJOR}"
 SCORE_IDEMPOTENCY_STRATEGY = (
-    "stable_score_id_submission_with_uncertain_remote_confirmation"
+    "stable_score_id_preflight_with_bounded_public_api_confirmation"
 )
-_MINIMUM_VERSION_PARTS = (4, 7, 0)
+_MINIMUM_VERSION_PARTS = (4, 14, 2)
 _FINAL_VERSION_RE = re.compile(
     r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
     r"(?:\.post\d+)?(?:\+[A-Za-z0-9.-]+)?$"
@@ -35,7 +36,7 @@ def probe_langfuse_capabilities() -> LangfuseCapabilityReport:
     try:
         version = importlib.metadata.version("langfuse")
     except importlib.metadata.PackageNotFoundError:
-        capabilities = _capability_flags(None, None)
+        capabilities = _capability_flags(None, None, {})
         return LangfuseCapabilityReport(
             installed=False,
             version=None,
@@ -55,7 +56,7 @@ def probe_langfuse_capabilities() -> LangfuseCapabilityReport:
     try:
         langfuse = importlib.import_module("langfuse")
     except Exception as exc:
-        capabilities = _capability_flags(None, None)
+        capabilities = _capability_flags(None, None, {})
         return LangfuseCapabilityReport(
             installed=True,
             version=version,
@@ -74,7 +75,8 @@ def probe_langfuse_capabilities() -> LangfuseCapabilityReport:
         )
 
     client_type = getattr(langfuse, "Langfuse", None)
-    capabilities = _capability_flags(client_type, langfuse)
+    score_api_types = _load_public_score_api_types()
+    capabilities = _capability_flags(client_type, langfuse, score_api_types)
     version_parts = _final_version_parts(version)
     version_compatible = (
         version_parts is not None
@@ -100,13 +102,27 @@ def probe_langfuse_capabilities() -> LangfuseCapabilityReport:
     )
     if score_submission_supported:
         warnings.append(
-            "The supported high-level SDK can submit Scores but does not provide a "
-            "public remote-confirmation method; submitted Scores remain uncertain."
+            "Score publication uses the public synchronous REST client with stable "
+            "identities and per-request timeouts."
         )
     else:
         warnings.append(
             "The installed SDK does not expose the required public Score submission "
             "method."
+        )
+    score_confirmation_supported = capabilities.get(
+        "score_confirmation_supported",
+        False,
+    )
+    if score_confirmation_supported:
+        warnings.append(
+            "Score confirmation uses bounded public v3 ID lookup with subject and "
+            "details fields."
+        )
+    else:
+        warnings.append(
+            "The installed SDK does not expose the required public Score "
+            "confirmation method."
         )
     return LangfuseCapabilityReport(
         installed=True,
@@ -119,7 +135,7 @@ def probe_langfuse_capabilities() -> LangfuseCapabilityReport:
         experiment_strategy=ExperimentStrategy.RUNNER_REPLAY,
         score_idempotency_strategy=SCORE_IDEMPOTENCY_STRATEGY,
         score_submission_supported=score_submission_supported,
-        score_confirmation_supported=False,
+        score_confirmation_supported=score_confirmation_supported,
     )
 
 
@@ -153,13 +169,63 @@ def require_langfuse_capabilities() -> LangfuseCapabilityReport:
     return report
 
 
-def _capability_flags(client_type: Any, langfuse_module: Any) -> dict[str, bool]:
+def _capability_flags(
+    client_type: Any,
+    langfuse_module: Any,
+    score_api_types: dict[str, Any],
+) -> dict[str, bool]:
     span_type = getattr(langfuse_module, "LangfuseSpan", None)
     propagate_attributes = getattr(langfuse_module, "propagate_attributes", None)
     not_found_error = getattr(
         getattr(langfuse_module, "api", None),
         "NotFoundError",
         None,
+    )
+    api_type = score_api_types.get("api")
+    scores_type = score_api_types.get("scores")
+    scores_v3_type = score_api_types.get("scores_v3")
+    numeric_score_type = score_api_types.get("numeric_score")
+    trace_subject_type = score_api_types.get("trace_subject")
+    create_response_type = score_api_types.get("create_response")
+    query_response_type = score_api_types.get("query_response")
+    public_api_available = _has_property(client_type, "api")
+    score_submission_supported = all(
+        (
+            public_api_available,
+            _has_property(api_type, "scores"),
+            _has_method(
+                scores_type,
+                "create",
+                {
+                    "name",
+                    "value",
+                    "id",
+                    "trace_id",
+                    "comment",
+                    "metadata",
+                    "data_type",
+                    "request_options",
+                },
+            ),
+            _has_annotations(create_response_type, {"id"}),
+        )
+    )
+    score_confirmation_supported = all(
+        (
+            public_api_available,
+            _has_property(api_type, "scores_v3"),
+            _has_method(
+                scores_v3_type,
+                "get_many_v3",
+                {"limit", "fields", "id", "trace_id", "request_options"},
+            ),
+            _has_annotations(
+                numeric_score_type,
+                {"id", "name", "value", "data_type", "metadata", "subject"},
+            ),
+            _has_annotations(trace_subject_type, {"kind", "id"}),
+            _has_annotations(query_response_type, {"data"}),
+        )
     )
     return {
         "client_initialization": _has_callable_parameters(
@@ -231,25 +297,73 @@ def _capability_flags(client_type: Any, langfuse_module: Any) -> dict[str, bool]
             propagate_attributes,
             {"session_id", "metadata", "tags", "trace_name"},
         ),
-        "score_submission_supported": _has_method(
-            client_type,
-            "create_score",
-            {
-                "name",
-                "value",
-                "dataset_run_id",
-                "trace_id",
-                "score_id",
-                "data_type",
-                "comment",
-                "metadata",
-                "timestamp",
-            },
-        ),
+        "score_submission_supported": score_submission_supported,
+        "score_confirmation_supported": score_confirmation_supported,
         "flush": _has_method(client_type, "flush", set()),
         "shutdown": _has_method(client_type, "shutdown", set()),
         "authentication_check": _has_method(client_type, "auth_check", set()),
     }
+
+
+def _load_public_score_api_types() -> dict[str, Any]:
+    try:
+        return {
+            "api": getattr(
+                importlib.import_module("langfuse.api.client"),
+                "LangfuseAPI",
+            ),
+            "scores": getattr(
+                importlib.import_module("langfuse.api.scores.client"),
+                "ScoresClient",
+            ),
+            "scores_v3": getattr(
+                importlib.import_module("langfuse.api.scores_v3.client"),
+                "ScoresV3Client",
+            ),
+            "numeric_score": getattr(
+                importlib.import_module("langfuse.api.scores_v3.types.score_v3"),
+                "ScoreV3_Numeric",
+            ),
+            "trace_subject": getattr(
+                importlib.import_module(
+                    "langfuse.api.scores_v3.types.score_subject_v3"
+                ),
+                "ScoreSubjectV3_Trace",
+            ),
+            "create_response": getattr(
+                importlib.import_module(
+                    "langfuse.api.scores.types.create_score_response"
+                ),
+                "CreateScoreResponse",
+            ),
+            "query_response": getattr(
+                importlib.import_module(
+                    "langfuse.api.scores_v3.types.get_scores_v3response"
+                ),
+                "GetScoresV3Response",
+            ),
+        }
+    except Exception:
+        return {}
+
+
+def _has_property(candidate: Any, name: str) -> bool:
+    if candidate is None:
+        return False
+    try:
+        return isinstance(inspect.getattr_static(candidate, name), property)
+    except AttributeError:
+        return False
+
+
+def _has_annotations(candidate: Any, required_fields: set[str]) -> bool:
+    if candidate is None:
+        return False
+    try:
+        annotations = inspect.get_annotations(candidate, eval_str=False)
+    except (TypeError, ValueError):
+        return False
+    return required_fields <= set(annotations)
 
 
 def _has_method(

@@ -378,6 +378,13 @@ class LangfuseCapabilityReport(ContractModel):
             raise ValueError(
                 "Score submission field must match the capability flags"
             )
+        if (
+            self.capabilities.get("score_confirmation_supported", False)
+            is not self.score_confirmation_supported
+        ):
+            raise ValueError(
+                "Score confirmation field must match the capability flags"
+            )
         return self
 
 

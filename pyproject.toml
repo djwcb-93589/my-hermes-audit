@@ -15,10 +15,10 @@ dependencies = [
 
 [project.optional-dependencies]
 judge = ["openai>=2,<3"]
-langfuse = ["langfuse>=4.7.0,<5"]
+langfuse = ["langfuse>=4.14.2,<5"]
 eval = [
     "openai>=2,<3",
-    "langfuse>=4.7.0,<5",
+    "langfuse>=4.14.2,<5",
 ]
 
 [project.scripts]

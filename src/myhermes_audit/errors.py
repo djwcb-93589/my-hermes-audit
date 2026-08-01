@@ -267,6 +267,60 @@ class ScoreIdempotencyError(ScorePublishError):
         self.code = "score_idempotency_error"
 
 
+class _ClassifiedScoreError(ScorePublishError):
+    error_code = "score_publish_error"
+    default_retryable = False
+
+    def __init__(self, message: str, **details: Any) -> None:
+        details.setdefault("retryable", self.default_retryable)
+        super().__init__(message, **details)
+        self.code = self.error_code
+
+
+class ScoreTargetError(_ClassifiedScoreError):
+    error_code = "score_target_error"
+
+
+class ScoreValidationError(_ClassifiedScoreError):
+    error_code = "score_validation_error"
+
+
+class ScoreAuthenticationError(_ClassifiedScoreError):
+    error_code = "score_authentication_error"
+
+
+class ScorePermissionError(_ClassifiedScoreError):
+    error_code = "score_permission_error"
+
+
+class ScoreRateLimitError(_ClassifiedScoreError):
+    error_code = "score_rate_limit_error"
+    default_retryable = True
+
+
+class ScoreTransportError(_ClassifiedScoreError):
+    error_code = "score_transport_error"
+    default_retryable = True
+
+
+class ScoreTimeoutError(_ClassifiedScoreError):
+    error_code = "score_timeout_error"
+    default_retryable = True
+
+
+class ScoreConfirmationTimeoutError(_ClassifiedScoreError):
+    error_code = "score_confirmation_timeout"
+    default_retryable = True
+
+
+class ScoreIdentityConflictError(_ClassifiedScoreError):
+    error_code = "score_identity_conflict"
+
+
+class ScoreCapabilityError(_ClassifiedScoreError):
+    error_code = "score_capability_error"
+
+
 class PublicationManifestError(IntegrationError):
     def __init__(self, message: str, **details: Any) -> None:
         super().__init__(message, code="publication_manifest_error", **details)

@@ -21,6 +21,7 @@ from myhermes_audit.contracts import (
     TrialStatus,
     TrialWarning,
 )
+from myhermes_audit.contracts.common import CURRENT_SCHEMA_VERSION
 from myhermes_audit.datasets.fixtures import materialize_fixtures
 from myhermes_audit.errors import AuditError, SandboxError, UnsupportedCaseError
 from myhermes_audit.fingerprint import (
@@ -140,6 +141,7 @@ class AuditOrchestrator:
         case_ids = [case.case_id for case in selected]
         audit_finished = datetime.now(timezone.utc)
         result = AuditRunResult(
+            schema_version=CURRENT_SCHEMA_VERSION,
             run_id=audit_run_id,
             suite_id=suite.suite_id,
             subject_fingerprint=subject_fingerprint,
