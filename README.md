@@ -32,6 +32,23 @@ python -m pip install -e .
 
 ## CLI
 
+Check the installed Audit package, the base config, the Subject Git identity,
+and the public MyHermes compatibility boundary without creating a conversation
+or database:
+
+```bash
+myhermes-audit doctor \
+  --subject-repo ../my-hermes \
+  --subject-config ./local-config.yaml
+```
+
+`--check-langfuse` and `--check-judge` additionally check dependency and
+environment-variable presence. Doctor does not create a Dataset, Trace, Score,
+or model request, and never prints credential values. Before any Trial is
+created, the same separate read-only Subject Capability Probe checks public API
+compatibility. See
+[`docs/subject-capability-probe.md`](docs/subject-capability-probe.md).
+
 校验一个 Suite：
 
 ```bash

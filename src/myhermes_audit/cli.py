@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import math
+import os
 import re
 import sys
 import traceback
@@ -81,6 +84,39 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=argparse.SUPPRESS,
         help="include internal worker diagnostics in the controlled stderr artifact",
+    )
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="check the local Audit installation and public MyHermes capabilities",
+    )
+    doctor_parser.add_argument(
+        "--subject-repo",
+        type=Path,
+        required=True,
+        help="path to the read-only MyHermes repository",
+    )
+    doctor_parser.add_argument(
+        "--subject-config",
+        type=Path,
+        required=True,
+        help="base MyHermes config checked without printing its values",
+    )
+    doctor_parser.add_argument(
+        "--check-langfuse",
+        action="store_true",
+        help="check Langfuse dependency and environment variable presence only",
+    )
+    doctor_parser.add_argument(
+        "--check-judge",
+        action="store_true",
+        help="check Judge dependency and environment variable presence only",
+    )
+    doctor_parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="show internal tracebacks while continuing to redact secret values",
     )
     return parser
 
@@ -164,6 +200,98 @@ def _run_command(arguments: argparse.Namespace) -> int:
     return 0 if outcome.result.summary.passed_count == len(outcome.result.trials) else 1
 
 
+def _doctor_command(arguments: argparse.Namespace) -> int:
+    from myhermes_audit import __version__
+    from myhermes_audit.fingerprint import read_subject_fingerprint
+    from myhermes_audit.integrations.myhermes.capability_runner import (
+        run_subject_capability_probe,
+    )
+    from myhermes_audit.integrations.myhermes.config_builder import (
+        MyHermesConfigBuilder,
+    )
+
+    subject_repo = arguments.subject_repo.expanduser().resolve(strict=False)
+    subject_config = arguments.subject_config.expanduser().resolve(strict=False)
+    fingerprint = read_subject_fingerprint(subject_repo)
+    MyHermesConfigBuilder(subject_config).prepare({})
+    report = run_subject_capability_probe(
+        subject_repo=subject_repo,
+        subject_config=subject_config,
+        subject_commit=fingerprint.git_commit,
+    )
+    langfuse_available = importlib.util.find_spec("langfuse") is not None
+    judge_available = importlib.util.find_spec("openai") is not None
+
+    if arguments.check_langfuse:
+        if not langfuse_available:
+            raise AuditError(
+                "Langfuse dependency is unavailable; install the P2 eval extra",
+                code="doctor_dependency_error",
+                details={"dependency": "langfuse"},
+            )
+        _require_environment_names(
+            ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"),
+            feature="Langfuse",
+        )
+    if arguments.check_judge:
+        if not judge_available:
+            raise AuditError(
+                "Judge dependency is unavailable; install the P2 eval extra",
+                code="doctor_dependency_error",
+                details={"dependency": "openai"},
+            )
+        _require_environment_names(
+            ("AUDIT_JUDGE_MODEL", "AUDIT_JUDGE_API_KEY"),
+            feature="Judge",
+        )
+        timeout = os.environ.get("AUDIT_JUDGE_TIMEOUT_SECONDS")
+        if timeout is not None:
+            try:
+                parsed_timeout = float(timeout)
+                if not math.isfinite(parsed_timeout) or parsed_timeout <= 0:
+                    raise ValueError
+            except ValueError as exc:
+                raise AuditError(
+                    "AUDIT_JUDGE_TIMEOUT_SECONDS must be a positive number",
+                    code="doctor_config_error",
+                    details={"field": "AUDIT_JUDGE_TIMEOUT_SECONDS"},
+                ) from exc
+
+    print(f"Audit version: {__version__}")
+    print(f"Subject commit: {fingerprint.git_commit}")
+    print(f"Subject dirty: {'yes' if fingerprint.dirty else 'no'}")
+    print("Base config: valid")
+    print(
+        "Subject capabilities: "
+        f"{len(report.capabilities) - len(report.missing_capabilities)}"
+        f"/{len(report.capabilities)}"
+    )
+    print(f"Public API fingerprint: {report.public_api_fingerprint}")
+    print(f"Optional dependency langfuse: {_presence(langfuse_available)}")
+    print(f"Optional dependency openai: {_presence(judge_available)}")
+    if arguments.check_langfuse:
+        print("Langfuse config: present; connection not attempted")
+    if arguments.check_judge:
+        print("Judge config: present; model request not attempted")
+    print("Doctor checks completed")
+    return 0
+
+
+def _require_environment_names(names: tuple[str, ...], *, feature: str) -> None:
+    missing = [name for name in names if not os.environ.get(name)]
+    if missing:
+        raise AuditError(
+            f"{feature} configuration is missing required environment variables: "
+            + ", ".join(missing),
+            code="doctor_config_error",
+            details={"feature": feature.lower(), "missing_fields": missing},
+        )
+
+
+def _presence(available: bool) -> str:
+    return "installed" if available else "not installed"
+
+
 def _select_cases(suite: AuditSuite, requested: list[str]) -> list[AuditCase]:
     if len(requested) != len(set(requested)):
         raise UnsupportedCaseError("--case values must not repeat")
@@ -240,6 +368,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _schema_command(arguments.output)
         if arguments.command == "run":
             return _run_command(arguments)
+        if arguments.command == "doctor":
+            return _doctor_command(arguments)
     except AuditError as exc:
         if arguments.debug:
             traceback.print_exc()

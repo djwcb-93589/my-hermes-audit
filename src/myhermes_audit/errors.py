@@ -133,6 +133,12 @@ class SubjectPreflightError(RunnerError):
         super().__init__(message, code="subject_preflight_error", **details)
 
 
+class SubjectCapabilityError(SubjectPreflightError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "subject_capability_error"
+
+
 class UnsupportedCaseError(RunnerError):
     def __init__(self, message: str, **details: Any) -> None:
         super().__init__(message, code="unsupported_case", **details)

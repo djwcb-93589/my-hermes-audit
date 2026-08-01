@@ -9,6 +9,7 @@ import re
 import signal
 import sys
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -193,9 +194,10 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         # This is the first hermes import in the worker. All environment and
         # cwd checks above have already completed.
         from hermes.config import (
+            BACKGROUND_REVIEW_CONFIG,
+            BROWSER_CONFIG,
             DB_PATH,
             HERMES_HOME,
-            _config,
             client,
         )
         from hermes.conversation import run_conversation
@@ -220,7 +222,10 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
             strict=False
         ):
             raise RuntimeError("MyHermes loaded a different DB_PATH")
-        _assert_disabled_capabilities(_config)
+        _assert_public_capability_boundary(
+            browser_config=BROWSER_CONFIG,
+            background_review_config=BACKGROUND_REVIEW_CONFIG,
+        )
         model_client = client
         process_manager = default_process_manager
         connection = init_db(str(request.sqlite_path))
@@ -421,20 +426,21 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
     )
 
 
-def _assert_disabled_capabilities(config: object) -> None:
-    if not isinstance(config, dict):
-        raise RuntimeError("MyHermes config did not produce a mapping")
-    if config.get("background_review", {}).get("enabled") is not False:
-        raise RuntimeError("background review must be disabled")
-    if config.get("browser", {}).get("enabled") is not False:
-        raise RuntimeError("browser must be disabled")
-    plugins = config.get("plugins", {})
+def _assert_public_capability_boundary(
+    *,
+    browser_config: object,
+    background_review_config: object,
+) -> None:
     if (
-        plugins.get("enabled") != []
-        or plugins.get("search_paths") != []
-        or plugins.get("enable_project_plugins") is not False
+        not isinstance(background_review_config, Mapping)
+        or background_review_config.get("enabled") is not False
     ):
-        raise RuntimeError("plugins must be disabled")
+        raise RuntimeError("background review must be disabled")
+    if (
+        not isinstance(browser_config, Mapping)
+        or browser_config.get("enabled") is not False
+    ):
+        raise RuntimeError("browser must be disabled")
 
 
 def _safe_status(value: object, default: str) -> str:

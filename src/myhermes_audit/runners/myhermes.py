@@ -38,6 +38,13 @@ from myhermes_audit.errors import (
     WorkerProcessError,
     WorkerProtocolError,
 )
+from myhermes_audit.fingerprint import read_subject_fingerprint
+from myhermes_audit.integrations.myhermes.capability_contracts import (
+    SubjectCapabilityReport,
+)
+from myhermes_audit.integrations.myhermes.capability_runner import (
+    run_subject_capability_probe,
+)
 from myhermes_audit.integrations.myhermes.config_builder import (
     MyHermesConfigBuilder,
 )
@@ -131,6 +138,11 @@ class MyHermesTrialRunner:
                 self._parent_environment[upper] = value
         self._sensitive_values = sensitive_environment_values(os.environ)
         self._config_builder = MyHermesConfigBuilder(requested_config)
+        self._capability_report: SubjectCapabilityReport | None = None
+
+    @property
+    def capability_report(self) -> SubjectCapabilityReport | None:
+        return self._capability_report
 
     def preflight(self, cases: Sequence[AuditCase]) -> None:
         self._preflight_subject()
@@ -153,6 +165,16 @@ class MyHermesTrialRunner:
         ):
             raise SubjectPreflightError(
                 "subject repository does not contain a regular importable hermes package"
+            )
+        fingerprint = read_subject_fingerprint(self.subject_repo)
+        if (
+            self._capability_report is None
+            or self._capability_report.subject_commit != fingerprint.git_commit
+        ):
+            self._capability_report = run_subject_capability_probe(
+                subject_repo=self.subject_repo,
+                subject_config=self.subject_config,
+                subject_commit=fingerprint.git_commit,
             )
 
     def _preflight_case(self, case: AuditCase) -> None:

@@ -7,11 +7,15 @@ from myhermes_audit.integrations.myhermes.contracts import (
     WorkerArtifactPaths,
     WorkerStatus,
 )
+from myhermes_audit.integrations.myhermes.capability_contracts import (
+    SubjectCapabilityReport,
+)
 
 __all__ = (
     "MyHermesWorkerRequest",
     "MyHermesWorkerResult",
     "ObservationBundle",
+    "SubjectCapabilityReport",
     "WorkerArtifactPaths",
     "WorkerStatus",
 )
