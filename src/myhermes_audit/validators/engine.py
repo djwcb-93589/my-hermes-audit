@@ -6,7 +6,7 @@ from collections.abc import Iterable
 
 from pydantic import Field, StrictBool, model_validator
 
-from myhermes_audit.contracts import AuditCase, MetricResult
+from myhermes_audit.contracts import AuditCase, JudgeExpectation, MetricResult
 from myhermes_audit.contracts.common import ContractModel, Identifier, NonEmptyText
 from myhermes_audit.contracts.suite import (
     EvaluatorKind,
@@ -29,6 +29,7 @@ _DETERMINISTIC_GROUPS = frozenset({"all", "files", "texts", "json_values"})
 
 class EvaluatorValidationResult(ContractModel):
     evaluator_id: Identifier
+    evaluator_kind: EvaluatorKind
     required: StrictBool
     passed: StrictBool
     metric_names: list[NonEmptyText] = Field(min_length=1)
@@ -67,12 +68,21 @@ class ValidatorResultsArtifact(ContractModel):
     def hard_gates_passed(self) -> bool:
         return all(item.passed for item in self.evaluator_results if item.required)
 
+    @property
+    def deterministic_hard_gates_passed(self) -> bool:
+        return all(
+            item.passed
+            for item in self.evaluator_results
+            if item.required and item.evaluator_kind is EvaluatorKind.DETERMINISTIC
+        )
+
 
 def preflight_evaluators(case: AuditCase) -> None:
     """Reject unsupported or ambiguous evaluator declarations before execution."""
 
     covered_groups: set[str] = set()
     tool_trajectory_covered = False
+    covered_judges: set[int] = set()
     for evaluator in case.evaluators:
         if evaluator.kind is EvaluatorKind.DETERMINISTIC:
             group = _deterministic_group(evaluator, case_id=case.case_id)
@@ -108,6 +118,16 @@ def preflight_evaluators(case: AuditCase) -> None:
                 )
             tool_trajectory_covered = True
             continue
+        if evaluator.kind is EvaluatorKind.LLM_JUDGE:
+            index, _ = resolve_judge_expectation(case, evaluator)
+            if index in covered_judges:
+                raise UnsupportedCaseError(
+                    "a Judge expectation cannot be evaluated more than once",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            covered_judges.add(index)
+            continue
         raise UnsupportedCaseError(
             "evaluator kind is outside the P1 boundary",
             case_id=case.case_id,
@@ -125,6 +145,10 @@ def preflight_evaluators(case: AuditCase) -> None:
             orphan_groups.append(group)
     if case.expected.tool_trajectories and not tool_trajectory_covered:
         orphan_groups.append("tool_trajectories")
+    if case.expected.judges and covered_judges != set(
+        range(len(case.expected.judges))
+    ):
+        orphan_groups.append("judges")
     if orphan_groups:
         raise UnsupportedCaseError(
             "P1 expectations must be attached to an evaluator",
@@ -144,11 +168,14 @@ def evaluate_case(
     evaluator_results: list[EvaluatorValidationResult] = []
     metrics: list[MetricResult] = []
     for evaluator in case.evaluators:
+        if evaluator.kind is EvaluatorKind.LLM_JUDGE:
+            continue
         current = _evaluate_one(case, evaluator, context)
         metrics.extend(current)
         evaluator_results.append(
             EvaluatorValidationResult(
                 evaluator_id=evaluator.evaluator_id,
+                evaluator_kind=evaluator.kind,
                 required=evaluator.required,
                 passed=all(metric.passed is True for metric in current),
                 metric_names=[metric.metric_name for metric in current],
@@ -207,6 +234,16 @@ def _evaluate_one(
                 source=MetricSource(source),
                 error=exc,
             )
+        result = result.model_copy(
+            update={
+                "metadata": {
+                    **result.metadata,
+                    "evaluator_id": evaluator.evaluator_id,
+                    "evaluator_kind": evaluator.kind.value,
+                    "required": evaluator.required,
+                }
+            }
+        )
         results.append(result)
     return results
 
@@ -230,6 +267,40 @@ def _validate_tool_config(evaluator: EvaluatorSpec, *, case_id: str) -> None:
             case_id=case_id,
             evaluator_id=evaluator.evaluator_id,
         )
+
+
+def resolve_judge_expectation(
+    case: AuditCase,
+    evaluator: EvaluatorSpec,
+) -> tuple[int, JudgeExpectation]:
+    if set(evaluator.config) != {"rubric_ref"}:
+        raise UnsupportedCaseError(
+            "llm_judge config must contain only rubric_ref",
+            case_id=case.case_id,
+            evaluator_id=evaluator.evaluator_id,
+        )
+    reference = evaluator.config.get("rubric_ref")
+    if not isinstance(reference, str) or not reference.startswith("judges."):
+        raise UnsupportedCaseError(
+            "llm_judge rubric_ref must use judges.<zero-based-index>",
+            case_id=case.case_id,
+            evaluator_id=evaluator.evaluator_id,
+        )
+    suffix = reference.removeprefix("judges.")
+    if not suffix.isdigit() or (len(suffix) > 1 and suffix.startswith("0")):
+        raise UnsupportedCaseError(
+            "llm_judge rubric_ref has an invalid index",
+            case_id=case.case_id,
+            evaluator_id=evaluator.evaluator_id,
+        )
+    index = int(suffix)
+    if index >= len(case.expected.judges):
+        raise UnsupportedCaseError(
+            "llm_judge rubric_ref is out of range",
+            case_id=case.case_id,
+            evaluator_id=evaluator.evaluator_id,
+        )
+    return index, case.expected.judges[index]
 
 
 def _has_p1_tool_constraint(
@@ -272,4 +343,5 @@ __all__ = (
     "ValidatorResultsArtifact",
     "evaluate_case",
     "preflight_evaluators",
+    "resolve_judge_expectation",
 )

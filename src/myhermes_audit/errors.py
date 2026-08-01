@@ -178,3 +178,76 @@ class ValidatorError(RunnerError):
 class ReportError(RunnerError):
     def __init__(self, message: str, **details: Any) -> None:
         super().__init__(message, code="report_error", **details)
+
+
+class IntegrationError(AuditError):
+    def __init__(self, message: str, *, code: str, **details: Any) -> None:
+        super().__init__(message, code=code, details=details)
+
+
+class LangfuseDependencyError(IntegrationError):
+    def __init__(self, message: str = "Langfuse dependency is unavailable") -> None:
+        super().__init__(message, code="langfuse_dependency_error")
+
+
+class LangfuseConfigError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="langfuse_config_error", **details)
+
+
+class LangfuseConnectionError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="langfuse_connection_error", **details)
+
+
+class DatasetSyncError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="dataset_sync_error", **details)
+
+
+class ExperimentPublishError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="experiment_publish_error", **details)
+
+
+class ScorePublishError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="score_publish_error", **details)
+
+
+class JudgeDependencyError(IntegrationError):
+    def __init__(self, message: str = "Judge dependency is unavailable") -> None:
+        super().__init__(message, code="judge_dependency_error")
+
+
+class JudgeConfigError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="judge_config_error", **details)
+
+
+class JudgeInvocationError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="judge_invocation_error", **details)
+
+
+class JudgeTimeoutError(JudgeInvocationError):
+    def __init__(self, message: str = "Judge request timed out", **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "judge_timeout_error"
+
+
+class JudgeParseError(JudgeInvocationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "judge_parse_error"
+
+
+class JudgeProtocolError(JudgeInvocationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "judge_protocol_error"
+
+
+class ContentRedactionError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="content_redaction_error", **details)

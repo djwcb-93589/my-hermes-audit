@@ -33,6 +33,7 @@ class AuditFingerprint(ContractModel):
     """Audit 代码、Suite 与平台环境的可复现身份。"""
 
     audit_version: NonEmptyText
+    audit_commit: GitObjectId | None = None
     suite_sha256: Sha256Digest
     python_version: NonEmptyText
     platform: NonEmptyText

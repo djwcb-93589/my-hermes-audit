@@ -130,8 +130,13 @@ def build_audit_fingerprint(
     """构造当前 Audit 代码、Suite 与 Python 平台指纹。"""
 
     timestamp = created_at or datetime.now(timezone.utc)
+    try:
+        audit_commit = _run_git(Path(__file__).resolve().parents[2], "rev-parse", "HEAD")
+    except FingerprintError:
+        audit_commit = None
     return AuditFingerprint(
         audit_version=audit_version,
+        audit_commit=audit_commit,
         suite_sha256=suite_sha256(suite),
         python_version=platform_module.python_version(),
         platform=platform_module.platform(),

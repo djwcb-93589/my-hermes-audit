@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import math
 import os
 import re
 import sys
@@ -85,6 +84,56 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="include internal worker diagnostics in the controlled stderr artifact",
     )
+    run_parser.add_argument(
+        "--judge",
+        action="store_true",
+        help="enable the environment-configured LLM Judge",
+    )
+    run_parser.add_argument(
+        "--langfuse",
+        action="store_true",
+        help="ensure the Dataset and publish this run as a Langfuse Experiment",
+    )
+    run_parser.add_argument(
+        "--dataset-name",
+        help="Langfuse Dataset name required with --langfuse",
+    )
+    run_parser.add_argument(
+        "--experiment-name",
+        help="Langfuse Experiment/Dataset Run name required with --langfuse",
+    )
+    run_parser.add_argument(
+        "--langfuse-no-content",
+        action="store_true",
+        help="publish hashes, lengths, statuses, and metrics without input/output content",
+    )
+
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="plan or perform non-destructive Langfuse Dataset synchronization",
+    )
+    sync_parser.add_argument("suite", type=Path, help="path to the Suite YAML")
+    sync_parser.add_argument(
+        "--dataset-name",
+        required=True,
+        help="Langfuse Dataset name",
+    )
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="build the local plan without importing, connecting, or writing Langfuse",
+    )
+    sync_parser.add_argument(
+        "--langfuse-no-content",
+        action="store_true",
+        help="omit input and expected-output content from the remote projection",
+    )
+    sync_parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="show internal tracebacks while continuing to redact secret values",
+    )
 
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -158,6 +207,12 @@ def _schema_command(output: Path | None) -> int:
 
 
 def _run_command(arguments: argparse.Namespace) -> int:
+    from myhermes_audit.integrations.langfuse import (
+        LangfuseV4Adapter,
+        build_dataset_sync_plan,
+    )
+    from myhermes_audit.integrations.judge import OpenAICompatibleJudgeAdapter
+    from myhermes_audit.judges import JudgeService
     from myhermes_audit.reports import (
         render_console_summary,
         write_json_report,
@@ -168,6 +223,7 @@ def _run_command(arguments: argparse.Namespace) -> int:
     suite_path = arguments.suite.expanduser().resolve(strict=False)
     suite = load_suite(suite_path)
     selected = _select_cases(suite, arguments.case_ids)
+    _validate_run_integration_options(arguments)
     output = _report_path(arguments.output, suite.suite_id)
     _validate_report_destination(
         output,
@@ -176,28 +232,97 @@ def _run_command(arguments: argparse.Namespace) -> int:
         subject_repo=arguments.subject_repo,
         subject_config=arguments.subject_config,
     )
-    runner = MyHermesTrialRunner(
-        subject_repo=arguments.subject_repo,
-        subject_config=arguments.subject_config,
-        debug=arguments.debug,
+    judge_adapter = None
+    langfuse_adapter = None
+    try:
+        if arguments.judge:
+            judge_adapter = OpenAICompatibleJudgeAdapter.from_environment()
+        langfuse_dataset = None
+        if arguments.langfuse:
+            plan = build_dataset_sync_plan(
+                suite,
+                dataset_name=arguments.dataset_name,
+                dry_run=False,
+                no_content=arguments.langfuse_no_content,
+            )
+            langfuse_adapter = LangfuseV4Adapter.from_environment()
+            langfuse_adapter.check_connection()
+            langfuse_dataset = langfuse_adapter.sync_dataset(plan)
+
+        runner = MyHermesTrialRunner(
+            subject_repo=arguments.subject_repo,
+            subject_config=arguments.subject_config,
+            debug=arguments.debug,
+        )
+        orchestrator = AuditOrchestrator(
+            runner=runner,
+            subject_repo=arguments.subject_repo,
+            judge_service=JudgeService(judge_adapter),
+            langfuse=langfuse_adapter,
+            langfuse_dataset=langfuse_dataset,
+            experiment_name=arguments.experiment_name,
+            langfuse_no_content=arguments.langfuse_no_content,
+        )
+        outcome = orchestrator.run(
+            suite,
+            cases=selected,
+            preserve_on_failure=arguments.preserve_on_failure,
+        )
+        write_json_report(output, outcome.result)
+        sys.stdout.write(render_console_summary(outcome.result))
+        print(f"Report:             {output}")
+        if outcome.preserved_sandboxes:
+            print("Preserved Sandboxes:")
+            for path in outcome.preserved_sandboxes:
+                print(f"- {path}")
+        has_trial_failure = (
+            outcome.result.summary.passed_count != len(outcome.result.trials)
+        )
+        has_integration_failure = bool(outcome.result.integration_errors)
+        return 1 if has_trial_failure or has_integration_failure else 0
+    finally:
+        try:
+            if judge_adapter is not None:
+                judge_adapter.shutdown()
+        finally:
+            if langfuse_adapter is not None:
+                langfuse_adapter.shutdown()
+
+
+def _sync_command(arguments: argparse.Namespace) -> int:
+    from myhermes_audit.integrations.langfuse import (
+        LangfuseV4Adapter,
+        build_dataset_sync_plan,
+        dry_run_sync_result,
     )
-    orchestrator = AuditOrchestrator(
-        runner=runner,
-        subject_repo=arguments.subject_repo,
-    )
-    outcome = orchestrator.run(
+
+    suite = load_suite(arguments.suite.expanduser().resolve(strict=False))
+    plan = build_dataset_sync_plan(
         suite,
-        cases=selected,
-        preserve_on_failure=arguments.preserve_on_failure,
+        dataset_name=arguments.dataset_name,
+        dry_run=arguments.dry_run,
+        no_content=arguments.langfuse_no_content,
     )
-    write_json_report(output, outcome.result)
-    sys.stdout.write(render_console_summary(outcome.result))
-    print(f"Report:             {output}")
-    if outcome.preserved_sandboxes:
-        print("Preserved Sandboxes:")
-        for path in outcome.preserved_sandboxes:
-            print(f"- {path}")
-    return 0 if outcome.result.summary.passed_count == len(outcome.result.trials) else 1
+    if arguments.dry_run:
+        result = dry_run_sync_result(plan)
+    else:
+        adapter = LangfuseV4Adapter.from_environment()
+        try:
+            adapter.check_connection()
+            result = adapter.sync_dataset(plan)
+            adapter.flush()
+        finally:
+            adapter.shutdown()
+    print(f"Dataset:           {result.dataset.dataset_name}")
+    print(f"Suite SHA-256:     {result.dataset.suite_sha256}")
+    print(f"Planned items:     {result.planned_upsert_count}")
+    print(f"Added:             {_count_or_unknown(result.added_count)}")
+    print(f"Updated/versioned: {_count_or_unknown(result.updated_count)}")
+    print(f"Unchanged:         {_count_or_unknown(result.unchanged_count)}")
+    print(f"Remote write:      {'no' if result.dry_run else 'yes'}")
+    for warning in result.warnings:
+        print(f"Warning:           {warning}")
+    return 0
 
 
 def _doctor_command(arguments: argparse.Namespace) -> int:
@@ -223,39 +348,17 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
     judge_available = importlib.util.find_spec("openai") is not None
 
     if arguments.check_langfuse:
-        if not langfuse_available:
-            raise AuditError(
-                "Langfuse dependency is unavailable; install the P2 eval extra",
-                code="doctor_dependency_error",
-                details={"dependency": "langfuse"},
-            )
-        _require_environment_names(
-            ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"),
-            feature="Langfuse",
-        )
+        from myhermes_audit.integrations.langfuse import LangfuseV4Adapter
+
+        langfuse_adapter = LangfuseV4Adapter.from_environment()
+        langfuse_adapter.shutdown()
     if arguments.check_judge:
-        if not judge_available:
-            raise AuditError(
-                "Judge dependency is unavailable; install the P2 eval extra",
-                code="doctor_dependency_error",
-                details={"dependency": "openai"},
-            )
-        _require_environment_names(
-            ("AUDIT_JUDGE_MODEL", "AUDIT_JUDGE_API_KEY"),
-            feature="Judge",
+        from myhermes_audit.integrations.judge import (
+            OpenAICompatibleJudgeAdapter,
         )
-        timeout = os.environ.get("AUDIT_JUDGE_TIMEOUT_SECONDS")
-        if timeout is not None:
-            try:
-                parsed_timeout = float(timeout)
-                if not math.isfinite(parsed_timeout) or parsed_timeout <= 0:
-                    raise ValueError
-            except ValueError as exc:
-                raise AuditError(
-                    "AUDIT_JUDGE_TIMEOUT_SECONDS must be a positive number",
-                    code="doctor_config_error",
-                    details={"field": "AUDIT_JUDGE_TIMEOUT_SECONDS"},
-                ) from exc
+
+        judge_adapter = OpenAICompatibleJudgeAdapter.from_environment()
+        judge_adapter.shutdown()
 
     print(f"Audit version: {__version__}")
     print(f"Subject commit: {fingerprint.git_commit}")
@@ -277,19 +380,54 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def _require_environment_names(names: tuple[str, ...], *, feature: str) -> None:
-    missing = [name for name in names if not os.environ.get(name)]
-    if missing:
-        raise AuditError(
-            f"{feature} configuration is missing required environment variables: "
-            + ", ".join(missing),
-            code="doctor_config_error",
-            details={"feature": feature.lower(), "missing_fields": missing},
-        )
-
-
 def _presence(available: bool) -> str:
     return "installed" if available else "not installed"
+
+
+def _count_or_unknown(value: int | None) -> str:
+    return "unknown (no remote connection)" if value is None else str(value)
+
+
+def _validate_run_integration_options(arguments: argparse.Namespace) -> None:
+    if arguments.langfuse:
+        missing = [
+            name
+            for name, value in (
+                ("--dataset-name", arguments.dataset_name),
+                ("--experiment-name", arguments.experiment_name),
+            )
+            if value is None or not value.strip()
+        ]
+        if missing:
+            raise AuditError(
+                "--langfuse requires " + " and ".join(missing),
+                code="langfuse_config_error",
+                details={"missing_options": missing},
+            )
+        experiment_name = arguments.experiment_name.strip()
+        if len(experiment_name) > 200 or any(
+            ord(character) < 32 for character in experiment_name
+        ):
+            raise AuditError(
+                "--experiment-name must be a safe name up to 200 characters",
+                code="langfuse_config_error",
+                details={"field": "--experiment-name"},
+            )
+        arguments.experiment_name = experiment_name
+        return
+    unused = []
+    if arguments.dataset_name is not None:
+        unused.append("--dataset-name")
+    if arguments.experiment_name is not None:
+        unused.append("--experiment-name")
+    if arguments.langfuse_no_content:
+        unused.append("--langfuse-no-content")
+    if unused:
+        raise AuditError(
+            "Langfuse run options require --langfuse: " + ", ".join(unused),
+            code="langfuse_config_error",
+            details={"unused_options": unused},
+        )
 
 
 def _select_cases(suite: AuditSuite, requested: list[str]) -> list[AuditCase]:
@@ -368,17 +506,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _schema_command(arguments.output)
         if arguments.command == "run":
             return _run_command(arguments)
+        if arguments.command == "sync":
+            return _sync_command(arguments)
         if arguments.command == "doctor":
             return _doctor_command(arguments)
     except AuditError as exc:
         if arguments.debug:
-            traceback.print_exc()
+            _print_safe_traceback()
         else:
             print(f"Audit command failed: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:
         if arguments.debug:
-            traceback.print_exc()
+            _print_safe_traceback()
         else:
             print(
                 f"Unexpected error: {type(exc).__name__}",
@@ -387,6 +527,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 3
     parser.error(f"unsupported command: {arguments.command}")
     return 2
+
+
+def _print_safe_traceback() -> None:
+    from myhermes_audit.security import redact_text, sensitive_environment_values
+
+    safe = redact_text(
+        traceback.format_exc(),
+        sensitive_environment_values(os.environ),
+    )
+    sys.stderr.write(safe)
 
 
 def entrypoint() -> None:

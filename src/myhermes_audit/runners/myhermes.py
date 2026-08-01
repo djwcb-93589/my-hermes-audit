@@ -18,6 +18,10 @@ from pydantic import ValidationError
 from myhermes_audit.artifacts import atomic_write_json, atomic_write_text
 from myhermes_audit.contracts import (
     AuditCase,
+    ModelObservationSummary,
+    RunObservationSummary,
+    ToolObservationSummary,
+    TrialObservationSummary,
     TrialRuntimeSummary,
     TrialWarning,
 )
@@ -52,6 +56,7 @@ from myhermes_audit.integrations.myhermes.contracts import (
     MyHermesWorkerRequest,
     MyHermesWorkerResult,
     ObservationBundle,
+    WORKER_PROTOCOL_VERSION,
     WorkerArtifactPaths,
     WorkerError,
     WorkerMode,
@@ -213,6 +218,7 @@ class MyHermesTrialRunner:
             if item.kind not in {
                 EvaluatorKind.DETERMINISTIC,
                 EvaluatorKind.TOOL_TRAJECTORY,
+                EvaluatorKind.LLM_JUDGE,
             }
         ]
         if unsupported_evaluators:
@@ -222,9 +228,7 @@ class MyHermesTrialRunner:
                 evaluator_kinds=unsupported_evaluators,
             )
         if (
-            case.expected.memories
-            or case.expected.background_reviews
-            or case.expected.judges
+            case.expected.memories or case.expected.background_reviews
         ):
             raise UnsupportedCaseError(
                 "case declares expectations outside the P1 boundary",
@@ -258,6 +262,7 @@ class MyHermesTrialRunner:
         captured_stdout = ""
         captured_stderr = ""
         process = None
+        subject_model: str | None = None
         sensitive_values = self._sensitive_values
         try:
             turns = [
@@ -280,6 +285,10 @@ class MyHermesTrialRunner:
             prepared = self._config_builder.write(
                 sandbox.hermes_home / "config.yaml",
                 case.execution.config_overrides,
+            )
+            subject_model = _safe_subject_model(
+                prepared.document,
+                sensitive_values,
             )
             environment = self._build_worker_environment(
                 case,
@@ -358,6 +367,13 @@ class MyHermesTrialRunner:
                 observations,
                 returncode=process.returncode,
             )
+            result, transcript = _redact_worker_content(
+                result,
+                transcript,
+                sensitive_values,
+            )
+            atomic_write_json(paths.worker_result, result)
+            atomic_write_json(paths.transcript, transcript)
             status = (
                 RunnerStatus.COMPLETED
                 if result.worker_status is WorkerStatus.COMPLETED
@@ -375,6 +391,7 @@ class MyHermesTrialRunner:
                 paths,
                 status=status,
                 observations=observations,
+                subject_model=subject_model,
             )
         except Exception as exc:
             worker_warnings: list[WorkerWarning] = []
@@ -569,15 +586,21 @@ class MyHermesTrialRunner:
         except subprocess.TimeoutExpired as exc:
             raise WorkerProcessError("worker process group did not terminate") from exc
 
-    @staticmethod
     def _outcome_from_result(
+        self,
         result: MyHermesWorkerResult,
         paths: WorkerArtifactPaths,
         *,
         status: RunnerStatus,
         observations: ObservationBundle | None = None,
+        subject_model: str | None = None,
         include_runtime: bool = True,
     ) -> TrialRunnerOutcome:
+        result, _ = _redact_worker_content(
+            result,
+            None,
+            self._sensitive_values,
+        )
         tool_calls = (
             None
             if observations is None
@@ -601,6 +624,7 @@ class MyHermesTrialRunner:
             turns=tuple(result.turns),
             runtime=(
                 TrialRuntimeSummary(
+                    subject_model=subject_model,
                     iterations=result.iterations,
                     tool_batches=result.tool_batches,
                     tool_call_count=result.tool_call_count,
@@ -612,6 +636,7 @@ class MyHermesTrialRunner:
                 if include_runtime
                 else None
             ),
+            observations=_local_observations(observations),
             tool_calls=tool_calls,
             tool_trace_complete=(
                 status is RunnerStatus.COMPLETED
@@ -634,6 +659,127 @@ class MyHermesTrialRunner:
                 for item in result.warnings
             ),
         )
+
+
+def _local_observations(
+    observations: ObservationBundle | None,
+) -> TrialObservationSummary | None:
+    if observations is None:
+        return None
+    return TrialObservationSummary(
+        worker_protocol_version=WORKER_PROTOCOL_VERSION,
+        runs=[
+            RunObservationSummary(
+                run_id=item.run_id,
+                parent_run_id=item.parent_run_id,
+                status=item.status,
+                stop_reason=item.stop_reason,
+                iterations=item.iterations,
+                tool_call_count=item.tool_call_count,
+                has_final_reply=item.has_final_reply,
+                duration_ms=item.duration_ms,
+            )
+            for item in observations.runs
+        ],
+        model_calls=[
+            ModelObservationSummary(
+                run_id=item.run_id,
+                parent_run_id=item.parent_run_id,
+                finish_reason=item.finish_reason,
+                prompt_tokens=item.prompt_tokens,
+                completion_tokens=item.completion_tokens,
+                total_tokens=item.total_tokens,
+                duration_ms=item.duration_ms,
+                tool_call_count=item.tool_call_count,
+                error_category=item.error_category,
+            )
+            for item in observations.model_calls
+        ],
+        tool_calls=[
+            ToolObservationSummary(
+                run_id=item.run_id,
+                parent_run_id=item.parent_run_id,
+                tool_call_id=item.tool_call_id,
+                tool_name=item.tool_name,
+                status=item.status,
+                success=item.success,
+                error_type=item.error_type,
+                duration_ms=item.duration_ms,
+            )
+            for item in observations.tool_calls
+        ],
+        truncated=observations.truncated,
+    )
+
+
+def _redact_worker_content(
+    result: MyHermesWorkerResult,
+    transcript: WorkerTranscript | None,
+    sensitive_values: tuple[str, ...],
+) -> tuple[MyHermesWorkerResult, WorkerTranscript | None]:
+    def safe_turn(turn):
+        return turn.model_copy(
+            update={
+                "user_message": redact_text(
+                    turn.user_message,
+                    sensitive_values,
+                ),
+                "final_output": (
+                    None
+                    if turn.final_output is None
+                    else redact_text(turn.final_output, sensitive_values)
+                ),
+            }
+        )
+
+    safe_turns = [safe_turn(turn) for turn in result.turns]
+    safe_error = (
+        None
+        if result.error is None
+        else result.error.model_copy(
+            update={
+                "message": redact_text(result.error.message, sensitive_values),
+            }
+        )
+    )
+    safe_warnings = [
+        warning.model_copy(
+            update={
+                "message": redact_text(warning.message, sensitive_values),
+            }
+        )
+        for warning in result.warnings
+    ]
+    safe_result = result.model_copy(
+        update={
+            "final_output": (
+                None
+                if result.final_output is None
+                else redact_text(result.final_output, sensitive_values)
+            ),
+            "turns": safe_turns,
+            "error": safe_error,
+            "warnings": safe_warnings,
+        }
+    )
+    safe_transcript = (
+        None
+        if transcript is None
+        else transcript.model_copy(
+            update={"turns": [safe_turn(turn) for turn in transcript.turns]}
+        )
+    )
+    return safe_result, safe_transcript
+
+
+def _safe_subject_model(
+    document: dict,
+    sensitive_values: tuple[str, ...],
+) -> str | None:
+    value = document.get("model")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return redact_text(value.strip(), sensitive_values)[:256]
 
 
 def _case_turns(case: AuditCase) -> list[str]:

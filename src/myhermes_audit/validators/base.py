@@ -6,7 +6,13 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from myhermes_audit.contracts import MetricEvidence, MetricResult, MetricSource
+from myhermes_audit.contracts import (
+    MetricError,
+    MetricEvidence,
+    MetricResult,
+    MetricSource,
+    MetricStatus,
+)
 from myhermes_audit.contracts.common import validate_relative_path
 from myhermes_audit.errors import UnsafePathError, ValidatorError
 
@@ -100,17 +106,26 @@ def validator_error_metric(
     error: Exception,
 ) -> MetricResult:
     error_type = type(error).__name__
-    return metric(
-        name=name,
+    return MetricResult(
+        metric_name=name,
         source=source,
-        passed=False,
+        status=MetricStatus.ERROR,
+        value=None,
+        passed=None,
         reason=f"evaluator error: {error_type}",
-        evidence_items=[
+        evidence=[
             evidence(
                 kind="validator_error",
                 description=f"validator_error={error_type}",
             )
         ],
+        evaluator_version=EVALUATOR_VERSION,
+        error=MetricError(
+            error_type="validator_error",
+            message=f"validator raised {error_type}",
+            retryable=False,
+            details={"exception_type": error_type},
+        ),
     )
 
 

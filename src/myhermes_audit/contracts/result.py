@@ -28,6 +28,12 @@ from myhermes_audit.contracts.common import (
     UtcDatetime,
 )
 from myhermes_audit.contracts.fingerprint import AuditFingerprint, SubjectFingerprint
+from myhermes_audit.contracts.judge import JudgeResult, JudgeRunSummary
+from myhermes_audit.contracts.langfuse import (
+    LangfuseExperimentIdentity,
+    LangfusePublishError,
+    LangfusePublishResult,
+)
 
 
 class TrialStatus(str, Enum):
@@ -49,6 +55,20 @@ class MetricSource(str, Enum):
     BACKGROUND_REVIEW = "background_review"
 
 
+class MetricStatus(str, Enum):
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    ERROR = "error"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class MetricError(ContractModel):
+    error_type: Identifier
+    message: NonEmptyText
+    retryable: StrictBool = False
+    details: JsonObject = Field(default_factory=dict)
+
+
 class MetricEvidence(ContractModel):
     evidence_id: Identifier
     kind: NonEmptyText
@@ -61,11 +81,33 @@ class MetricEvidence(ContractModel):
 class MetricResult(ContractModel):
     metric_name: NonEmptyText
     source: MetricSource
-    value: JsonValue
+    status: MetricStatus = MetricStatus.COMPLETED
+    value: JsonValue | None = None
     passed: StrictBool | None = None
     reason: StrictStr | None = None
     evidence: list[MetricEvidence] = Field(default_factory=list)
     evaluator_version: NonEmptyText
+    error: MetricError | None = None
+    metadata: JsonObject = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_metric_result(self) -> "MetricResult":
+        if self.status is MetricStatus.COMPLETED:
+            if self.error is not None:
+                raise ValueError("completed metrics cannot contain error")
+            if self.value is None:
+                raise ValueError("completed metrics require value")
+            return self
+        if self.value is not None:
+            raise ValueError("non-completed metrics cannot contain value")
+        if self.passed is not None:
+            raise ValueError("non-completed metrics must set passed to null")
+        if self.status is MetricStatus.ERROR:
+            if self.error is None:
+                raise ValueError("error metrics require structured error")
+        elif self.error is not None:
+            raise ValueError("skipped and not_applicable metrics cannot contain error")
+        return self
 
 
 class ArtifactRef(ContractModel):
@@ -108,6 +150,7 @@ class TurnResult(ContractModel):
 
 
 class TrialRuntimeSummary(ContractModel):
+    subject_model: NonEmptyText | None = None
     iterations: NonNegativeInt = 0
     tool_batches: NonNegativeInt = 0
     tool_call_count: NonNegativeInt = 0
@@ -130,12 +173,76 @@ class TrialRuntimeSummary(ContractModel):
         return self
 
 
+class RunObservationSummary(ContractModel):
+    run_id: Identifier
+    parent_run_id: Identifier | None = None
+    status: NonEmptyText
+    stop_reason: NonEmptyText
+    iterations: NonNegativeInt
+    tool_call_count: NonNegativeInt
+    has_final_reply: StrictBool
+    duration_ms: NonNegativeInt | None = None
+
+
+class ModelObservationSummary(ContractModel):
+    run_id: Identifier
+    parent_run_id: Identifier | None = None
+    finish_reason: StrictStr | None = None
+    prompt_tokens: NonNegativeInt | None = None
+    completion_tokens: NonNegativeInt | None = None
+    total_tokens: NonNegativeInt | None = None
+    duration_ms: NonNegativeInt
+    tool_call_count: NonNegativeInt
+    error_category: Identifier | None = None
+
+    @model_validator(mode="after")
+    def validate_tokens(self) -> "ModelObservationSummary":
+        if (
+            self.prompt_tokens is not None
+            and self.completion_tokens is not None
+            and self.total_tokens is not None
+            and self.total_tokens != self.prompt_tokens + self.completion_tokens
+        ):
+            raise ValueError("model total_tokens must equal prompt plus completion")
+        return self
+
+
+class ToolObservationSummary(ContractModel):
+    run_id: Identifier
+    parent_run_id: Identifier | None = None
+    tool_call_id: Identifier
+    tool_name: NonEmptyText
+    status: NonEmptyText
+    success: StrictBool
+    error_type: Identifier | None = None
+    duration_ms: NonNegativeInt
+
+
+class TrialObservationSummary(ContractModel):
+    worker_protocol_version: NonEmptyText
+    runs: list[RunObservationSummary] = Field(default_factory=list)
+    model_calls: list[ModelObservationSummary] = Field(default_factory=list)
+    tool_calls: list[ToolObservationSummary] = Field(default_factory=list)
+    truncated: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_observations(self) -> "TrialObservationSummary":
+        run_ids = [item.run_id for item in self.runs]
+        if len(run_ids) != len(set(run_ids)):
+            raise ValueError("run observations must have unique run_id values")
+        tool_call_ids = [item.tool_call_id for item in self.tool_calls]
+        if len(tool_call_ids) != len(set(tool_call_ids)):
+            raise ValueError("tool observations must have unique tool_call_id values")
+        return self
+
+
 class TrialResult(ContractModel):
     trial_id: Identifier
     run_id: Identifier
     case_id: Identifier
     trial_number: NonNegativeInt
     status: TrialStatus
+    task_passed: StrictBool | None = None
     passed: StrictBool | None = None
     final_output: StrictStr | None = None
     started_at: UtcDatetime | None = None
@@ -143,7 +250,9 @@ class TrialResult(ContractModel):
     duration_ms: NonNegativeInt | None = None
     turns: list[TurnResult] = Field(default_factory=list)
     runtime: TrialRuntimeSummary | None = None
+    observations: TrialObservationSummary | None = None
     metrics: list[MetricResult] = Field(default_factory=list)
+    judge_result: JudgeResult | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     warnings: list[TrialWarning] = Field(default_factory=list)
     error: TrialError | None = None
@@ -170,12 +279,15 @@ class TrialResult(ContractModel):
                 self.error is not None
                 or self.final_output is not None
                 or self.passed is not None
+                or self.task_passed is not None
             ):
                 raise ValueError(
                     "pending and running trials cannot contain terminal results"
                 )
         if self.status is not TrialStatus.COMPLETED and self.passed is True:
             raise ValueError("only completed trials can pass")
+        if self.status is not TrialStatus.COMPLETED and self.task_passed is True:
+            raise ValueError("only completed trials can have task_passed=true")
         if self.status is TrialStatus.TIMEOUT:
             if self.error is None or self.error.error_type != "timeout":
                 raise ValueError("timeout trials require a stable timeout error")
@@ -261,6 +373,7 @@ class AuditSummary(ContractModel):
     trial_count: NonNegativeInt
     passed_count: NonNegativeInt
     pass_rate: StrictFloat = Field(ge=0, le=1)
+    task_success_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
     tool_correctness_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
     duration_p50_ms: NonNegativeInt | None = None
     duration_p95_ms: NonNegativeInt | None = None
@@ -303,6 +416,10 @@ class AuditRunResult(ContractModel):
     trials: list[TrialResult] = Field(default_factory=list)
     cases: list[CaseAggregate] = Field(default_factory=list)
     summary: AuditSummary
+    judge_summary: JudgeRunSummary = Field(default_factory=JudgeRunSummary)
+    experiment_identity: LangfuseExperimentIdentity | None = None
+    langfuse_publish_result: LangfusePublishResult | None = None
+    integration_errors: list[LangfusePublishError] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_run_result(self) -> "AuditRunResult":
@@ -321,6 +438,21 @@ class AuditRunResult(ContractModel):
             raise ValueError("summary.case_count must match case aggregates")
         if self.summary.trial_count != len(self.trials):
             raise ValueError("summary.trial_count must match trials")
+        if self.langfuse_publish_result is None and (
+            self.experiment_identity is not None or self.integration_errors
+        ):
+            raise ValueError(
+                "Langfuse identity/errors require a publication result"
+            )
+        if self.langfuse_publish_result is not None:
+            if self.experiment_identity != self.langfuse_publish_result.experiment:
+                raise ValueError(
+                    "experiment_identity must match the Langfuse publication result"
+                )
+            if self.integration_errors != self.langfuse_publish_result.errors:
+                raise ValueError(
+                    "integration_errors must mirror Langfuse publication errors"
+                )
         passed_count = sum(trial.passed is True for trial in self.trials)
         if self.summary.passed_count != passed_count:
             raise ValueError("summary.passed_count must match passed trials")

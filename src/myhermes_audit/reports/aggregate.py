@@ -9,7 +9,9 @@ from collections.abc import Sequence
 from myhermes_audit.contracts import (
     AuditSummary,
     CaseAggregate,
+    JudgeRunSummary,
     MetricSource,
+    MetricStatus,
     MetricSummary,
     TrialResult,
 )
@@ -48,6 +50,9 @@ def aggregate_audit(
         for trial in trials
         for metric in trial.metrics
         if metric.source is MetricSource.RUNTIME and metric.passed is not None
+        and metric.status is MetricStatus.COMPLETED
+        and metric.metadata.get("required") is True
+        and metric.metadata.get("evaluator_kind") == "tool_trajectory"
     ]
     durations = sorted(
         trial.duration_ms
@@ -64,6 +69,14 @@ def aggregate_audit(
         trial_count=trial_count,
         passed_count=passed_count,
         pass_rate=float(passed_count / trial_count) if trial_count else 0.0,
+        task_success_rate=(
+            float(
+                sum(trial.task_passed is True for trial in trials)
+                / len(trials)
+            )
+            if trials and all(trial.task_passed is not None for trial in trials)
+            else None
+        ),
         tool_correctness_rate=(
             float(sum(value is True for value in tool_outcomes) / len(tool_outcomes))
             if tool_outcomes
@@ -92,7 +105,11 @@ def _metric_summaries(trials: Sequence[TrialResult]) -> list[MetricSummary]:
 
     summaries: list[MetricSummary] = []
     for metric_name in sorted(grouped):
-        metrics = grouped[metric_name]
+        metrics = [
+            metric
+            for metric in grouped[metric_name]
+            if metric.status is MetricStatus.COMPLETED
+        ]
         passed_count = sum(metric.passed is True for metric in metrics)
         numbers = [
             float(metric.value)
@@ -115,6 +132,40 @@ def _metric_summaries(trials: Sequence[TrialResult]) -> list[MetricSummary]:
     return summaries
 
 
+def aggregate_judges(trials: Sequence[TrialResult]) -> JudgeRunSummary:
+    metrics = [
+        metric
+        for trial in trials
+        for metric in trial.metrics
+        if metric.metric_name == "answer_quality"
+        and metric.source is MetricSource.JUDGE
+    ]
+    completed_values = [
+        float(metric.value)
+        for metric in metrics
+        if metric.status is MetricStatus.COMPLETED
+        and type(metric.value) in (int, float)
+    ]
+    return JudgeRunSummary(
+        declared_count=len(metrics),
+        completed_count=sum(
+            metric.status is MetricStatus.COMPLETED for metric in metrics
+        ),
+        skipped_count=sum(
+            metric.status is MetricStatus.SKIPPED for metric in metrics
+        ),
+        error_count=sum(metric.status is MetricStatus.ERROR for metric in metrics),
+        not_applicable_count=sum(
+            metric.status is MetricStatus.NOT_APPLICABLE for metric in metrics
+        ),
+        mean_answer_quality=(
+            float(sum(completed_values) / len(completed_values))
+            if completed_values
+            else None
+        ),
+    )
+
+
 def _nearest_rank(values: Sequence[int], quantile: float) -> int | None:
     """Return sorted[ceil(q*n)-1]; a one-item sample returns that item."""
 
@@ -124,4 +175,4 @@ def _nearest_rank(values: Sequence[int], quantile: float) -> int | None:
     return values[index]
 
 
-__all__ = ("aggregate_audit", "aggregate_cases")
+__all__ = ("aggregate_audit", "aggregate_cases", "aggregate_judges")

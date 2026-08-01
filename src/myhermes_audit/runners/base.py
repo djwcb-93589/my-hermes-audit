@@ -9,6 +9,7 @@ from typing import Protocol, Sequence
 
 from myhermes_audit.contracts import (
     AuditCase,
+    TrialObservationSummary,
     TrialRuntimeSummary,
     TrialWarning,
     TurnResult,
@@ -32,6 +33,7 @@ class TrialRunnerOutcome:
     final_output: str | None
     turns: tuple[TurnResult, ...]
     runtime: TrialRuntimeSummary | None
+    observations: TrialObservationSummary | None
     tool_calls: tuple[ToolTraceEntry, ...] | None
     tool_trace_complete: bool
     artifact_paths: dict[str, Path] = field(default_factory=dict)

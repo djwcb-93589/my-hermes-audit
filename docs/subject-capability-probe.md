@@ -39,6 +39,7 @@ public plugins projection, so Audit does not work around that gap by reading a
 private object or copying the Subject config model.
 
 `myhermes-audit doctor` exposes the same local check. Its optional Langfuse and
-Judge checks inspect dependency and configuration presence only. They do not
-write remote data or send a model request, and output includes names/statuses
-but not credential values or the complete environment.
+Judge checks initialize and immediately close the configured client to validate
+dependency version, required fields, URL and timeout without making a connection.
+They do not write remote data or send a model request, and output includes
+names/statuses but not credential values or the complete environment.

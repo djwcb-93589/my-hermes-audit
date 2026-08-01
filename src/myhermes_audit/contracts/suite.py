@@ -36,6 +36,12 @@ from myhermes_audit.contracts.common import (
     SchemaVersion,
     Sha256Digest,
 )
+from myhermes_audit.contracts.data import (
+    DataClassification,
+    classification_from_metadata,
+    is_classification_downgrade,
+)
+from myhermes_audit.contracts.judge import JudgeExpectation
 from myhermes_audit.contracts.memory import MemoryFixture, MemoryKind, MemoryQuery
 
 
@@ -89,7 +95,19 @@ class TrialConfig(ContractModel):
     timeout_seconds: PositiveInt = 120
     seed: StrictInt | None = None
     preserve_sandbox: StrictBool = False
-    metadata: JsonObject = Field(default_factory=dict)
+    metadata: JsonObject = Field(
+        default_factory=lambda: {
+            "data_classification": DataClassification.INTERNAL.value,
+        }
+    )
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, value: JsonObject) -> JsonObject:
+        normalized = dict(value)
+        classification = classification_from_metadata(normalized)
+        normalized["data_classification"] = classification.value
+        return normalized
 
 
 class RunnerKind(str, Enum):
@@ -363,39 +381,6 @@ class MemoryExpectation(ContractModel):
         return value
 
 
-class JudgeCriterion(ContractModel):
-    name: NonEmptyText
-    description: NonEmptyText
-    weight: StrictInt | StrictFloat = Field(default=1.0, gt=0)
-
-    @field_validator("weight")
-    @classmethod
-    def validate_finite_weight(cls, value: int | float) -> int | float:
-        if not math.isfinite(float(value)):
-            raise ValueError("weight must be finite")
-        return value
-
-
-class JudgeExpectation(ContractModel):
-    rubric: NonEmptyText
-    criteria: list[JudgeCriterion] = Field(default_factory=list)
-    minimum_score: StrictInt | StrictFloat | None = None
-    maximum_score: StrictInt | StrictFloat | None = None
-
-    @model_validator(mode="after")
-    def validate_score_range(self) -> "JudgeExpectation":
-        for value in (self.minimum_score, self.maximum_score):
-            if value is not None and not math.isfinite(float(value)):
-                raise ValueError("judge score bounds must be finite")
-        if (
-            self.minimum_score is not None
-            and self.maximum_score is not None
-            and self.minimum_score > self.maximum_score
-        ):
-            raise ValueError("minimum_score cannot exceed maximum_score")
-        return self
-
-
 class ExpectedSpec(ContractModel):
     files: list[FileExpectation] = Field(default_factory=list)
     texts: list[TextExpectation] = Field(default_factory=list)
@@ -445,6 +430,7 @@ class AuditCase(ContractModel):
     description: StrictStr = ""
     mode: CaseMode
     tags: list[NonEmptyText] = Field(default_factory=list)
+    metadata: JsonObject = Field(default_factory=dict)
     input: CaseInput
     execution: ExecutionSpec = Field(default_factory=ExecutionSpec)
     fixture: FixtureSpec = Field(default_factory=FixtureSpec)
@@ -465,6 +451,8 @@ class AuditCase(ContractModel):
             raise ValueError("evaluator_id must be unique within an AuditCase")
         if len(self.tags) != len(set(self.tags)):
             raise ValueError("case tags must not repeat")
+        if "data_classification" in self.metadata:
+            classification_from_metadata(self.metadata)
         return self
 
 
@@ -486,4 +474,16 @@ class AuditSuite(ContractModel):
             raise ValueError("case_id must be unique within an AuditSuite")
         if len(self.tags) != len(set(self.tags)):
             raise ValueError("suite tags must not repeat")
+        suite_classification = classification_from_metadata(self.defaults.metadata)
+        for case in self.cases:
+            if "data_classification" not in case.metadata:
+                continue
+            case_classification = classification_from_metadata(case.metadata)
+            if is_classification_downgrade(
+                suite_classification,
+                case_classification,
+            ):
+                raise ValueError(
+                    f"case {case.case_id} cannot downgrade the Suite data classification"
+                )
         return self

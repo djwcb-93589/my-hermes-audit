@@ -7,6 +7,7 @@ from myhermes_audit.validators.engine import (
     ValidatorResultsArtifact,
     evaluate_case,
     preflight_evaluators,
+    resolve_judge_expectation,
 )
 from myhermes_audit.validators.json_file import JsonFileValidator
 from myhermes_audit.validators.text import TextValidator
@@ -22,4 +23,5 @@ __all__ = (
     "ValidatorResultsArtifact",
     "evaluate_case",
     "preflight_evaluators",
+    "resolve_judge_expectation",
 )
