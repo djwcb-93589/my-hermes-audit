@@ -195,6 +195,19 @@ def _cleanup_probe_root(root: Path) -> None:
         ) from exc
 
 
+def _missing_capability_label(name: str, failure_type: str | None) -> str:
+    description = {
+        "module_unavailable": "public module unavailable",
+        "symbol_missing": "public symbol missing",
+        "symbol_unavailable": "public symbol unavailable",
+        "symbol_not_callable": "public symbol is not callable",
+        "call_shape_incompatible": "Worker call shape incompatible",
+        "signature_unavailable": "public signature unavailable",
+        "signature_validation_failed": "public signature validation failed",
+    }.get(failure_type)
+    return name if description is None else f"{name} ({description})"
+
+
 def run_subject_capability_probe(
     *,
     subject_repo: Path,
@@ -289,10 +302,23 @@ def run_subject_capability_probe(
     if report is None:
         raise SubjectCapabilityError("Subject Capability Probe returned no report")
     if not report.compatible:
-        missing = ", ".join(report.missing_capabilities)
+        checks = {item.name: item for item in report.capabilities}
+        missing = ", ".join(
+            _missing_capability_label(
+                name,
+                None if checks.get(name) is None else checks[name].failure_type,
+            )
+            for name in report.missing_capabilities
+        )
+        capability_failures = {
+            name: checks[name].failure_type
+            for name in report.missing_capabilities
+            if name in checks and checks[name].failure_type is not None
+        }
         raise SubjectCapabilityError(
             f"required public MyHermes capabilities are missing: {missing}",
             missing_capabilities=list(report.missing_capabilities),
+            capability_failures=capability_failures,
             public_api_fingerprint=report.public_api_fingerprint,
         )
     return report

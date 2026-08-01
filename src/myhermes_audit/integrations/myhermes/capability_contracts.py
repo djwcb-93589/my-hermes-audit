@@ -31,6 +31,13 @@ class SubjectCapabilityCheck(ContractModel):
     module: NonEmptyText
     public_object: NonEmptyText
     signature: StrictStr | None = None
+    failure_type: Identifier | None = None
+
+    @model_validator(mode="after")
+    def validate_failure(self) -> "SubjectCapabilityCheck":
+        if self.available and self.failure_type is not None:
+            raise ValueError("available capability cannot contain a failure type")
+        return self
 
 
 class SubjectCapabilityWarning(ContractModel):

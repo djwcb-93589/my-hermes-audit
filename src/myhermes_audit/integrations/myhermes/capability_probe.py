@@ -26,6 +26,22 @@ from myhermes_audit.serialization import canonical_sha256
 
 _MAX_REQUEST_BYTES = 256 * 1024
 _MEMORY_ADDRESS = re.compile(r"0x[0-9A-Fa-f]+")
+_BIND_PLACEHOLDER = object()
+_RUN_CONVERSATION_KEYWORDS = (
+    "session_key",
+    "enabled_toolsets",
+    "tool_context",
+    "tool_policy",
+    "hook_registry",
+)
+
+
+class _ProjectedDefault:
+    def __repr__(self) -> str:
+        return "<default>"
+
+
+_PROJECTED_DEFAULT = _ProjectedDefault()
 
 
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -62,13 +78,30 @@ def _load_request(path: Path) -> SubjectCapabilityProbeRequest:
     return SubjectCapabilityProbeRequest.model_validate_json(text)
 
 
-def _safe_signature(value: object) -> str | None:
-    if not callable(value):
-        return None
-    rendered = str(inspect.signature(value))
+def _safe_signature(signature: inspect.Signature) -> str:
+    parameters = [
+        parameter
+        if parameter.default is inspect.Parameter.empty
+        else parameter.replace(default=_PROJECTED_DEFAULT)
+        for parameter in signature.parameters.values()
+    ]
+    rendered = str(signature.replace(parameters=parameters))
     if len(rendered) > 4096 or _MEMORY_ADDRESS.search(rendered):
         raise ValueError("public signature is not stable")
     return rendered
+
+
+def _bind_run_conversation_worker_call(signature: inspect.Signature) -> None:
+    signature.bind(
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        **{
+            name: _BIND_PLACEHOLDER
+            for name in _RUN_CONVERSATION_KEYWORDS
+        },
+    )
 
 
 class _ProbeBuilder:
@@ -83,17 +116,33 @@ class _ProbeBuilder:
         module_name: str,
         object_name: str,
         predicate: Callable[[object], bool] | None = None,
+        signature_validator: Callable[[inspect.Signature], None] | None = None,
     ) -> object | None:
         value: object | None = None
         available = False
         signature: str | None = None
+        failure_type: str | None = None
         try:
             module = importlib.import_module(module_name)
-            value = module if object_name == "<module>" else getattr(module, object_name)
-            available = True if predicate is None else bool(predicate(value))
-            if available:
+        except Exception:
+            failure_type = "module_unavailable"
+        else:
+            try:
+                value = (
+                    module
+                    if object_name == "<module>"
+                    else getattr(module, object_name)
+                )
+            except AttributeError:
+                failure_type = "symbol_missing"
+            except Exception:
+                failure_type = "symbol_unavailable"
+        if failure_type is None:
+            inspected_signature: inspect.Signature | None = None
+            if callable(value):
                 try:
-                    signature = _safe_signature(value)
+                    inspected_signature = inspect.signature(value)
+                    signature = _safe_signature(inspected_signature)
                 except (TypeError, ValueError):
                     self.warnings.append(
                         SubjectCapabilityWarning(
@@ -101,8 +150,31 @@ class _ProbeBuilder:
                             message=f"public signature unavailable for capability {name}",
                         )
                     )
-        except Exception:
-            available = False
+            if signature_validator is not None:
+                if not callable(value):
+                    failure_type = "symbol_not_callable"
+                elif inspected_signature is None:
+                    failure_type = "signature_unavailable"
+                else:
+                    try:
+                        signature_validator(inspected_signature)
+                    except TypeError:
+                        failure_type = "call_shape_incompatible"
+                    except Exception:
+                        failure_type = "signature_validation_failed"
+                    else:
+                        available = True
+                        failure_type = None
+            else:
+                try:
+                    available = True if predicate is None else bool(predicate(value))
+                except Exception:
+                    available = False
+                    failure_type = "capability_check_failed"
+                else:
+                    failure_type = (
+                        None if available else "capability_incompatible"
+                    )
         self.checks.append(
             SubjectCapabilityCheck(
                 name=name,
@@ -110,6 +182,7 @@ class _ProbeBuilder:
                 module=module_name,
                 public_object=object_name,
                 signature=signature,
+                failure_type=failure_type,
             )
         )
         self.api_entries.append(
@@ -129,16 +202,22 @@ class _ProbeBuilder:
         operation: Callable[[], bool],
     ) -> None:
         available = False
+        failure_type: str | None = None
         try:
             available = bool(operation())
         except Exception:
             available = False
+            failure_type = "capability_check_failed"
+        else:
+            if not available:
+                failure_type = "capability_incompatible"
         self.checks.append(
             SubjectCapabilityCheck(
                 name=name,
                 available=available,
                 module=module_name,
                 public_object=object_name,
+                failure_type=failure_type,
             )
         )
         self.api_entries.append(
@@ -226,14 +305,7 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         "run_conversation",
         "hermes.conversation",
         "run_conversation",
-        _has_parameters(
-            "message",
-            "conn",
-            "session_id",
-            "system_prompt",
-            "tool_policy",
-            "hook_registry",
-        ),
+        signature_validator=_bind_run_conversation_worker_call,
     )
     builder.check(
         "tool_registry",
