@@ -186,8 +186,24 @@ class IntegrationError(AuditError):
 
 
 class LangfuseDependencyError(IntegrationError):
-    def __init__(self, message: str = "Langfuse dependency is unavailable") -> None:
-        super().__init__(message, code="langfuse_dependency_error")
+    def __init__(
+        self,
+        message: str = "Langfuse dependency is unavailable",
+        **details: Any,
+    ) -> None:
+        super().__init__(message, code="langfuse_dependency_error", **details)
+
+
+class UnsupportedLangfuseVersionError(LangfuseDependencyError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "unsupported_langfuse_version"
+
+
+class LangfuseCapabilityError(LangfuseDependencyError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "langfuse_capability_error"
 
 
 class LangfuseConfigError(IntegrationError):
@@ -210,9 +226,60 @@ class ExperimentPublishError(IntegrationError):
         super().__init__(message, code="experiment_publish_error", **details)
 
 
+class ExperimentInitializationError(ExperimentPublishError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "experiment_initialization_error"
+
+
+class ExperimentAssociationError(ExperimentPublishError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "experiment_association_error"
+
+
+class ExperimentReplayError(ExperimentPublishError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "experiment_replay_error"
+
+
 class ScorePublishError(IntegrationError):
     def __init__(self, message: str, **details: Any) -> None:
         super().__init__(message, code="score_publish_error", **details)
+
+
+class ScoreIdentityError(ScorePublishError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "score_identity_error"
+
+
+class ScorePublicationConflictError(ScoreIdentityError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "score_publication_conflict"
+
+
+class ScoreIdempotencyError(ScorePublishError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, **details)
+        self.code = "score_idempotency_error"
+
+
+class PublicationManifestError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="publication_manifest_error", **details)
+
+
+class PublicationStateError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="publication_state_error", **details)
+
+
+class DeprecatedLangfuseApiError(IntegrationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="deprecated_langfuse_api_error", **details)
 
 
 class JudgeDependencyError(IntegrationError):

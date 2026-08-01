@@ -4,35 +4,32 @@ P2 在现有 P1 隔离 Runner 之后增加两个父进程适配层：LLM Judge �
 
 ## 依赖方向
 
-核心合同、Dataset planner、Validator、Judge service 与报告层不导入 `openai` 或 `langfuse`。`ports/judge.py` 和 `ports/langfuse.py` 只暴露 Audit 自己的 Protocol、数据类和合同；第三方 SDK 的延迟导入局限于 `integrations/judge/` 与 `integrations/langfuse/`。
+核心合同、Dataset planner、Validator、Judge service 与报告层不导入 `openai` 或第三方 Langfuse SDK。`ports/judge.py` 和 `ports/langfuse.py` 只暴露 Audit 自有 Protocol、数据类和合同；SDK 延迟导入局限于 `integrations/` 适配层。
 
-普通本地 P1 运行不需要 P2 extras。`--judge` 才创建 Judge adapter；`--langfuse` 才创建一个 Langfuse adapter。两者都只存在于父进程，其环境变量不在 Worker 继承白名单中。
+普通本地运行不需要 P2 extras。`--judge` 才创建 Judge adapter；`--langfuse` 才执行 Langfuse capability check 并创建 adapter。两者都只存在于父进程，其凭据不在 Worker 继承白名单中。没有 `--langfuse` 时不创建发布清单，也不改变 P1/P2 本地执行语义。
 
 ## Trial 事实与门禁
 
-`TrialResult.task_passed` 保留 Worker 完成且 required deterministic gate 成功这一原始任务事实。required tool trajectory 和 required Judge 继续参与 `TrialResult.passed`，但不会覆盖 `task_passed`。因此报告能区分任务失败、工具门禁失败和 Judge 失败。
+`TrialResult.task_passed` 保留 Worker 完成且 required deterministic gate 成功这一原始任务事实。required tool trajectory 和 required Judge 继续参与 `TrialResult.passed`，但不会覆盖 `task_passed`。非 completed metric 不伪造零分：未启用、不可评价或 evaluator 错误均保留各自状态，只有 completed 结果才具有正常数值语义。
 
-非 completed metric 不伪造零分：
+## Langfuse 后发布边界
 
-- Worker 没有可评价输出时，`answer_quality` 为 `not_applicable`；
-- 可选 Judge 未启用时为 `skipped`；
-- Judge 自身失败时为 `error` 并携带结构化错误；
-- 只有 `completed` 才有 `value` 和正常 `passed` 语义。
+显式 `--langfuse` 在首个 Trial 前检查配置、SDK 最低版本、必要公开能力、连接、Dataset 与 Experiment 策略；不兼容会在远端写入前明确失败。`begin_experiment()` 建立本地 pending 清单，不依赖第一条 Trial 隐式初始化。
 
-required Judge 的 `error` 或低于阈值会令 Trial 不通过；非 required Judge 的错误和低分不覆盖本地任务结果。
+所有本地 Trial、Validator 和可选 Judge 完成后，适配层才调用官方 Experiment Runner。Runner task 只能把现有 `TrialResult` 映射为安全的 `ReplayTrialPayload` 和 Observation，不持有 MyHermes runner 或 Judge service，因此不能二次执行 Agent、模型、工具、Validator 或 Judge。
 
-## Langfuse 故障边界
+Trace、Experiment 关联、Score、flush 或 shutdown 出错会转换成脱敏 Audit 异常。每项清单区分 pending、publishing、confirmed、uncertain 和 failed；整体区分 pending、publishing、published、partially published 和 failed。最终 JSON 保留全部本地事实，显式集成错误使 CLI 返回非零，部分结果不会显示成完整成功。
 
-显式 `--langfuse` 在首个 Trial 前检查配置和连接，并完成 Dataset ensure。初始化、认证或同步失败直接终止，不能静默降级。Trial 开始后的 Trace、Dataset Run Item、Score、flush 或 shutdown 失败会转换为脱敏 `LangfusePublishError`，后续 Trial 仍进行本地执行。最终 JSON 保留全部本地事实，CLI 因 integration error 返回非零。
+## 生命周期
 
-每次 CLI run 只创建一个 adapter。所有 Trial 后统一 `finish_experiment()`、`flush()`、`shutdown()`；Worker 不初始化 SDK，也不接收 Langfuse 凭据。
+一个 adapter 实例只允许一个活动 Experiment。`finish_experiment()` 后拒绝继续发布；它只接受官方 Runner 返回且相互一致的 Dataset Run ID 与 URL，不猜测或拼接身份。每个 Score 写入后执行公开 `flush()`，run 结束再执行统一 `flush()` 和 `shutdown()`。
 
-## 明确不在 P2
+## 时间与顺序语义
 
-P2 不实现模拟用户、Memory Retrieval、Dense/BM25/Hybrid、Compression 消融、Background Review 评测、Baseline Compare、并行执行、CI 或 Langfuse 自定义前端 Dashboard。P2 也不向 MyHermes 增加任何 Audit 专用路径。
+P2 是执行后的观测发布。公共 MyHermes 投影未为全部 Model/Tool Observation 提供可靠历史开始时间，因此 span 使用发布时生命周期，并把真实 duration 和可用 Turn 时间放入 metadata；`post_hoc_publication` 与 `runtime_timestamps_not_replayed` 显式标记这一点。公共投影也没有跨 Model/Tool 的统一全序，P2 只保留各类型内顺序和 run/parent-run 关联。
 
-## 时间语义
+Score 使用 Trial 完成时间或首次持久化时间，不在重试时生成新时间。官方 flush 正常返回只代表 SDK 已完成交付步骤，查询侧可见性仍可能延迟。
 
-P2 是执行后的观测发布。公共 MyHermes 投影提供真实 duration，但未为所有 Model/Tool Observation 提供可靠的历史开始时间，因此 SDK span 使用发布时生命周期，并把真实 duration 和可用的 Turn 时间放进 metadata；`post_hoc_publication` 与 `runtime_timestamps_not_replayed` 明确标记这一点。实现不伪造历史瀑布图。
+## 明确不在 P2.1
 
-公共投影还没有统一的跨 Model/Tool 全序号，因此 P2 只保留各类型内顺序、run/parent_run 关联并显式记录 `runtime_cross_type_order_available=false`。`sync --dry-run` 不连接远端，所以无法区分远端 add/update/unchanged；三项计数显示 unknown。低层 Dataset Run Item API 没有返回可靠 Experiment URL，P2 只保存 remote run ID，不推测链接。Experiment name 由调用方负责唯一命名；重复名称会遵循 Langfuse Dataset Run 的复用语义。同步不会追溯删除旧 Case 版本，因此后来收紧分类不会抹除此前已发布的历史 Item；需要远端数据治理时应在独立阶段处理。
+P2.1 只修复 Langfuse 兼容性、Experiment 关联和 Score 幂等。它不新增模拟用户、Memory Retrieval、Dense/BM25/Hybrid、Compression 消融、Background Review 评测、Baseline Compare、并行执行、CI、新 Judge 指标或自定义前端 Dashboard，也不向 MyHermes 增加 Audit 专用路径。P2.1 仅定义后续恢复所需的清单结构，不提供完整 resume CLI。

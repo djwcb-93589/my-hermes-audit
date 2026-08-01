@@ -2,7 +2,7 @@
 
 `my-hermes-audit` 是独立于 MyHermes 运行时的本地评测工具。报告总是从调用方指定的 `--subject-repo` 读取实际 Git fingerprint；文档不再把某个历史 MyHermes commit 当作运行基线。核心合同、数据集、Validator 与报告层不导入 `hermes.*`，MyHermes 也不感知自己正在被评测。
 
-项目要求 Python 3.13 或更高版本，与 MyHermes 的 `requires-python` 保持一致。基础运行依赖仅有 Pydantic v2 与 PyYAML；Langfuse v4 与 OpenAI Python SDK 均为延迟导入的可选 P2 依赖。
+项目要求 Python 3.13 或更高版本，与 MyHermes 的 `requires-python` 保持一致。基础运行依赖仅有 Pydantic v2 与 PyYAML；Langfuse Python SDK `>=4.7.0,<5` 与 OpenAI Python SDK 均为延迟导入的可选 P2 依赖。
 
 ## 已实现
 
@@ -22,7 +22,7 @@
 - 独立、只读的 Subject Capability Probe，以及不调用模型的 `doctor` 诊断；
 - `MetricStatus`、结构化 Judge 结果、任务结果与 Judge 门禁分离；
 - OpenAI-compatible LLM Judge、版本化 `answer-quality-v1` Prompt、本地 criterion 加权与唯一一级指标 `answer_quality`；
-- Langfuse v4 Dataset 幂等版本化同步、Dataset Run/Experiment 关联、Trial Trace、Turn/Model/Tool/Validator/Judge Observation 与稳定 Score 发布；
+- Langfuse Dataset 幂等版本化同步、正式 Experiment Runner 纯回放关联、Trial Trace、Turn/Model/Tool/Validator/Judge Observation，以及带本地发布清单的 Score 幂等发布；
 - `task_success`、`tool_correctness`、`answer_quality` 三个一级质量分数，以及独立效率元数据；
 - `synthetic`、`internal`、`sensitive` 数据分类和 `--langfuse-no-content` 内容关闭开关；
 - 本地报告中的 Judge coverage/error、Experiment identity、发布计数和脱敏 integration error。
@@ -58,8 +58,8 @@ myhermes-audit doctor \
 ```
 
 `--check-langfuse` and `--check-judge` additionally initialize and close the
-configured optional client to validate dependency, major version, URL, timeout,
-and required environment fields. Doctor does not connect, create a Dataset,
+configured optional client to validate the exact SDK minimum, required public
+capabilities, URL, timeout, and required environment fields. Doctor does not connect, create a Dataset,
 Trace or Score, or send a model request, and never prints credential values. Before any Trial is
 created, the same separate read-only Subject Capability Probe checks public API
 compatibility. See
@@ -115,7 +115,7 @@ myhermes-audit run examples/core_judge_v1.yaml \
 
 Judge 只读取 `AUDIT_JUDGE_MODEL`、`AUDIT_JUDGE_API_KEY`、可选 `AUDIT_JUDGE_BASE_URL` 与 `AUDIT_JUDGE_TIMEOUT_SECONDS`。Langfuse 读取 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`、优先 `LANGFUSE_BASE_URL`（兼容 `LANGFUSE_HOST`）及可选 `LANGFUSE_TIMEOUT`。两组凭据不会进入 MyHermes Worker。`--langfuse-no-content` 强制远端只接收哈希、长度、状态、指标和安全 metadata。
 
-显式 `--langfuse` 会在第一个 Trial 前完成连接检查和 Dataset ensure。后续某个发布、Score、flush 或 shutdown 失败不会丢弃本地 Trial 事实；错误写入 JSON 报告且 CLI 返回非零。
+显式 `--langfuse` 会在第一个 Trial 前完成版本/能力、连接、Dataset 与 Experiment 策略检查。全部本地 Trial 完成后，正式 Experiment Runner 的 task 只回放既有 `TrialResult`，不会启动 Worker、Validator 或 Judge。发布清单与报告并列写入；发布、Score、flush 或 shutdown 失败不会丢弃本地 Trial 事实，网络结果不确定时不会显示为成功，CLI 最终返回非零。
 
 ## 示例 Suite
 
@@ -139,4 +139,4 @@ Judge 与 Langfuse 仅在 Audit 父进程的 `integrations/` 适配层初始化�
 
 当前阶段只构建代码与合同。本仓库不创建测试目录或测试文件，也不在本阶段运行 pytest、unittest、集成或烟雾验证。后续独立验证阶段应从公开合同和端口验证行为，不应给 MyHermes 增加评测专用分支。
 
-更多边界见 [`docs/architecture.md`](docs/architecture.md)、[`docs/p1-runner.md`](docs/p1-runner.md)、[`docs/worker-protocol.md`](docs/worker-protocol.md)、[`docs/validators.md`](docs/validators.md)、[`docs/security.md`](docs/security.md)、[`docs/p1-boundary.md`](docs/p1-boundary.md)、[`docs/p2-boundary.md`](docs/p2-boundary.md)、[`docs/langfuse.md`](docs/langfuse.md)、[`docs/llm-judge.md`](docs/llm-judge.md)、[`docs/score-model.md`](docs/score-model.md) 与 [`docs/data-classification.md`](docs/data-classification.md)。
+更多边界见 [`docs/architecture.md`](docs/architecture.md)、[`docs/p1-runner.md`](docs/p1-runner.md)、[`docs/worker-protocol.md`](docs/worker-protocol.md)、[`docs/validators.md`](docs/validators.md)、[`docs/security.md`](docs/security.md)、[`docs/p1-boundary.md`](docs/p1-boundary.md)、[`docs/p2-boundary.md`](docs/p2-boundary.md)、[`docs/langfuse.md`](docs/langfuse.md)、[`docs/langfuse-compatibility.md`](docs/langfuse-compatibility.md)、[`docs/publication-idempotency.md`](docs/publication-idempotency.md)、[`docs/llm-judge.md`](docs/llm-judge.md)、[`docs/score-model.md`](docs/score-model.md) 与 [`docs/data-classification.md`](docs/data-classification.md)。

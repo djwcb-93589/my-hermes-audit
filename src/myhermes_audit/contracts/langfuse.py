@@ -13,6 +13,7 @@ from myhermes_audit.contracts.common import (
     NonEmptyText,
     NonNegativeInt,
     Sha256Digest,
+    UtcDatetime,
 )
 
 
@@ -91,27 +92,83 @@ class LangfuseDatasetSyncResult(ContractModel):
         return self
 
 
+class ExperimentStrategy(str, Enum):
+    RUNNER_REPLAY = "experiment_runner_replay"
+    UNSUPPORTED = "unsupported_by_sdk"
+
+
+class ExperimentPublicationStatus(str, Enum):
+    PENDING = "pending"
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
+    PARTIALLY_PUBLISHED = "partially_published"
+    FAILED = "failed"
+    UNSUPPORTED = "unsupported"
+
+
+class DatasetSyncPublicationStatus(str, Enum):
+    PUBLISHED = "published"
+    FAILED = "failed"
+
+
+class PublicationItemStatus(str, Enum):
+    PENDING = "pending"
+    PUBLISHING = "publishing"
+    CONFIRMED = "confirmed"
+    UNCERTAIN = "uncertain"
+    FAILED = "failed"
+
+
+class PublicationManifestStatus(str, Enum):
+    PENDING = "pending"
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
+    PARTIALLY_PUBLISHED = "partially_published"
+    FAILED = "failed"
+
+
 class LangfuseExperimentIdentity(ContractModel):
     experiment_name: NonEmptyText
     audit_run_id: Identifier
     dataset_name: NonEmptyText
+    run_name: StrictStr | None = None
     remote_run_id: StrictStr | None = None
     url: StrictStr | None = None
+
+
+class ReplayTrialPayload(ContractModel):
+    """Safe, immutable input consumed by the official Experiment Runner task."""
+
+    audit_run_id: Identifier
+    trial_id: Identifier
+    case_id: Identifier
+    dataset_item_id: NonEmptyText
+    final_output: JsonValue
+    runtime_status: NonEmptyText
+    safe_metric_summary: JsonObject = Field(default_factory=dict)
+    local_trace_id: NonEmptyText
+    artifact_summary: list[JsonObject] = Field(default_factory=list)
 
 
 class LangfuseTrialPublishReceipt(ContractModel):
     trial_id: Identifier
     dataset_item_id: NonEmptyText
+    experiment_item_key: NonEmptyText
     trace_id: NonEmptyText
     observation_id: NonEmptyText
     dataset_run_id: NonEmptyText
     url: StrictStr | None = None
 
 
-class LangfusePublishStatus(str, Enum):
-    COMPLETED = "completed"
-    PARTIAL = "partial"
-    ERROR = "error"
+class ScorePublicationIdentity(ContractModel):
+    score_id: Sha256Digest
+    trace_id: NonEmptyText
+    score_name: NonEmptyText
+    evaluator_version: NonEmptyText
+    trial_id: Identifier
+    case_id: Identifier
+    stable_timestamp: UtcDatetime
+    value_hash: Sha256Digest
 
 
 class LangfusePublishError(ContractModel):
@@ -123,19 +180,176 @@ class LangfusePublishError(ContractModel):
     metadata: JsonObject = Field(default_factory=dict)
 
 
+class TrialPublicationRecord(ContractModel):
+    trial_id: Identifier
+    case_id: Identifier
+    dataset_item_id: NonEmptyText
+    local_trace_id: NonEmptyText
+    status: PublicationItemStatus = PublicationItemStatus.PENDING
+    attempt_count: NonNegativeInt = 0
+    remote_trace_id: StrictStr | None = None
+    remote_observation_id: StrictStr | None = None
+    dataset_run_id: StrictStr | None = None
+    experiment_item_key: StrictStr | None = None
+    last_attempt_at: UtcDatetime | None = None
+    confirmed_at: UtcDatetime | None = None
+    error: LangfusePublishError | None = None
+
+    @model_validator(mode="after")
+    def validate_publication_state(self) -> "TrialPublicationRecord":
+        remote_values = (
+            self.remote_trace_id,
+            self.remote_observation_id,
+            self.dataset_run_id,
+            self.experiment_item_key,
+        )
+        if self.status is PublicationItemStatus.CONFIRMED:
+            if any(value is None for value in remote_values) or self.confirmed_at is None:
+                raise ValueError("confirmed Trial publication requires all remote identities")
+            if self.error is not None:
+                raise ValueError("confirmed Trial publication cannot contain an error")
+        if self.status in {PublicationItemStatus.UNCERTAIN, PublicationItemStatus.FAILED}:
+            if self.error is None:
+                raise ValueError("uncertain/failed Trial publication requires an error")
+        if self.attempt_count == 0 and self.last_attempt_at is not None:
+            raise ValueError("Trial attempt timestamp requires a positive attempt count")
+        return self
+
+
+class ScorePublicationRecord(ContractModel):
+    identity: ScorePublicationIdentity
+    status: PublicationItemStatus = PublicationItemStatus.PENDING
+    attempt_count: NonNegativeInt = 0
+    remote_id: StrictStr | None = None
+    last_attempt_at: UtcDatetime | None = None
+    confirmed_at: UtcDatetime | None = None
+    error: LangfusePublishError | None = None
+
+    @model_validator(mode="after")
+    def validate_publication_state(self) -> "ScorePublicationRecord":
+        if self.status is PublicationItemStatus.CONFIRMED:
+            if self.remote_id is None or self.confirmed_at is None:
+                raise ValueError("confirmed Score publication requires remote identity")
+            if self.error is not None:
+                raise ValueError("confirmed Score publication cannot contain an error")
+        if self.status in {PublicationItemStatus.UNCERTAIN, PublicationItemStatus.FAILED}:
+            if self.error is None:
+                raise ValueError("uncertain/failed Score publication requires an error")
+        if self.attempt_count == 0 and self.last_attempt_at is not None:
+            raise ValueError("Score attempt timestamp requires a positive attempt count")
+        return self
+
+
+class LangfusePublicationManifest(ContractModel):
+    audit_run_id: Identifier
+    experiment_name: NonEmptyText
+    dataset_name: NonEmptyText
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
+    trial_publications: list[TrialPublicationRecord] = Field(default_factory=list)
+    score_publications: list[ScorePublicationRecord] = Field(default_factory=list)
+    remote_ids: JsonObject = Field(default_factory=dict)
+    stable_timestamps: dict[NonEmptyText, UtcDatetime] = Field(default_factory=dict)
+    status: PublicationManifestStatus = PublicationManifestStatus.PENDING
+    last_error: LangfusePublishError | None = None
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> "LangfusePublicationManifest":
+        if self.updated_at < self.created_at:
+            raise ValueError("Manifest updated_at cannot precede created_at")
+        trial_ids = [item.trial_id for item in self.trial_publications]
+        if len(trial_ids) != len(set(trial_ids)):
+            raise ValueError("Manifest Trial identities must be unique")
+        score_ids = [item.identity.score_id for item in self.score_publications]
+        if len(score_ids) != len(set(score_ids)):
+            raise ValueError("Manifest Score identities must be unique")
+        if self.status is PublicationManifestStatus.PUBLISHED:
+            if self.last_error:
+                raise ValueError("published Manifest cannot contain a last error")
+            if not self.trial_publications or any(
+                item.status is not PublicationItemStatus.CONFIRMED
+                for item in (*self.trial_publications, *self.score_publications)
+            ):
+                raise ValueError(
+                    "published Manifest requires every publication to be confirmed"
+                )
+        return self
+
+
+class PublicationManifestRef(ContractModel):
+    path: NonEmptyText
+    sha256: Sha256Digest
+    status: PublicationManifestStatus
+
+
+class LangfusePublicationCounts(ContractModel):
+    published_trial_count: NonNegativeInt = 0
+    associated_experiment_item_count: NonNegativeInt = 0
+    published_score_count: NonNegativeInt = 0
+    skipped_score_count: NonNegativeInt = 0
+    uncertain_score_count: NonNegativeInt = 0
+    failed_score_count: NonNegativeInt = 0
+
+
+class LangfuseCapabilityReport(ContractModel):
+    installed: StrictBool
+    version: StrictStr | None = None
+    compatible: StrictBool
+    required_minimum_version: NonEmptyText
+    capabilities: dict[NonEmptyText, StrictBool] = Field(default_factory=dict)
+    missing_capabilities: list[NonEmptyText] = Field(default_factory=list)
+    warnings: list[NonEmptyText] = Field(default_factory=list)
+    experiment_strategy: ExperimentStrategy
+    score_idempotency_strategy: NonEmptyText
+
+    @model_validator(mode="after")
+    def validate_capabilities(self) -> "LangfuseCapabilityReport":
+        expected_missing = sorted(
+            name for name, available in self.capabilities.items() if not available
+        )
+        if sorted(self.missing_capabilities) != expected_missing:
+            raise ValueError("missing_capabilities must match capability flags")
+        if self.compatible and (not self.installed or expected_missing):
+            raise ValueError("compatible SDK must be installed with every capability")
+        if not self.installed and self.version is not None:
+            raise ValueError("uninstalled SDK cannot report a version")
+        return self
+
+
+class LangfusePublishStatus(str, Enum):
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    ERROR = "error"
+
+
 class LangfusePublishResult(ContractModel):
     status: LangfusePublishStatus
     dataset: LangfuseDatasetIdentity
     experiment: LangfuseExperimentIdentity
+    dataset_sync_status: DatasetSyncPublicationStatus
+    experiment_status: ExperimentPublicationStatus
+    experiment_strategy: ExperimentStrategy
     published_trial_count: NonNegativeInt = 0
+    associated_experiment_item_count: NonNegativeInt = 0
     published_score_count: NonNegativeInt = 0
+    skipped_score_count: NonNegativeInt = 0
+    uncertain_score_count: NonNegativeInt = 0
+    failed_score_count: NonNegativeInt = 0
+    publication_manifest: PublicationManifestRef
     errors: list[LangfusePublishError] = Field(default_factory=list)
     warnings: list[NonEmptyText] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_status(self) -> "LangfusePublishResult":
-        if self.status is LangfusePublishStatus.COMPLETED and self.errors:
-            raise ValueError("completed Langfuse publication cannot contain errors")
+        if self.associated_experiment_item_count > self.published_trial_count:
+            raise ValueError("Experiment Item count cannot exceed published Trial count")
+        if self.status is LangfusePublishStatus.COMPLETED:
+            if self.errors:
+                raise ValueError("completed Langfuse publication cannot contain errors")
+            if self.experiment_status is not ExperimentPublicationStatus.PUBLISHED:
+                raise ValueError("completed publication requires a published Experiment")
+            if self.uncertain_score_count or self.failed_score_count:
+                raise ValueError("completed publication cannot contain unresolved Scores")
         if self.status is LangfusePublishStatus.ERROR and not self.errors:
             raise ValueError("error Langfuse publication requires errors")
         if self.status is LangfusePublishStatus.PARTIAL:
@@ -147,14 +361,27 @@ class LangfusePublishResult(ContractModel):
 
 
 __all__ = (
+    "DatasetSyncPublicationStatus",
+    "ExperimentPublicationStatus",
+    "ExperimentStrategy",
+    "LangfuseCapabilityReport",
     "LangfuseDatasetIdentity",
     "LangfuseDatasetItemIdentity",
     "LangfuseDatasetItemPlan",
     "LangfuseDatasetSyncPlan",
     "LangfuseDatasetSyncResult",
     "LangfuseExperimentIdentity",
+    "LangfusePublicationManifest",
+    "LangfusePublicationCounts",
     "LangfusePublishError",
     "LangfusePublishResult",
     "LangfusePublishStatus",
     "LangfuseTrialPublishReceipt",
+    "PublicationItemStatus",
+    "PublicationManifestRef",
+    "PublicationManifestStatus",
+    "ReplayTrialPayload",
+    "ScorePublicationIdentity",
+    "ScorePublicationRecord",
+    "TrialPublicationRecord",
 )

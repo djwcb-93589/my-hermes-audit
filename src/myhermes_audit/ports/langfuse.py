@@ -12,7 +12,10 @@ from myhermes_audit.contracts import (
     LangfuseDatasetSyncPlan,
     LangfuseDatasetSyncResult,
     LangfuseExperimentIdentity,
+    LangfusePublicationManifest,
+    LangfusePublicationCounts,
     LangfuseTrialPublishReceipt,
+    PublicationManifestRef,
     TrialResult,
 )
 
@@ -57,13 +60,13 @@ class LangfusePort(Protocol):
         self,
         request: LangfuseExperimentRequest,
     ) -> LangfuseExperimentIdentity:
-        """Begin one serial AuditRun-to-Experiment lifecycle."""
+        """Begin one serial AuditRun-to-Experiment lifecycle and local Manifest."""
 
     def publish_trial(
         self,
         request: LangfuseTrialRequest,
     ) -> LangfuseTrialPublishReceipt:
-        """Publish one Trial trace and associate it with a Dataset run item."""
+        """Replay local facts through the official Experiment Runner once."""
 
     def publish_scores(
         self,
@@ -77,7 +80,16 @@ class LangfusePort(Protocol):
         identity: LangfuseExperimentIdentity,
         receipts: Sequence[LangfuseTrialPublishReceipt],
     ) -> LangfuseExperimentIdentity:
-        """Finalize the local Experiment identity from published run items."""
+        """Finalize the Experiment identity returned by the official runner."""
+
+    def publication_manifest(self) -> LangfusePublicationManifest:
+        """Return the current SDK-neutral publication state."""
+
+    def publication_manifest_ref(self) -> PublicationManifestRef:
+        """Return the local Manifest path, digest, and status."""
+
+    def publication_counts(self) -> LangfusePublicationCounts:
+        """Return confirmed/skipped/uncertain/failed publication counts."""
 
     def flush(self) -> None:
         """Deliver queued SDK events."""

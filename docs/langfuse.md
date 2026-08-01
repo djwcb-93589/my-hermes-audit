@@ -1,8 +1,8 @@
 # Langfuse 集成
 
-P2 锁定 `langfuse>=4,<5`。Langfuse Python SDK 在 v4 重写；当前构造参数使用 `base_url`，同时兼容旧环境名 `LANGFUSE_HOST`。实现依据当前官方 [Langfuse Python SDK](https://github.com/langfuse/langfuse-python)、[v4 client 源码](https://github.com/langfuse/langfuse-python/blob/main/langfuse/_client/client.py) 与 [Dataset Run Item API](https://github.com/langfuse/langfuse-python/blob/main/langfuse/api/dataset_run_items/client.py)，不使用 v2/v3 示例。
+P2.1 支持 Langfuse Python SDK `>=4.7.0,<5`。下限来自 Langfuse 当前 [版本兼容说明](https://langfuse.com/docs/compatibility)：Python SDK 4.7.0 起可在 v4 数据模型下实时处理 OpenTelemetry Trace；运行时还会逐项检查本项目实际使用的公开方法及参数，版本号本身不是充分条件。
 
-## 配置
+## 配置与预检
 
 安装：
 
@@ -15,44 +15,51 @@ python -m pip install -e ".[langfuse]"
 - `LANGFUSE_PUBLIC_KEY`，必填；
 - `LANGFUSE_SECRET_KEY`，必填；
 - `LANGFUSE_BASE_URL`，可选且优先；
-- `LANGFUSE_HOST`，兼容环境名，仅在没有 `LANGFUSE_BASE_URL` 时使用；
+- `LANGFUSE_HOST`，只作为既有环境变量名兼容；
 - `LANGFUSE_TIMEOUT`，可选的 1～600 秒整数。
 
-Host 只能是无认证信息、query 或 fragment 的 HTTP(S) URL。Suite、报告和 Artifact 不保存密钥。普通 P1 导入路径不会导入 SDK。
+Host 必须是无认证信息、query 或 fragment 的 HTTP(S) URL。Suite、报告和 Artifact 不保存密钥。没有 `--langfuse` 时不会导入第三方 SDK、创建 client 或写发布清单。
+
+显式发布在首个 Trial 前完成依赖、精确版本、公开能力、凭据、轻量认证和 Dataset 检查。`doctor --check-langfuse` 只检查版本、公开方法签名和 client 配置，默认不联网，也不创建任何远端资源。能力明细见 [兼容性合同](langfuse-compatibility.md)。
 
 ## Dataset
 
-一个 Suite 对应一个 Dataset，一个 Case 内容版本对应一个 Dataset Item。Item ID 是 `dataset_name + suite_id + case_id + case_sha256` 的稳定 UUID5。SDK 的 `create_dataset_item(..., id=...)` 具有 upsert 语义；Case hash 与发布投影 hash 都不变时不写，分类、`--langfuse-no-content` 或外部 Fixture 摘要变化时更新同一 Case 版本的受控投影，Case 内容变化时创建新的稳定版本。历史 Item 和历史 Experiment 保留，P2 没有 prune 或删除命令。
+一个 Suite 对应一个 Dataset，一个 Case 内容版本对应一个 Dataset Item。Item ID 是 `dataset_name + suite_id + case_id + case_sha256` 的稳定 UUID5。公开 `create_dataset_item(..., id=...)` 提供同 ID 写入语义；Case hash 与发布投影 hash 都不变时不写，投影变化时更新同一 Case 版本，Case 内容变化时创建新的稳定版本。历史 Item 和历史 Experiment 保留，P2.1 没有 prune 或删除命令。
 
-Item input 包含 Case ID、模式、tags 和受分类控制的用户输入。expected output 是 Judge rubric/criteria 与确定性期望的结构化投影。Fixture 正文永不上传；文件 Fixture metadata 只含受控相对标识、SHA-256、content type、字节数、synthetic 标志和 `content_uploaded=false`。Memory、Skill 与数据库 Fixture 正文不上传。
-
-`sync --dry-run` 只构造本地身份和内容投影，不导入 SDK、不连接、不创建 Dataset。由于不读远端，新增/更新/不变三个远端计数明确显示为 unknown，而不是伪造数量。
+Item input、expected output 和 metadata 均先经过数据分类投影。Fixture、Memory、Skill 与数据库正文不上传。`sync --dry-run` 只生成本地计划，不导入 SDK、不连接远端；因此远端新增、更新、不变计数保持 unknown。
 
 ## Experiment 与 Trace
 
-Audit 自己串行执行 MyHermes，随后通过 `api.dataset_run_items.create` 将稳定 Trial Trace 与已同步 Dataset Item、Experiment name 关联。映射如下：
+采用官方公开 [`Langfuse.run_experiment`](https://python.reference.langfuse.com/langfuse#Langfuse.run_experiment)，输入为已经同步的 Langfuse Dataset Item。每个 Audit run 使用精确、稳定的 `run_name = experiment_name::audit_run_id`。公开 Runner 自动创建 Trace 并将 Dataset Item、Experiment Item 和 Trace 关联；适配层立即把 `ExperimentResult` 映射成 Audit 自有 receipt，只接受 SDK 实际返回的 Dataset Run ID 和 URL。
 
-- `AuditRunResult` → Langfuse Dataset Run / Experiment identity；
-- `TrialResult` → 根 span `myhermes.audit.trial`；
-- scripted turn → `myhermes.audit.turn`；
-- 公共 Model Observation → generation `myhermes.agent.model`；
-- 公共 Tool Observation → tool observation `myhermes.agent.tool`；
-- deterministic/runtime metric → evaluator `myhermes.audit.validator`；
-- 实际完成的 Judge → generation `myhermes.audit.judge`；
-- 未调用的 Judge → 同名 evaluator 状态记录，不伪造 generation。
+Runner 的 task 是纯回放函数：它只读取已经完成且已脱敏的 `TrialResult`，返回 `ReplayTrialPayload`，并在 Runner 当前 Trace 下补充本地观测投影。载荷包含 Audit/Trial/Case/Dataset Item 身份、既有 final output、安全指标摘要、本地 Trace ID、runtime 状态和 Artifact 摘要。它没有 runner、worker、agent、model、tool、validator 或 judge 依赖，不能修改本地结果。
 
-Trace metadata 保存 Audit/Suite/Case/Trial 身份、subject commit/dirty、Audit version/commit、subject model（安全可得时）、Judge model/prompt version、分类、tags、runtime status、worker protocol 和效率数据。不保存 config、绝对路径、隐藏系统 Prompt、隐藏推理或工具正文。
+全部本地 Trial 完成后才开始远端发布。调用顺序为：
 
-## Score
+1. `begin_experiment()` 校验远端 Dataset Item，并原子写入本地 pending 清单；
+2. `publish_trial()` 对单个既有结果执行纯回放，验证 Runner 返回的 Dataset Item、Trace 和 Dataset Run 一致；
+3. `publish_scores()` 只把本地已计算的三个一级指标写到该 Trace；
+4. `finish_experiment()` 验证所有已确认 receipt 指向同一个真实 Dataset Run，并返回 SDK 提供的身份和 URL；
+5. `flush()` 与 `shutdown()` 完成公开生命周期。
 
-只发布 `task_success`、`tool_correctness`、`answer_quality`。Score ID 由 `trace_id + score_name + evaluator_version` 稳定派生，因此重试不会有意创建同一版本的重复 Score。每个 Score metadata 包含 source、evaluator version、Trial ID 和 Case ID。duration、tokens、iterations、tool call count 只作为效率 metadata。
+重复的单项 Runner 调用使用同一精确 run name；若 SDK 返回不同 Dataset Run ID，发布立即转为关联错误，不会把多个远端 run 拼成一个本地成功结果。适配层不直接访问自动生成客户端资源，不手写旧端点，也没有旧协议 fallback。
 
-## 生命周期与可见性
+一个 Dataset Item 在一个 Dataset-backed run 中只有一个正式 Experiment Item 身份，因此 P2.1 的显式发布要求每个 Case 恰好一个 Trial；不满足时在 Worker 启动前明确失败。普通本地多 Trial 运行保持不变。
 
-一个 CLI run 使用一个 adapter。连接检查使用 `auth_check()`；所有 Trial 后先完成本地 Experiment identity，再调用 `flush()` 和 `shutdown()`。SDK v4 明确说明 flush 保证交付但不保证立即可读，因此 P2 不在 flush 后立即反查并把短暂读取不到误判为上传失败。
+## Observation 投影
 
-Trace URL 只有 SDK 实际返回并通过安全 URL 检查时才进入 receipt；Experiment URL 不推测构造。发布错误先映射成 Audit 异常并脱敏。无 `--langfuse` 时，本地 P1 路径完全独立。
+`TrialResult` 映射为 Runner task Trace 的子树：Trial span、scripted turn、公共 Model/Tool Observation、Validator evaluator，以及实际完成的 Judge generation。未执行的 Judge 不伪造 generation。真实 runtime duration 和可用时间只进入 metadata；发布发生时创建的 span 不伪装成历史瀑布图。
 
-## 事实来源
+Trace metadata 保存 Audit/Suite/Case/Trial 身份、subject/audit commit、模型标识（安全可得时）、数据分类、runtime 状态和效率摘要。它不保存 config、绝对路径、隐藏 Prompt、隐藏推理或工具正文。
 
-`AuditRunResult` 是 task gate、Judge 结果、效率数据和发布状态的事实来源。Langfuse 是 Dataset 管理、Experiment 观测、Trace 展示和 Score 分析层，不在远端重新计算或取代本地 `task_success`、`tool_correctness`、`answer_quality`。
+## Score 与发布清单
+
+只发布 `task_success`、`tool_correctness`、`answer_quality`。Score ID 由 `trace_id + score_name + evaluator_version + trial_id` 的 SHA-256 派生；同一身份固定使用首次持久化的 timestamp 和 `value_hash`。Langfuse 官方 [Score 数据模型](https://langfuse.com/docs/evaluation/scores/data-model) 明确允许自定义 Score ID 作为幂等键更新同一个 Score。
+
+公开 `create_score(..., score_id=..., timestamp=...)` 后立即 `flush()`。只有调用与 flush 都正常返回才记为 confirmed；超时或连接中断后无法判断远端结果时记为 uncertain。相同身份但不同 `value_hash` 会报冲突，不能静默覆盖。完整规则见 [发布幂等合同](publication-idempotency.md)。
+
+## 事实来源与可见性
+
+`AuditRunResult` 始终是任务门禁、Judge 结果、效率数据和集成错误的唯一事实来源。Langfuse 只承担 Dataset 管理、Experiment/Trace 展示和 Score 分析，远端不会重新计算本地指标。
+
+官方 `flush()` 保证把待处理事件交给 API，但查询侧可能存在摄取延迟；P2.1 不做立即远端反查，也不把短暂不可查询等同于失败。这里的 confirmed 表示公开 SDK 写入调用和 flush 已正常返回，不表示 UI 已立即可见。本阶段没有连接真实 Langfuse 服务进行远端行为验证。

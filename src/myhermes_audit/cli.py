@@ -245,7 +245,9 @@ def _run_command(arguments: argparse.Namespace) -> int:
                 dry_run=False,
                 no_content=arguments.langfuse_no_content,
             )
-            langfuse_adapter = LangfuseV4Adapter.from_environment()
+            langfuse_adapter = LangfuseV4Adapter.from_environment(
+                report_path=output
+            )
             langfuse_adapter.check_connection()
             langfuse_dataset = langfuse_adapter.sync_dataset(plan)
 
@@ -347,11 +349,20 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
     langfuse_available = importlib.util.find_spec("langfuse") is not None
     judge_available = importlib.util.find_spec("openai") is not None
 
+    langfuse_capability = None
+    langfuse_check_error: AuditError | None = None
     if arguments.check_langfuse:
-        from myhermes_audit.integrations.langfuse import LangfuseV4Adapter
+        from myhermes_audit.integrations.langfuse import (
+            LangfuseV4Adapter,
+            probe_langfuse_capabilities,
+        )
 
-        langfuse_adapter = LangfuseV4Adapter.from_environment()
-        langfuse_adapter.shutdown()
+        langfuse_capability = probe_langfuse_capabilities()
+        try:
+            langfuse_adapter = LangfuseV4Adapter.from_environment()
+            langfuse_adapter.shutdown()
+        except AuditError as exc:
+            langfuse_check_error = exc
     if arguments.check_judge:
         from myhermes_audit.integrations.judge import (
             OpenAICompatibleJudgeAdapter,
@@ -373,10 +384,48 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
     print(f"Optional dependency langfuse: {_presence(langfuse_available)}")
     print(f"Optional dependency openai: {_presence(judge_available)}")
     if arguments.check_langfuse:
-        print("Langfuse config: present; connection not attempted")
+        if langfuse_capability is None:
+            raise RuntimeError("Langfuse capability report was lost")
+        print(f"Langfuse SDK version: {langfuse_capability.version or 'not installed'}")
+        print(
+            "Langfuse minimum: "
+            f"{langfuse_capability.required_minimum_version}"
+        )
+        print(
+            "Langfuse compatible: "
+            f"{'yes' if langfuse_capability.compatible else 'no'}"
+        )
+        print(
+            "Langfuse Experiment strategy: "
+            f"{langfuse_capability.experiment_strategy.value}"
+        )
+        print(
+            "Langfuse Score idempotency: "
+            f"{langfuse_capability.score_idempotency_strategy}"
+        )
+        for name in (
+            "dataset_read",
+            "dataset_create",
+            "dataset_item_upsert",
+            "experiment_runner",
+            "experiment_item_association",
+            "trace_observation",
+            "score_create_or_update",
+        ):
+            print(
+                f"Langfuse capability {name}: "
+                f"{'available' if langfuse_capability.capabilities.get(name) else 'missing'}"
+            )
+        missing = ", ".join(langfuse_capability.missing_capabilities) or "none"
+        print(f"Langfuse missing capabilities: {missing}")
+        print("Langfuse connection: not attempted")
+        if langfuse_check_error is None:
+            print("Langfuse config: present; client initialized")
     if arguments.check_judge:
         print("Judge config: present; model request not attempted")
     print("Doctor checks completed")
+    if langfuse_check_error is not None:
+        raise langfuse_check_error
     return 0
 
 

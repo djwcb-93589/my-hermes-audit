@@ -16,6 +16,9 @@ from myhermes_audit.contracts import (
     AuditRunResult,
     AuditSuite,
     DataClassification,
+    DatasetSyncPublicationStatus,
+    ExperimentPublicationStatus,
+    ExperimentStrategy,
     LangfuseDatasetItemIdentity,
     LangfuseDatasetSyncResult,
     LangfuseExperimentIdentity,
@@ -24,6 +27,7 @@ from myhermes_audit.contracts import (
     LangfusePublishStatus,
     LangfuseTrialPublishReceipt,
     MetricStatus,
+    PublicationManifestStatus,
     TrialError,
     TrialResult,
     TrialStatus,
@@ -137,8 +141,6 @@ class AuditOrchestrator:
         experiment_identity: LangfuseExperimentIdentity | None = None
         receipts: list[LangfuseTrialPublishReceipt] = []
         publication_errors: list[LangfusePublishError] = []
-        published_trial_count = 0
-        published_score_count = 0
         if self.langfuse is not None:
             dataset_items = self._preflight_langfuse(suite, selected)
             dataset = self.langfuse_dataset
@@ -218,7 +220,6 @@ class AuditOrchestrator:
                 try:
                     receipt = self.langfuse.publish_trial(publication_request)
                     receipts.append(receipt)
-                    published_trial_count += 1
                 except Exception as exc:
                     publication_errors.append(
                         _publication_error(
@@ -229,15 +230,11 @@ class AuditOrchestrator:
                     )
                 else:
                     try:
-                        published_score_count += self.langfuse.publish_scores(
+                        self.langfuse.publish_scores(
                             publication_request,
                             receipt,
                         )
                     except Exception as exc:
-                        if isinstance(exc, AuditError):
-                            partial_count = exc.details.get("published_count")
-                            if type(partial_count) is int and partial_count >= 0:
-                                published_score_count += partial_count
                         publication_errors.append(
                             _publication_error(
                                 "scores",
@@ -263,12 +260,15 @@ class AuditOrchestrator:
                 self.langfuse.shutdown()
             except Exception as exc:
                 publication_errors.append(_publication_error("shutdown", exc))
+            counts = self.langfuse.publication_counts()
+            manifest = self.langfuse.publication_manifest()
+            manifest_ref = self.langfuse.publication_manifest_ref()
             publication_status = (
                 LangfusePublishStatus.COMPLETED
                 if not publication_errors
                 else (
                     LangfusePublishStatus.PARTIAL
-                    if published_trial_count > 0
+                    if counts.published_trial_count > 0
                     else LangfusePublishStatus.ERROR
                 )
             )
@@ -279,8 +279,18 @@ class AuditOrchestrator:
                 status=publication_status,
                 dataset=dataset.dataset,
                 experiment=experiment_identity,
-                published_trial_count=published_trial_count,
-                published_score_count=published_score_count,
+                dataset_sync_status=DatasetSyncPublicationStatus.PUBLISHED,
+                experiment_status=_experiment_publication_status(manifest.status),
+                experiment_strategy=ExperimentStrategy.RUNNER_REPLAY,
+                published_trial_count=counts.published_trial_count,
+                associated_experiment_item_count=(
+                    counts.associated_experiment_item_count
+                ),
+                published_score_count=counts.published_score_count,
+                skipped_score_count=counts.skipped_score_count,
+                uncertain_score_count=counts.uncertain_score_count,
+                failed_score_count=counts.failed_score_count,
+                publication_manifest=manifest_ref,
                 errors=publication_errors,
                 warnings=list(dataset.warnings),
             )
@@ -319,6 +329,12 @@ class AuditOrchestrator:
         if dataset.dry_run:
             raise UnsupportedCaseError(
                 "a dry-run Dataset plan cannot be used for Trial publication"
+            )
+        if suite.defaults.trials != 1:
+            raise UnsupportedCaseError(
+                "Langfuse Experiment publication requires exactly one Trial per Case; "
+                "the official Dataset-backed Runner has one Experiment Item identity "
+                "per Dataset Item within a run"
             )
         current_suite_hash = canonical_sha256(suite)
         if (
@@ -629,6 +645,20 @@ def _case_classification(
         case.metadata,
         default=suite_classification,
     )
+
+
+def _experiment_publication_status(
+    status: PublicationManifestStatus,
+) -> ExperimentPublicationStatus:
+    return {
+        PublicationManifestStatus.PENDING: ExperimentPublicationStatus.PENDING,
+        PublicationManifestStatus.PUBLISHING: ExperimentPublicationStatus.PUBLISHING,
+        PublicationManifestStatus.PUBLISHED: ExperimentPublicationStatus.PUBLISHED,
+        PublicationManifestStatus.PARTIALLY_PUBLISHED: (
+            ExperimentPublicationStatus.PARTIALLY_PUBLISHED
+        ),
+        PublicationManifestStatus.FAILED: ExperimentPublicationStatus.FAILED,
+    }[status]
 
 
 def _publication_error(

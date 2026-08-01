@@ -25,3 +25,7 @@ Judge 与 Langfuse 只在父进程初始化，使用不同环境变量，且都�
 Judge Prompt 把 rubric/criteria 标为 trusted rule，把任务、候选输出、会话和 runtime evidence 标为 untrusted data；工具 evidence 不含参数与结果正文。Prompt 采用透明头尾截断和 48,000 字符硬上限，不保存 raw response 或隐藏推理。
 
 Langfuse 内容由 `synthetic`、`internal`、`sensitive` 和 CLI `--langfuse-no-content` 共同约束。Fixture、Memory、Skill 和数据库正文、完整工具内容、隐藏 Prompt、config 与绝对路径不上传。外部内容与错误在进入 SDK/报告前覆盖环境敏感值、Authorization、Bearer/Basic、常见 key、JWT、私钥与 URL credentials；外部错误还移除常见绝对路径并有长度上限。
+
+P2.1 的发布清单与 JSON 报告并列写入，采用原子替换并尽量设置为 `0600`。清单只保存本地/远端身份、摘要哈希、稳定时间戳、尝试次数、状态和脱敏错误；不保存凭据、完整输入输出、Fixture 正文、隐藏 Prompt、工具正文或绝对 Sandbox 路径。网络超时不会被标成 confirmed。
+
+Experiment Runner 的回放载荷继续经过现有数据分类投影。回放代码位于 Audit 父进程，只消费已经脱敏的本地合同；Langfuse 凭据、Judge 凭据和模型凭据都不会传入 MyHermes Worker。运行时只使用官方公开 SDK 方法，不读取 transport、下划线成员或自动生成客户端资源。

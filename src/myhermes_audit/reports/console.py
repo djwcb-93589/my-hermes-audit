@@ -33,6 +33,32 @@ def render_console_summary(result: AuditRunResult) -> str:
     ]
     if result.integration_errors:
         lines.append(f"Langfuse errors:   {len(result.integration_errors)}")
+    publication = result.langfuse_publish_result
+    if publication is not None:
+        lines.extend(
+            (
+                f"Langfuse publish:   {publication.status.value}",
+                f"Langfuse dataset:   {publication.dataset_sync_status.value}",
+                "Langfuse traces:    "
+                f"{publication.published_trial_count}/{summary.trial_count}",
+                f"Experiment status: {publication.experiment_status.value}",
+                "Experiment association: "
+                + (
+                    "unsupported by installed SDK"
+                    if publication.experiment_status.value == "unsupported"
+                    else (
+                        f"{publication.associated_experiment_item_count}/"
+                        f"{summary.trial_count}"
+                    )
+                ),
+                "Score publication:",
+                f"- confirmed: {publication.published_score_count}",
+                f"- skipped: {publication.skipped_score_count}",
+                f"- uncertain: {publication.uncertain_score_count}",
+                f"- failed: {publication.failed_score_count}",
+                "Publication Manifest: " + publication.publication_manifest.path,
+            )
+        )
     failures = [trial for trial in result.trials if trial.passed is not True]
     if failures:
         lines.extend(("", "Failures:"))

@@ -1,4 +1,4 @@
-"""Map local Audit facts to a stable Langfuse observation tree."""
+"""Replay local Audit facts as children of an Experiment Runner task trace."""
 
 from __future__ import annotations
 
@@ -18,15 +18,14 @@ VALIDATOR_NAME = "myhermes.audit.validator"
 JUDGE_NAME = "myhermes.audit.judge"
 
 
-def publish_trial_trace(
+def publish_replay_observations(
     client: Any,
     propagate_attributes: Callable[..., Any],
     request: LangfuseTrialRequest,
     *,
     sensitive_values: Iterable[str],
-) -> tuple[str, str]:
+) -> None:
     trial = request.trial
-    trace_id = client.create_trace_id(seed=f"myhermes-audit:{trial.trial_id}")
     runtime = trial.runtime
     metadata = {
         "suite_id": request.suite_id,
@@ -75,6 +74,7 @@ def publish_trial_trace(
         "runtime_total_tokens": None if runtime is None else runtime.total_tokens,
         "post_hoc_publication": True,
         "runtime_timestamps_not_replayed": True,
+        "experiment_runner_replay": True,
     }
     root_input = project_remote_content(
         _case_input(request),
@@ -99,21 +99,16 @@ def publish_trial_trace(
         tags=["myhermes-audit", "p2", request.case.mode.value],
         trace_name=TRACE_NAME,
     ):
-        root = client.start_observation(
-            trace_context={"trace_id": trace_id},
+        with client.start_as_current_observation(
             name=TRACE_NAME,
             as_type="span",
             input=root_input,
             output=root_output,
             metadata=metadata,
             version="p2",
-        )
-        try:
+        ) as root:
             _publish_turns(root, request, sensitive_values=sensitive_values)
             _publish_evaluators(root, request, sensitive_values=sensitive_values)
-        finally:
-            root.end()
-    return trace_id, root.id
 
 
 def _publish_turns(
@@ -386,5 +381,5 @@ __all__ = (
     "TRACE_NAME",
     "TURN_NAME",
     "VALIDATOR_NAME",
-    "publish_trial_trace",
+    "publish_replay_observations",
 )
