@@ -257,8 +257,8 @@ langfuse = [
 
 [package.metadata]
 requires-dist = [
-    { name = "langfuse", marker = "extra == 'eval'", specifier = ">=4.7.0,<5" },
-    { name = "langfuse", marker = "extra == 'langfuse'", specifier = ">=4.7.0,<5" },
+    { name = "langfuse", marker = "extra == 'eval'", specifier = ">=4.14.2,<5" },
+    { name = "langfuse", marker = "extra == 'langfuse'", specifier = ">=4.14.2,<5" },
     { name = "openai", marker = "extra == 'eval'", specifier = ">=2,<3" },
     { name = "openai", marker = "extra == 'judge'", specifier = ">=2,<3" },
     { name = "pydantic", specifier = ">=2.11,<3" },
