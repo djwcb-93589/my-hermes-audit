@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
-import os
 import re
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,11 +12,12 @@ from typing import Any
 
 import yaml
 
+from myhermes_audit.artifacts import atomic_write_text
 from myhermes_audit.environment import (
     MODEL_ENVIRONMENT_ALLOWLIST,
     SUITE_ENVIRONMENT_ALLOWLIST,
 )
-from myhermes_audit.errors import ConfigBuildError
+from myhermes_audit.errors import ConfigBuildError, ReportError
 
 
 _MAX_CONFIG_BYTES = 2 * 1024 * 1024
@@ -115,30 +114,15 @@ class MyHermesConfigBuilder:
         target = Path(destination)
         if target.is_symlink() or target.parent.is_symlink():
             raise ConfigBuildError("generated config path must not be a symlink")
-        temporary: Path | None = None
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
             text = yaml.safe_dump(
                 prepared.document,
                 allow_unicode=True,
                 default_flow_style=False,
                 sort_keys=True,
             )
-            temporary = target.with_name(
-                f".{target.name}.{uuid.uuid4().hex}.tmp"
-            )
-            temporary.write_text(text, encoding="utf-8", newline="\n")
-            try:
-                temporary.chmod(0o600)
-            except OSError:
-                pass
-            os.replace(temporary, target)
-        except OSError as exc:
-            if temporary is not None:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            atomic_write_text(target, text, mode=0o600)
+        except (OSError, ReportError) as exc:
             raise ConfigBuildError("cannot publish generated MyHermes config") from exc
 
 
