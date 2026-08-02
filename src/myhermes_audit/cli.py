@@ -370,9 +370,26 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
     print("Base config: valid")
     print(
         "Subject capabilities: "
-        f"{len(report.capabilities) - len(report.missing_capabilities)}"
+        f"{sum(item.available for item in report.capabilities)}"
         f"/{len(report.capabilities)}"
     )
+    print(
+        "Memory kinds: "
+        + (
+            ", ".join(item.value for item in report.supported_memory_kinds)
+            or "none"
+        )
+    )
+    print(
+        "Memory strategies: "
+        + (
+            ", ".join(
+                item.value for item in report.supported_retrieval_strategies
+            )
+            or "none"
+        )
+    )
+    print(f"Memory provider: {report.memory_provider or 'unavailable'}")
     print(f"Public API fingerprint: {report.public_api_fingerprint}")
     print(f"Optional dependency langfuse: {_presence(langfuse_available)}")
     print(f"Optional dependency openai: {_presence(judge_available)}")

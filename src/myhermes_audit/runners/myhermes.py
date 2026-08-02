@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import signal
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 from pathlib import Path
 from typing import Sequence
 
@@ -18,12 +20,16 @@ from pydantic import ValidationError
 from myhermes_audit.artifacts import atomic_write_json, atomic_write_text
 from myhermes_audit.contracts import (
     AuditCase,
+    MemoryErrorType,
+    MemoryOperationError,
     ModelObservationSummary,
     RunObservationSummary,
     ToolObservationSummary,
     TrialObservationSummary,
     TrialRuntimeSummary,
     TrialWarning,
+    RetrievalStrategy,
+    ToolsetName,
 )
 from myhermes_audit.contracts.suite import (
     CaseMode,
@@ -31,12 +37,18 @@ from myhermes_audit.contracts.suite import (
     EvaluatorKind,
     TextTarget,
 )
-from myhermes_audit.datasets.fixtures import validate_p1_fixture_support
+from myhermes_audit.datasets.fixtures import validate_runtime_fixture_support
 from myhermes_audit.environment import (
     MODEL_ENVIRONMENT_ALLOWLIST,
     WORKER_INHERITED_ENVIRONMENT_ALLOWLIST,
 )
 from myhermes_audit.errors import (
+    MemoryCapabilityError,
+    MemoryKindUnsupportedError,
+    MemoryMappingError,
+    MemoryProtocolError,
+    MemoryScopeUnsupportedError,
+    MemoryStrategyUnsupportedError,
     SubjectPreflightError,
     UnsupportedCaseError,
     WorkerProcessError,
@@ -53,6 +65,8 @@ from myhermes_audit.integrations.myhermes.config_builder import (
     MyHermesConfigBuilder,
 )
 from myhermes_audit.integrations.myhermes.contracts import (
+    MemoryArtifact,
+    MemoryQueryPlan,
     MyHermesWorkerRequest,
     MyHermesWorkerResult,
     ObservationBundle,
@@ -62,6 +76,7 @@ from myhermes_audit.integrations.myhermes.contracts import (
     WorkerMode,
     WorkerStatus,
     WorkerTranscript,
+    WorkerTurn,
     WorkerWarning,
 )
 from myhermes_audit.runners.base import (
@@ -209,7 +224,8 @@ class MyHermesTrialRunner:
                 "P1 scripted turns must contain only user messages",
                 case_id=case.case_id,
             )
-        validate_p1_fixture_support(case.fixture)
+        memory_case = _is_memory_case(case)
+        validate_runtime_fixture_support(case.fixture, allow_memory=memory_case)
         self._config_builder.prepare(case.execution.config_overrides)
 
         unsupported_evaluators = [
@@ -219,21 +235,22 @@ class MyHermesTrialRunner:
                 EvaluatorKind.DETERMINISTIC,
                 EvaluatorKind.TOOL_TRAJECTORY,
                 EvaluatorKind.LLM_JUDGE,
+                EvaluatorKind.RETRIEVAL,
             }
         ]
         if unsupported_evaluators:
             raise UnsupportedCaseError(
-                "case uses evaluators outside the P1 boundary",
+                "case uses evaluators outside the implemented runtime boundary",
                 case_id=case.case_id,
                 evaluator_kinds=unsupported_evaluators,
             )
-        if (
-            case.expected.memories or case.expected.background_reviews
-        ):
+        if case.expected.background_reviews:
             raise UnsupportedCaseError(
-                "case declares expectations outside the P1 boundary",
+                "case declares Background Review expectations outside P3",
                 case_id=case.case_id,
             )
+        if memory_case:
+            self._preflight_memory_case(case)
         if any(
             item.target is not TextTarget.FINAL_OUTPUT
             for item in case.expected.texts
@@ -249,6 +266,156 @@ class MyHermesTrialRunner:
             )
         preflight_evaluators(case)
 
+    def _preflight_memory_case(self, case: AuditCase) -> None:
+        report = self._capability_report
+        if report is None:
+            raise MemoryCapabilityError(
+                "Subject Memory capability report is unavailable",
+                case_id=case.case_id,
+            )
+        strategy = case.execution.memory_strategy
+        if strategy is None:
+            raise MemoryCapabilityError(
+                "P3 Memory cases must explicitly declare execution.memory_strategy",
+                case_id=case.case_id,
+                missing_capability="declared_memory_strategy",
+            )
+        supported = list(report.supported_retrieval_strategies)
+        if strategy not in supported:
+            missing_capability = (
+                "ranked_query+declared_retrieval_strategies"
+                if strategy in {
+                    RetrievalStrategy.DENSE,
+                    RetrievalStrategy.BM25,
+                    RetrievalStrategy.HYBRID,
+                }
+                else "memory_prompt_render+memory_prompt_toggle"
+            )
+            raise MemoryStrategyUnsupportedError(
+                "requested Memory retrieval strategy is not supported by Subject",
+                case_id=case.case_id,
+                requested_strategy=strategy.value,
+                supported_strategies=[item.value for item in supported],
+                missing_capability=missing_capability,
+            )
+        if (
+            strategy is RetrievalStrategy.DISABLED
+            and ToolsetName.MEMORY in case.execution.enabled_toolsets
+        ):
+            raise MemoryCapabilityError(
+                "disabled Memory strategy cannot enable the memory toolset",
+                case_id=case.case_id,
+                missing_capability="disabled_tool_policy_conflict",
+            )
+        if ToolsetName.MEMORY in case.execution.enabled_toolsets:
+            capability = report.capability("memory_tool")
+            if capability is None or not capability.available:
+                raise MemoryCapabilityError(
+                    "Subject public memory tool is unavailable",
+                    case_id=case.case_id,
+                    missing_capability="memory_tool",
+                )
+
+        fixture_items = (
+            [] if case.fixture.memory is None else case.fixture.memory.items
+        )
+        supported_kinds = set(report.supported_memory_kinds)
+        requested_kinds = {item.kind for item in fixture_items}
+        requested_kinds.update(
+            kind
+            for expectation in case.expected.memories
+            for kind in expectation.required_kinds
+        )
+        requested_kinds.update(
+            content.kind
+            for expectation in case.expected.memory_states
+            for content in (
+                *expectation.required_added_content,
+                *expectation.forbidden_added_content,
+            )
+            if content.kind is not None
+        )
+        unsupported_kinds = sorted(
+            requested_kinds - supported_kinds,
+            key=lambda item: item.value,
+        )
+        if unsupported_kinds:
+            raise MemoryKindUnsupportedError(
+                "Memory case requests kinds unsupported by Subject",
+                case_id=case.case_id,
+                requested_kinds=[item.value for item in unsupported_kinds],
+                supported_kinds=[item.value for item in report.supported_memory_kinds],
+            )
+        by_target: dict[str, set[str]] = {"memory": set(), "user": set()}
+        target_by_kind = {
+            "long_term": "memory",
+            "user_profile": "user",
+        }
+        for item in fixture_items:
+            target = target_by_kind.get(item.kind.value)
+            if target is None:
+                continue
+            normalized = " ".join(
+                unicodedata.normalize("NFKC", item.content).split()
+            ).casefold()
+            if normalized in by_target[target]:
+                raise MemoryMappingError(
+                    "Memory fixture entries are indistinguishable in a Subject target",
+                    case_id=case.case_id,
+                    target=target,
+                )
+            by_target[target].add(normalized)
+            if item.user_id is not None and not _capability_available(
+                report,
+                "user_filtering",
+            ):
+                raise MemoryScopeUnsupportedError(
+                    "Subject cannot preserve fixture user scope",
+                    case_id=case.case_id,
+                    missing_capability="user_filtering",
+                )
+            if item.session_id is not None and not _capability_available(
+                report,
+                "session_filtering",
+            ):
+                raise MemoryScopeUnsupportedError(
+                    "Subject cannot preserve fixture session scope",
+                    case_id=case.case_id,
+                    missing_capability="session_filtering",
+                )
+        for expectation in case.expected.memories:
+            query = expectation.query
+            if query.user_id is not None and not _capability_available(
+                report,
+                "user_filtering",
+            ):
+                raise MemoryScopeUnsupportedError(
+                    "Subject does not support Memory user filtering",
+                    case_id=case.case_id,
+                    query_id=expectation.query_id,
+                    missing_capability="user_filtering",
+                )
+            if query.session_id is not None and not _capability_available(
+                report,
+                "session_filtering",
+            ):
+                raise MemoryScopeUnsupportedError(
+                    "Subject does not support Memory session filtering",
+                    case_id=case.case_id,
+                    query_id=expectation.query_id,
+                    missing_capability="session_filtering",
+                )
+            if query.filters and not _capability_available(
+                report,
+                "query_filters",
+            ):
+                raise MemoryScopeUnsupportedError(
+                    "Subject does not support declared Memory query filters",
+                    case_id=case.case_id,
+                    query_id=expectation.query_id,
+                    missing_capability="query_filters",
+                )
+
     def run_trial(
         self,
         case: AuditCase,
@@ -257,7 +424,8 @@ class MyHermesTrialRunner:
         trial_id: str,
         timeout_seconds: int,
     ) -> TrialRunnerOutcome:
-        paths = _worker_artifact_paths(sandbox)
+        memory_case = _is_memory_case(case)
+        paths = _worker_artifact_paths(sandbox, memory_enabled=memory_case)
         started = time.perf_counter()
         captured_stdout = ""
         captured_stderr = ""
@@ -266,8 +434,12 @@ class MyHermesTrialRunner:
         sensitive_values = self._sensitive_values
         try:
             turns = [
-                redact_text(message, sensitive_values)
-                for message in _case_turns(case)
+                turn.model_copy(
+                    update={
+                        "message": redact_text(turn.message, sensitive_values),
+                    }
+                )
+                for turn in _case_turns(case)
             ]
             request = MyHermesWorkerRequest(
                 trial_id=trial_id,
@@ -278,6 +450,16 @@ class MyHermesTrialRunner:
                 hermes_home=sandbox.hermes_home.resolve(strict=True),
                 sqlite_path=sandbox.sqlite_path.resolve(strict=False),
                 enabled_toolsets=case.execution.enabled_toolsets,
+                memory_strategy=case.execution.memory_strategy,
+                memory_fixture=case.fixture.memory,
+                memory_queries=[
+                    MemoryQueryPlan(
+                        query_id=item.query_id,
+                        phase=item.phase,
+                        query=item.query,
+                    )
+                    for item in case.expected.memories
+                ],
                 timeout_seconds=timeout_seconds,
                 artifact_paths=paths,
             )
@@ -335,15 +517,35 @@ class MyHermesTrialRunner:
             atomic_write_text(paths.stderr_log, captured_stderr)
             duration_ms = max(0, round((time.perf_counter() - started) * 1000))
             if timed_out:
+                recovered_memory = _recover_parent_memory_artifact(
+                    paths,
+                    trial_id=trial_id,
+                    case_id=case.case_id,
+                    strategy=case.execution.memory_strategy,
+                )
                 result = _fallback_worker_result(
                     paths,
                     error_type="timeout",
                     message="MyHermes worker exceeded the Trial timeout",
                     duration_ms=duration_ms,
                     warnings=runtime_warnings,
+                    memory_strategy=case.execution.memory_strategy,
+                    recovered_memory=recovered_memory,
+                )
+                result, recovered_memory = _redact_memory_facts(
+                    result,
+                    recovered_memory,
+                    sensitive_values,
                 )
                 atomic_write_json(paths.worker_result, result)
-                _ensure_empty_worker_artifacts(paths, trial_id, case.case_id)
+                _ensure_empty_worker_artifacts(
+                    paths,
+                    trial_id,
+                    case.case_id,
+                    memory_strategy=case.execution.memory_strategy,
+                    memory_errors=result.memory_errors,
+                    recovered_memory=recovered_memory,
+                )
                 return self._outcome_from_result(
                     result,
                     paths,
@@ -360,11 +562,17 @@ class MyHermesTrialRunner:
                 paths.observations,
                 ObservationBundle,
             )
+            memory_artifact = (
+                None
+                if paths.memory is None
+                else _read_protocol_model(paths.memory, MemoryArtifact)
+            )
             _validate_worker_artifacts(
                 request,
                 result,
                 transcript,
                 observations,
+                memory_artifact,
                 returncode=process.returncode,
             )
             result, transcript = _redact_worker_content(
@@ -372,8 +580,15 @@ class MyHermesTrialRunner:
                 transcript,
                 sensitive_values,
             )
+            result, memory_artifact = _redact_memory_facts(
+                result,
+                memory_artifact,
+                sensitive_values,
+            )
             atomic_write_json(paths.worker_result, result)
             atomic_write_json(paths.transcript, transcript)
+            if paths.memory is not None and memory_artifact is not None:
+                atomic_write_json(paths.memory, memory_artifact)
             status = (
                 RunnerStatus.COMPLETED
                 if result.worker_status is WorkerStatus.COMPLETED
@@ -421,16 +636,36 @@ class MyHermesTrialRunner:
                 worker_warnings.append(
                     _worker_warning("log_publication_error", log_exc)
                 )
+            recovered_memory = _recover_parent_memory_artifact(
+                paths,
+                trial_id=trial_id,
+                case_id=case.case_id,
+                strategy=case.execution.memory_strategy,
+            )
             result = _fallback_worker_result(
                 paths,
                 error_type="environment_error",
                 message=f"worker environment failed: {type(exc).__name__}",
                 duration_ms=duration_ms,
                 warnings=worker_warnings,
+                memory_strategy=case.execution.memory_strategy,
+                recovered_memory=recovered_memory,
+            )
+            result, recovered_memory = _redact_memory_facts(
+                result,
+                recovered_memory,
+                sensitive_values,
             )
             try:
                 atomic_write_json(paths.worker_result, result)
-                _ensure_empty_worker_artifacts(paths, trial_id, case.case_id)
+                _ensure_empty_worker_artifacts(
+                    paths,
+                    trial_id,
+                    case.case_id,
+                    memory_strategy=case.execution.memory_strategy,
+                    memory_errors=result.memory_errors,
+                    recovered_memory=recovered_memory,
+                )
             except Exception as artifact_exc:
                 worker_warnings.append(
                     _worker_warning("fallback_artifact_error", artifact_exc)
@@ -441,6 +676,8 @@ class MyHermesTrialRunner:
                     message=f"worker environment failed: {type(exc).__name__}",
                     duration_ms=duration_ms,
                     warnings=worker_warnings,
+                    memory_strategy=case.execution.memory_strategy,
+                    recovered_memory=recovered_memory,
                 )
             return self._outcome_from_result(
                 result,
@@ -637,6 +874,10 @@ class MyHermesTrialRunner:
                 else None
             ),
             observations=_local_observations(observations),
+            memory_query_results=tuple(result.memory_query_results),
+            memory_snapshots=tuple(result.memory_snapshots),
+            memory_state_changes=tuple(result.memory_state_changes),
+            memory_errors=tuple(result.memory_errors),
             tool_calls=tool_calls,
             tool_trace_complete=(
                 status is RunnerStatus.COMPLETED
@@ -644,9 +885,11 @@ class MyHermesTrialRunner:
                 and not observations.truncated
             ),
             artifact_paths={
-                field_name: getattr(paths, field_name)
+                field_name: value
                 for field_name in type(paths).model_fields
                 if field_name != "schema_version"
+                and (value := getattr(paths, field_name)) is not None
+                and value.exists()
             },
             error_type=result.error_type,
             error_message=(None if result.error is None else result.error.message),
@@ -772,6 +1015,139 @@ def _redact_worker_content(
     return safe_result, safe_transcript
 
 
+def _redact_memory_facts(
+    result: MyHermesWorkerResult,
+    artifact: MemoryArtifact | None,
+    sensitive_values: tuple[str, ...],
+) -> tuple[MyHermesWorkerResult, MemoryArtifact | None]:
+    def safe_item(item):
+        safe_content = redact_text(item.content, sensitive_values)
+        metadata = _redact_json_value(item.metadata, sensitive_values)
+        if safe_content != item.content:
+            metadata = {
+                **metadata,
+                "local_content_redacted": True,
+                "original_content_sha256": hashlib.sha256(
+                    item.content.encode("utf-8")
+                ).hexdigest(),
+            }
+        return item.model_copy(
+            update={
+                "content": safe_content,
+                "metadata": metadata,
+            }
+        )
+
+    safe_queries = []
+    for query_result in result.memory_query_results:
+        query = query_result.query.model_copy(
+            update={
+                "query": redact_text(query_result.query.query, sensitive_values),
+                "filters": _redact_json_value(
+                    query_result.query.filters,
+                    sensitive_values,
+                ),
+            }
+        )
+        safe_queries.append(
+            query_result.model_copy(
+                update={
+                    "query": query,
+                    "items": [
+                        item.model_copy(
+                            update={
+                                "content": redact_text(
+                                    item.content,
+                                    sensitive_values,
+                                ),
+                                "metadata": _redact_json_value(
+                                    item.metadata,
+                                    sensitive_values,
+                                ),
+                            }
+                        )
+                        for item in query_result.items
+                    ],
+                    "metadata": _redact_json_value(
+                        query_result.metadata,
+                        sensitive_values,
+                    ),
+                }
+            )
+        )
+    safe_snapshots = [
+        snapshot.model_copy(
+            update={
+                "items": [safe_item(item) for item in snapshot.items],
+                "metadata": _redact_json_value(
+                    snapshot.metadata,
+                    sensitive_values,
+                ),
+            }
+        )
+        for snapshot in result.memory_snapshots
+    ]
+    safe_changes = [
+        change.model_copy(
+            update={
+                "before": None if change.before is None else safe_item(change.before),
+                "after": None if change.after is None else safe_item(change.after),
+                "metadata": _redact_json_value(
+                    change.metadata,
+                    sensitive_values,
+                ),
+            }
+        )
+        for change in result.memory_state_changes
+    ]
+    safe_errors = [
+        item.model_copy(
+            update={
+                "message": redact_text(item.message, sensitive_values),
+                "details": _redact_json_value(item.details, sensitive_values),
+            }
+        )
+        for item in result.memory_errors
+    ]
+    safe_result = result.model_copy(
+        update={
+            "memory_query_results": safe_queries,
+            "memory_snapshots": safe_snapshots,
+            "memory_state_changes": safe_changes,
+            "memory_errors": safe_errors,
+        }
+    )
+    safe_artifact = (
+        None
+        if artifact is None
+        else artifact.model_copy(
+            update={
+                "query_results": safe_queries,
+                "snapshots": safe_snapshots,
+                "state_changes": safe_changes,
+                "errors": safe_errors,
+            }
+        )
+    )
+    return safe_result, safe_artifact
+
+
+def _redact_json_value(value, sensitive_values: tuple[str, ...]):
+    if isinstance(value, str):
+        return redact_text(value, sensitive_values)
+    if isinstance(value, list):
+        return [_redact_json_value(item, sensitive_values) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_json_value(
+                item,
+                sensitive_values,
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
 def _safe_subject_model(
     document: dict,
     sensitive_values: tuple[str, ...],
@@ -782,15 +1158,48 @@ def _safe_subject_model(
     return redact_text(value.strip(), sensitive_values)[:256]
 
 
-def _case_turns(case: AuditCase) -> list[str]:
+def _case_turns(case: AuditCase) -> list[WorkerTurn]:
     if case.mode is CaseMode.SINGLE_TURN:
         if case.input.message is None:
             raise UnsupportedCaseError("single_turn case has no input message")
-        return [case.input.message]
-    return [turn.message for turn in case.input.turns]
+        return [
+            WorkerTurn(
+                message=case.input.message,
+                session_id=case.input.session_id,
+            )
+        ]
+    return [
+        WorkerTurn(message=turn.message, session_id=turn.session_id)
+        for turn in case.input.turns
+    ]
 
 
-def _worker_artifact_paths(sandbox: AuditSandbox) -> WorkerArtifactPaths:
+def _is_memory_case(case: AuditCase) -> bool:
+    return any(
+        (
+            case.execution.memory_strategy is not None,
+            ToolsetName.MEMORY in case.execution.enabled_toolsets,
+            case.fixture.memory is not None,
+            bool(case.expected.memories),
+            bool(case.expected.memory_states),
+            any(
+                evaluator.kind is EvaluatorKind.RETRIEVAL
+                for evaluator in case.evaluators
+            ),
+        )
+    )
+
+
+def _capability_available(report: SubjectCapabilityReport, name: str) -> bool:
+    capability = report.capability(name)
+    return capability is not None and capability.available
+
+
+def _worker_artifact_paths(
+    sandbox: AuditSandbox,
+    *,
+    memory_enabled: bool,
+) -> WorkerArtifactPaths:
     root = sandbox.artifacts_dir.resolve(strict=True)
     return WorkerArtifactPaths(
         worker_request=root / "worker-request.json",
@@ -800,6 +1209,7 @@ def _worker_artifact_paths(sandbox: AuditSandbox) -> WorkerArtifactPaths:
         validator_results=root / "validator-results.json",
         stdout_log=root / "worker.stdout.log",
         stderr_log=root / "worker.stderr.log",
+        memory=(root / "memory.json" if memory_enabled else None),
     )
 
 
@@ -893,6 +1303,7 @@ def _validate_worker_artifacts(
     result: MyHermesWorkerResult,
     transcript: WorkerTranscript,
     observations: ObservationBundle,
+    memory_artifact: MemoryArtifact | None,
     *,
     returncode: int,
 ) -> None:
@@ -901,8 +1312,13 @@ def _validate_worker_artifacts(
     if transcript.turns != result.turns:
         raise WorkerProtocolError("worker transcript turns do not match result")
     observed_messages = [turn.user_message for turn in result.turns]
-    if observed_messages != request.turns[: len(observed_messages)]:
+    requested_messages = [turn.message for turn in request.turns]
+    if observed_messages != requested_messages[: len(observed_messages)]:
         raise WorkerProtocolError("worker transcript messages do not match request")
+    observed_sessions = [turn.session_id for turn in result.turns]
+    requested_sessions = [turn.session_id for turn in request.turns]
+    if observed_sessions != requested_sessions[: len(observed_sessions)]:
+        raise WorkerProtocolError("worker transcript sessions do not match request")
     if (
         result.worker_status is WorkerStatus.COMPLETED
         and len(result.turns) != len(request.turns)
@@ -912,6 +1328,67 @@ def _validate_worker_artifacts(
         raise WorkerProtocolError("worker result names an unexpected Observation artifact")
     if result.transcript_artifact != "artifacts/transcript.json":
         raise WorkerProtocolError("worker result names an unexpected transcript artifact")
+    if request.memory_strategy is None:
+        if memory_artifact is not None or result.memory_artifact is not None:
+            raise MemoryProtocolError("non-Memory worker returned a Memory Artifact")
+        if any(
+            (
+                result.memory_query_results,
+                result.memory_snapshots,
+                result.memory_state_changes,
+                result.memory_errors,
+            )
+        ):
+            raise MemoryProtocolError("non-Memory worker returned Memory facts")
+    else:
+        if memory_artifact is None:
+            raise MemoryProtocolError("Memory worker did not return a Memory Artifact")
+        if result.memory_artifact != "artifacts/memory.json":
+            raise MemoryProtocolError("worker result names an unexpected Memory Artifact")
+        if (
+            memory_artifact.trial_id != request.trial_id
+            or memory_artifact.case_id != request.case_id
+            or memory_artifact.strategy is not request.memory_strategy
+        ):
+            raise MemoryProtocolError("Memory Artifact identity does not match request")
+        if (
+            memory_artifact.query_results != result.memory_query_results
+            or memory_artifact.snapshots != result.memory_snapshots
+            or memory_artifact.state_changes != result.memory_state_changes
+            or memory_artifact.errors != result.memory_errors
+        ):
+            raise MemoryProtocolError("Memory Artifact facts do not match worker result")
+        plans = {item.query_id: item for item in request.memory_queries}
+        for query_result in result.memory_query_results:
+            plan = plans.get(query_result.query_id)
+            if (
+                plan is None
+                or query_result.query != plan.query
+                or query_result.phase is not plan.phase
+                or query_result.strategy is not request.memory_strategy
+            ):
+                raise MemoryProtocolError(
+                    "Memory query result does not match its declared plan"
+                )
+        if result.worker_status is WorkerStatus.COMPLETED:
+            covered_query_ids = {
+                item.query_id for item in result.memory_query_results
+            } | {
+                item.query_id
+                for item in result.memory_errors
+                if item.query_id is not None
+            }
+            if covered_query_ids != set(plans):
+                raise MemoryProtocolError(
+                    "completed Memory worker has incomplete query coverage"
+                )
+        if any(
+            item.strategy is not request.memory_strategy
+            for item in result.memory_snapshots
+        ):
+            raise MemoryProtocolError(
+                "Memory snapshot strategy does not match request"
+            )
     if result.worker_status is WorkerStatus.COMPLETED and returncode != 0:
         raise WorkerProtocolError(
             "worker returned a completed envelope with non-zero exit status"
@@ -945,7 +1422,25 @@ def _fallback_worker_result(
     message: str,
     duration_ms: int,
     warnings: Sequence[WorkerWarning] = (),
+    memory_strategy: RetrievalStrategy | None = None,
+    recovered_memory: MemoryArtifact | None = None,
 ) -> MyHermesWorkerResult:
+    protocol_errors = (
+        []
+        if memory_strategy is None
+        else [
+            MemoryOperationError(
+                error_type=MemoryErrorType.PROTOCOL,
+                operation="parent_fallback",
+                message="Memory pipeline did not return a complete Worker envelope",
+                details={"worker_error_type": error_type},
+            )
+        ]
+    )
+    memory_errors = [
+        *([] if recovered_memory is None else recovered_memory.errors),
+        *protocol_errors,
+    ]
     return MyHermesWorkerResult(
         worker_status=WorkerStatus.FAILED,
         runtime_status=error_type,
@@ -955,6 +1450,21 @@ def _fallback_worker_result(
         duration_ms=duration_ms,
         observations_artifact=f"artifacts/{paths.observations.name}",
         transcript_artifact=f"artifacts/{paths.transcript.name}",
+        memory_artifact=(
+            None
+            if paths.memory is None
+            else f"artifacts/{paths.memory.name}"
+        ),
+        memory_errors=memory_errors,
+        memory_query_results=(
+            [] if recovered_memory is None else recovered_memory.query_results
+        ),
+        memory_snapshots=(
+            [] if recovered_memory is None else recovered_memory.snapshots
+        ),
+        memory_state_changes=(
+            [] if recovered_memory is None else recovered_memory.state_changes
+        ),
         warnings=list(warnings),
         error=WorkerError(error_type=error_type, message=message),
     )
@@ -976,6 +1486,10 @@ def _ensure_empty_worker_artifacts(
     paths: WorkerArtifactPaths,
     trial_id: str,
     case_id: str,
+    *,
+    memory_strategy: RetrievalStrategy | None,
+    memory_errors: Sequence[MemoryOperationError],
+    recovered_memory: MemoryArtifact | None,
 ) -> None:
     if not paths.observations.exists():
         atomic_write_json(paths.observations, ObservationBundle())
@@ -984,6 +1498,41 @@ def _ensure_empty_worker_artifacts(
             paths.transcript,
             WorkerTranscript(trial_id=trial_id, case_id=case_id),
         )
+    if memory_strategy is not None and paths.memory is not None:
+        memory_artifact = recovered_memory or MemoryArtifact(
+            trial_id=trial_id,
+            case_id=case_id,
+            strategy=memory_strategy,
+            provider="unavailable",
+        )
+        atomic_write_json(
+            paths.memory,
+            memory_artifact.model_copy(
+                update={"errors": list(memory_errors)}
+            ),
+        )
+
+
+def _recover_parent_memory_artifact(
+    paths: WorkerArtifactPaths,
+    *,
+    trial_id: str,
+    case_id: str,
+    strategy: RetrievalStrategy | None,
+) -> MemoryArtifact | None:
+    if strategy is None or paths.memory is None:
+        return None
+    try:
+        artifact = _read_protocol_model(paths.memory, MemoryArtifact)
+    except Exception:
+        return None
+    if (
+        artifact.trial_id != trial_id
+        or artifact.case_id != case_id
+        or artifact.strategy is not strategy
+    ):
+        return None
+    return artifact
 
 
 __all__ = ("MyHermesTrialRunner",)

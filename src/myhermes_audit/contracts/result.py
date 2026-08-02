@@ -35,6 +35,13 @@ from myhermes_audit.contracts.langfuse import (
     LangfusePublishResult,
     LangfusePublishStatus,
 )
+from myhermes_audit.contracts.memory import (
+    MemoryOperationError,
+    MemoryQueryResult,
+    MemorySnapshotPhase,
+    MemoryStateChange,
+    MemoryStateSnapshot,
+)
 
 
 class TrialStatus(str, Enum):
@@ -140,6 +147,7 @@ class TrialWarning(ContractModel):
 class TurnResult(ContractModel):
     turn_number: PositiveInt
     user_message: NonEmptyText
+    session_id: Identifier | None = None
     final_output: StrictStr | None = None
     runtime_status: NonEmptyText
     error_type: Identifier | None = None
@@ -257,6 +265,13 @@ class TrialResult(ContractModel):
     turns: list[TurnResult] = Field(default_factory=list)
     runtime: TrialRuntimeSummary | None = None
     observations: TrialObservationSummary | None = None
+    memory_query_results: list[MemoryQueryResult] = Field(default_factory=list)
+    memory_snapshots: list[MemoryStateSnapshot] = Field(default_factory=list)
+    memory_state_changes: list[MemoryStateChange] = Field(default_factory=list)
+    memory_errors: list[MemoryOperationError] = Field(default_factory=list)
+    retrieval_gate_passed: StrictBool | None = None
+    final_answer_gate_passed: StrictBool | None = None
+    memory_state_gate_passed: StrictBool | None = None
     metrics: list[MetricResult] = Field(default_factory=list)
     judge_result: JudgeResult | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
@@ -320,6 +335,56 @@ class TrialResult(ContractModel):
         turn_numbers = [turn.turn_number for turn in self.turns]
         if turn_numbers != list(range(1, len(turn_numbers) + 1)):
             raise ValueError("turn numbers must be contiguous from 1")
+        query_ids = [item.query_id for item in self.memory_query_results]
+        if len(query_ids) != len(set(query_ids)):
+            raise ValueError("memory_query_results must have unique query_id values")
+        snapshot_ids = [item.snapshot_id for item in self.memory_snapshots]
+        if len(snapshot_ids) != len(set(snapshot_ids)):
+            raise ValueError("memory_snapshots must have unique snapshot_id values")
+        snapshot_phases = [item.phase for item in self.memory_snapshots]
+        if len(snapshot_phases) != len(set(snapshot_phases)):
+            raise ValueError("memory_snapshots must have unique phase values")
+        if any(
+            item.phase is None
+            or item.strategy is None
+            or item.provider is None
+            for item in self.memory_snapshots
+        ):
+            raise ValueError(
+                "TrialResult Memory snapshots require phase, strategy, and provider"
+            )
+        query_strategies = {item.strategy for item in self.memory_query_results}
+        query_providers = {item.provider for item in self.memory_query_results}
+        snapshot_strategies = {
+            item.strategy for item in self.memory_snapshots
+        }
+        snapshot_providers = {item.provider for item in self.memory_snapshots}
+        if (
+            len(query_strategies) > 1
+            or len(query_providers) > 1
+            or len(snapshot_strategies) > 1
+            or len(snapshot_providers) > 1
+        ):
+            raise ValueError("TrialResult Memory facts use inconsistent semantics")
+        if (
+            query_strategies
+            and snapshot_strategies
+            and snapshot_strategies != query_strategies
+        ):
+            raise ValueError("Memory query and snapshot strategies must agree")
+        if self.memory_state_changes and set(snapshot_phases) != {
+            MemorySnapshotPhase.BEFORE_CONVERSATION,
+            MemorySnapshotPhase.AFTER_CONVERSATION,
+        }:
+            raise ValueError("Memory state changes require before/after snapshots")
+        change_ids = [item.change_id for item in self.memory_state_changes]
+        if len(change_ids) != len(set(change_ids)):
+            raise ValueError("memory_state_changes must have unique change_id values")
+        changed_memory_ids = [
+            item.memory_id for item in self.memory_state_changes
+        ]
+        if len(changed_memory_ids) != len(set(changed_memory_ids)):
+            raise ValueError("memory_state_changes must have unique memory_id values")
         return self
 
 

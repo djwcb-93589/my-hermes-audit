@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from myhermes_audit.integrations.myhermes.contracts import WorkerWarning
 
 
 def close_runtime_resources(
     *,
     connection,
-    session_id: str | None,
+    session_id: str | None = None,
+    session_ids: Sequence[str] = (),
     process_manager,
     model_client,
 ) -> list[WorkerWarning]:
@@ -45,10 +48,13 @@ def close_runtime_resources(
     if not delegate_complete:
         warnings.append(_warning("delegate_shutdown_incomplete"))
 
-    if session_id is not None:
+    managed_session_ids = list(dict.fromkeys(session_ids))
+    if session_id is not None and session_id not in managed_session_ids:
+        managed_session_ids.append(session_id)
+    for current_session_id in managed_session_ids:
         try:
             report = cleanup_session_resources(
-                session_id,
+                current_session_id,
                 process_manager=process_manager,
             )
             if not report.complete:

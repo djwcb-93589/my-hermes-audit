@@ -6,6 +6,8 @@ P1 为每个 Trial 启动一个新的 Python 子进程。原因不是并行性�
 
 Worker 在导入 `hermes.*` 之前验证 cwd、`HERMES_HOME`、`DB_PATH`、请求和结果路径。随后使用 MyHermes 公开的数据库初始化、会话创建、`register_all`、`ToolPolicy`、`build_system_prompt`、Observation sink 与 `run_conversation`。脚本多轮复用同一个 session，固定输入只允许 user turn。
 
+P3 对该路径做向后兼容扩展：未声明 `memory_strategy` 的 P1/P2 Case 仍复用一个默认 Session、关闭 Memory Prompt 且不加载 Adapter；P3 turn 才可声明多个逻辑 Session，并按 [`p3-memory-retrieval.md`](p3-memory-retrieval.md) 重建 Memory Prompt。
+
 P1 串行执行 Trial。POSIX Worker 使用新 session，Windows 使用新进程组。超时时先发送协作终止信号，短暂等待，再强制清理进程组。Worker 的公开 shutdown 路径负责 process/delegate/session/background review/模型客户端资源，父进程的进程组终止是最后兜底。
 
 Trial 成功要求 Worker completed，且所有 required deterministic 与 tool_trajectory evaluator 都通过。单 Trial 的运行、协议、Validator 或清理失败会形成结构化失败，后续 Case 继续执行；Suite 合同或 subject preflight 失败则不启动任何 Trial。

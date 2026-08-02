@@ -48,13 +48,17 @@ Runner 的 task 是纯回放函数：它只读取已经完成且已脱敏的 `Tr
 
 ## Observation 投影
 
-`TrialResult` 映射为 Runner task Trace 的子树：Trial span、scripted turn、公共 Model/Tool Observation、Validator evaluator，以及实际完成的 Judge generation。未执行的 Judge 不伪造 generation。真实 runtime duration 和可用时间只进入 metadata；发布发生时创建的 span 不伪装成历史瀑布图。
+`TrialResult` 映射为 Runner task Trace 的子树：Trial span、scripted turn、公共 Model/Tool Observation、Validator evaluator，以及实际完成的 Judge generation。P3 Memory Case 还增加 seed、query、before/after snapshot 和 retrieval evaluator Observation；它们只是本地事实回放，不执行第二次查询或评测。未执行的 Judge 不伪造 generation。真实 runtime duration 和可用时间只进入 metadata；发布发生时创建的 span 不伪装成历史瀑布图。
 
 Trace metadata 保存 Audit/Suite/Case/Trial 身份、subject/audit commit、模型标识（安全可得时）、数据分类、runtime 状态和效率摘要。它不保存 config、绝对路径、隐藏 Prompt、隐藏推理或工具正文。
 
+Memory Observation 在允许内容的 `synthetic`/`internal` 模式下仍先经过统一脱敏与长度限制。`--langfuse-no-content` 时，每个 query/Memory item 只保留 SHA-256、长度/字节数、kind、rank、required hit、duration 与安全 metadata；不上传 Memory、User Profile、Fixture 或 query 正文。`sensitive` 分类无条件使用相同省略规则，即使没有传 no-content。Snapshot 不包含路径，跨 Session 只发布 Suite 的逻辑 ID，不发布 Subject Session ID。
+
+Dataset 规划对 P3 只增加逻辑 Session 与严格 Memory query/state expectation 投影，继续只发布 Fixture 指纹摘要并固定记录 `memory_fixture_uploaded=false`；它不导入 Subject，也不执行查询。相同的 no-content/sensitive 规则在远端写入前生效。
+
 ## Score 与发布清单
 
-只发布 `task_success`、`tool_correctness`、`answer_quality`。Score ID 由 `trace_id + score_name + evaluator_version + trial_id` 的 SHA-256 派生；同一身份固定使用首次持久化的 timestamp 和 `value_hash`。Langfuse 官方 [Score 数据模型](https://langfuse.com/docs/evaluation/scores/data-model) 明确允许自定义 Score ID 作为幂等键更新同一个 Score。
+只发布 `task_success`、`tool_correctness`、`answer_quality`。P3 required evidence、Memory state、Recall@K 和 MRR 只作为 Observation/本地 Metric，不增加 Score。Score ID 由 `trace_id + score_name + evaluator_version + trial_id` 的 SHA-256 派生；同一身份固定使用首次持久化的 timestamp 和 `value_hash`。Langfuse 官方 [Score 数据模型](https://langfuse.com/docs/evaluation/scores/data-model) 明确允许自定义 Score ID 作为幂等键更新同一个 Score。
 
 公开 `create_score(..., score_id=..., timestamp=...)` 后立即 `flush()`。只有调用与 flush 都正常返回才记为 confirmed；超时或连接中断后无法判断远端结果时记为 uncertain。相同身份但不同 `value_hash` 会报冲突，不能静默覆盖。完整规则见 [发布幂等合同](publication-idempotency.md)。
 

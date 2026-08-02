@@ -180,12 +180,28 @@ def _case_input(case: AuditCase) -> dict:
         "tags": list(case.tags),
     }
     if case.input.message is not None:
-        return {**identity, "message": case.input.message}
+        return {
+            **identity,
+            "message": case.input.message,
+            **(
+                {}
+                if case.input.session_id is None
+                else {"session_id": case.input.session_id}
+            ),
+        }
     if case.input.turns:
         return {
             **identity,
             "turns": [
-                {"role": turn.role.value, "message": turn.message}
+                {
+                    "role": turn.role.value,
+                    "message": turn.message,
+                    **(
+                        {}
+                        if turn.session_id is None
+                        else {"session_id": turn.session_id}
+                    ),
+                }
                 for turn in case.input.turns
             ]
         }
@@ -216,6 +232,24 @@ def _case_expectations(case: AuditCase) -> dict:
             }
             for item in expected.tool_trajectories
         ],
+        **(
+            {}
+            if not expected.memories
+            else {
+                "memories": [
+                    _without_schema(item) for item in expected.memories
+                ]
+            }
+        ),
+        **(
+            {}
+            if not expected.memory_states
+            else {
+                "memory_states": [
+                    _without_schema(item) for item in expected.memory_states
+                ]
+            }
+        ),
         "judges": [_without_schema(item) for item in expected.judges],
     }
 

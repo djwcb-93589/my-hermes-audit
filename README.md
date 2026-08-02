@@ -16,7 +16,7 @@
 - 保留 `validate` 与 `schema` 静态 CLI，并新增隔离执行的 `run`；
 - 每 Trial 独立子进程运行真实 MyHermes `run_conversation`，并隔离 `HERMES_HOME`、SQLite、workspace、配置导入副作用和进程组；
 - `single_turn` 与固定用户消息的 `scripted_multi_turn`；
-- 显式关闭或启用 `file` / `terminal` toolset；
+- 显式关闭或启用 `file` / `terminal` / `memory` toolset；
 - 文件、最终文本、JSON 文件和公共 Tool Observation 的确定性 Validator；
 - 串行多 Trial、单 Trial 超时、结构化 Artifact、稳定 JSON 报告和终端摘要。
 - 独立、只读的 Subject Capability Probe，以及不调用模型的 `doctor` 诊断；
@@ -26,10 +26,15 @@
 - `task_success`、`tool_correctness`、`answer_quality` 三个一级质量分数，以及独立效率元数据；
 - `synthetic`、`internal`、`sensitive` 数据分类和 `--langfuse-no-content` 内容关闭开关；
 - 本地报告中的 Judge coverage/error、Experiment identity、发布计数和脱敏 integration error。
+- P3 `subject_native` Memory Prompt 暴露与 `disabled` 对照、公共 API seed/read/render/clear Adapter、before/after snapshot、稳定状态 diff 和跨逻辑 Session；
+- required Memory evidence、Recall@K、MRR、Memory 状态门禁，以及与最终答案门禁分离的结构化 Trial 事实；
+- P3 Memory seed/query/snapshot/retrieval Langfuse Observation；no-content 或 sensitive 时只投影逐项哈希、长度、kind、rank 与安全 metadata。
 
-## P2 明确未实现
+## P3 实现边界与仍未实现
 
-P2 不实现 LLM 模拟用户、Memory Retrieval、Dense/BM25/Hybrid、Compression 消融、Background Review 评测、Baseline Compare、并行调度、CI 或 Langfuse 自定义前端 Dashboard。已有合同中的相关枚举仍只是未来边界；`run` 会在启动 Worker 前拒绝未实现能力。
+P3 已实现当前 MyHermes 公开能力对应的 `subject_native`（准确语义为 `prompt_context_injection`）和 `disabled`。当前 Subject 没有公开 ranked retrieval API，因此 Dense、BM25、Hybrid 只有严格枚举与 capability-negative 边界，`run` 会在创建 Sandbox 前明确拒绝，绝不由 Audit 自己实现或静默降级。
+
+仍未实现 LLM 模拟用户、Compression 消融、Background Review 评测、Baseline Compare、并行调度、CI 或 Langfuse 自定义前端 Dashboard。
 
 ## 安装
 
@@ -70,6 +75,7 @@ compatibility. See
 ```bash
 myhermes-audit validate examples/core_contract_v1.yaml
 python -m myhermes_audit validate examples/memory_contract_v1.yaml
+python -m myhermes_audit validate examples/memory_retrieval_v1.yaml
 ```
 
 输出 `AuditSuite` JSON Schema：
@@ -89,6 +95,17 @@ myhermes-audit run examples/core_run_v1.yaml \
   --subject-config ./local-config.yaml \
   --output reports/core-run.json
 ```
+
+运行 P3 synthetic Memory Suite 使用相同 `run` 命令，不新增 CLI：
+
+```bash
+myhermes-audit run examples/memory_retrieval_v1.yaml \
+  --subject-repo ../my-hermes \
+  --subject-config ./local-config.yaml \
+  --output reports/memory-retrieval.json
+```
+
+每个 P3 Trial 仍使用独立 Sandbox；示例只声明 `subject_native`/`disabled`，不会把 Dense/BM25/Hybrid 描述成当前可运行能力。
 
 可重复使用 `--case <case-id>` 选择 Case；`--preserve-on-failure` 只在终端打印被保留的本地 Sandbox 路径。模型凭据只能从启动 Audit 的环境继承，不能写入 Suite、生成配置、Artifact 或报告。未指定 `--output` 时写入当前目录的 `reports/`。
 
@@ -120,7 +137,8 @@ Judge 只读取 `AUDIT_JUDGE_MODEL`、`AUDIT_JUDGE_API_KEY`、可选 `AUDIT_JUDG
 ## 示例 Suite
 
 - [`examples/core_contract_v1.yaml`](examples/core_contract_v1.yaml)：单轮输入、文件 Fixture、文件与工具轨迹预期，以及 deterministic/llm_judge 声明；
-- [`examples/memory_contract_v1.yaml`](examples/memory_contract_v1.yaml)：固定多轮输入、Memory Fixture、MemoryQuery 与 retrieval 声明；
+- [`examples/memory_contract_v1.yaml`](examples/memory_contract_v1.yaml)：provider-neutral、capability-negative 的 Memory 合同示例，不代表当前 `hybrid` 可运行；
+- [`examples/memory_retrieval_v1.yaml`](examples/memory_retrieval_v1.yaml)：十个 P3 synthetic Case，覆盖事实、偏好、时间、覆盖、冲突、干扰、跨 Session、no-write、隔离与 disabled 对照；
 - [`examples/background_review_contract_v1.yaml`](examples/background_review_contract_v1.yaml)：Memory no-op、Skill update、stale rejection，以及五类 Review 证据；
 - [`examples/core_run_v1.yaml`](examples/core_run_v1.yaml)：P1 可运行的六个合成 Case；本仓库开发阶段不执行该示例。
 - [`examples/core_judge_v1.yaml`](examples/core_judge_v1.yaml)：六个合成 P2 Case，将原有确定性门禁与单个 `answer_quality` Judge 组合；代码建设阶段不执行该示例。
@@ -129,7 +147,7 @@ Judge 只读取 `AUDIT_JUDGE_MODEL`、`AUDIT_JUDGE_API_KEY`、可选 `AUDIT_JUDG
 
 ## 低耦合集成原则
 
-`myhermes_audit` 核心暴露合同、loader、Sandbox、fingerprint、Validator 与报告。`runners/myhermes.py` 负责父进程适配，`integrations/myhermes/worker.py` 是导入 MyHermes 的子进程边界；依赖方向不能反转到核心层。
+`myhermes_audit` 核心暴露合同、loader、Sandbox、fingerprint、Validator 与报告。`runners/myhermes.py` 负责父进程适配，`integrations/myhermes/worker.py` 与仅由它延迟加载的 `memory_adapter.py` 是导入 MyHermes 的子进程边界；依赖方向不能反转到核心层。
 
 父进程通过 `subprocess` 的 `env` 参数传递专属环境，不修改自身 `os.environ`。只有 Worker 在隔离校验完成后导入 MyHermes，并通过公开初始化、会话、工具策略、Observation 读取和关闭接口完成生命周期。
 
@@ -137,6 +155,6 @@ Judge 与 Langfuse 仅在 Audit 父进程的 `integrations/` 适配层初始化�
 
 ## 开发与验证分离
 
-当前阶段只构建代码与合同。本仓库不创建测试目录或测试文件，也不在本阶段运行 pytest、unittest、集成或烟雾验证。后续独立验证阶段应从公开合同和端口验证行为，不应给 MyHermes 增加评测专用分支。
+当前 P3 阶段只构建生产代码、合同、示例与文档。本仓库不创建或修改测试文件，也不在本阶段运行 pytest、unittest、真实 Trial、模型、Judge 或远端集成。后续独立 T3 应从公开合同和端口验证真实行为，不应给 MyHermes 增加评测专用分支。
 
-更多边界见 [`docs/architecture.md`](docs/architecture.md)、[`docs/p1-runner.md`](docs/p1-runner.md)、[`docs/worker-protocol.md`](docs/worker-protocol.md)、[`docs/validators.md`](docs/validators.md)、[`docs/security.md`](docs/security.md)、[`docs/p1-boundary.md`](docs/p1-boundary.md)、[`docs/p2-boundary.md`](docs/p2-boundary.md)、[`docs/langfuse.md`](docs/langfuse.md)、[`docs/langfuse-compatibility.md`](docs/langfuse-compatibility.md)、[`docs/publication-idempotency.md`](docs/publication-idempotency.md)、[`docs/llm-judge.md`](docs/llm-judge.md)、[`docs/score-model.md`](docs/score-model.md) 与 [`docs/data-classification.md`](docs/data-classification.md)。
+更多边界见 [`docs/architecture.md`](docs/architecture.md)、[`docs/p3-memory-retrieval.md`](docs/p3-memory-retrieval.md)、[`docs/p1-runner.md`](docs/p1-runner.md)、[`docs/worker-protocol.md`](docs/worker-protocol.md)、[`docs/validators.md`](docs/validators.md)、[`docs/security.md`](docs/security.md)、[`docs/p1-boundary.md`](docs/p1-boundary.md)、[`docs/p2-boundary.md`](docs/p2-boundary.md)、[`docs/langfuse.md`](docs/langfuse.md)、[`docs/langfuse-compatibility.md`](docs/langfuse-compatibility.md)、[`docs/publication-idempotency.md`](docs/publication-idempotency.md)、[`docs/llm-judge.md`](docs/llm-judge.md)、[`docs/score-model.md`](docs/score-model.md) 与 [`docs/data-classification.md`](docs/data-classification.md)。

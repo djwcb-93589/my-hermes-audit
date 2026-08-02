@@ -40,7 +40,7 @@ def project_scores(trial: TrialResult) -> list[ScoreProjection]:
                 value=1.0 if trial.task_passed else 0.0,
                 source="local_task_gate",
                 evaluator_version=SCORE_MODEL_VERSION,
-                comment="Local deterministic/runtime task gate result.",
+                comment="Local deterministic/runtime/retrieval task gate result.",
                 metadata=efficiency,
             )
         )

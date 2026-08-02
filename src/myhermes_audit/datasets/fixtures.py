@@ -43,8 +43,16 @@ class FixtureManifest(ContractModel):
 
 
 def validate_p1_fixture_support(fixture: FixtureSpec) -> None:
+    validate_runtime_fixture_support(fixture, allow_memory=False)
+
+
+def validate_runtime_fixture_support(
+    fixture: FixtureSpec,
+    *,
+    allow_memory: bool,
+) -> None:
     unsupported: list[str] = []
-    if fixture.memory is not None:
+    if fixture.memory is not None and not allow_memory:
         unsupported.append("memory")
     if fixture.skills:
         unsupported.append("skills")
@@ -54,7 +62,11 @@ def validate_p1_fixture_support(fixture: FixtureSpec) -> None:
         unsupported.append("review_requests")
     if unsupported:
         raise UnsupportedCaseError(
-            "P1 supports only file fixtures",
+            (
+                "runner supports only declared file and Memory fixtures"
+                if allow_memory
+                else "P1 supports only file fixtures"
+            ),
             unsupported_fixtures=unsupported,
         )
 
@@ -90,7 +102,7 @@ def materialize_fixtures(
     fixture: FixtureSpec,
     sandbox: AuditSandbox,
 ) -> tuple[FixtureManifest, Path]:
-    validate_p1_fixture_support(fixture)
+    validate_runtime_fixture_support(fixture, allow_memory=True)
     entries: list[FixtureManifestEntry] = []
     for item in fixture.files:
         try:
@@ -149,4 +161,5 @@ __all__ = (
     "FixtureManifestEntry",
     "materialize_fixtures",
     "validate_p1_fixture_support",
+    "validate_runtime_fixture_support",
 )

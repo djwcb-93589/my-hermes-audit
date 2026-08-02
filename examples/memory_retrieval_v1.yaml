@@ -1,0 +1,445 @@
+schema_version: "1.0"
+suite_id: memory-retrieval-v1
+name: P3 synthetic Memory retrieval and state evaluation
+description: Runnable subject-native and disabled Memory scenarios using only synthetic data.
+tags: [memory, p3, synthetic]
+defaults:
+  trials: 1
+  timeout_seconds: 120
+  preserve_sandbox: false
+  metadata:
+    data_classification: synthetic
+cases:
+  - case_id: memory-explicit-fact
+    name: Recall an explicit synthetic fact
+    mode: single_turn
+    input:
+      message: What is the synthetic launch code?
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: fact-launch-code
+            kind: long_term
+            content: The synthetic launch code is ORION-731.
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: ORION-731
+          case_sensitive: true
+      memories:
+        - query_id: explicit-fact-before
+          query:
+            query: synthetic launch code
+            top_k: 5
+          required_memory_ids: [fact-launch-code]
+          required_kinds: [long_term]
+          minimum_matches: 1
+    evaluators:
+      - evaluator_id: explicit-fact-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: explicit-fact-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-user-preference
+    name: Use a synthetic user preference
+    mode: single_turn
+    input:
+      message: Which synthetic report format should you use?
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: profile-report-format
+            kind: user_profile
+            content: The synthetic user prefers compact Markdown tables.
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: Markdown table
+          case_sensitive: false
+      memories:
+        - query_id: preference-before
+          query:
+            query: preferred report format
+            top_k: 5
+          required_memory_ids: [profile-report-format]
+          required_kinds: [user_profile]
+          minimum_matches: 1
+    evaluators:
+      - evaluator_id: preference-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: preference-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-temporal-order
+    name: Preserve native temporal declaration order
+    mode: single_turn
+    input:
+      message: What is the current synthetic deployment region?
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: region-old
+            kind: long_term
+            content: "Older synthetic record: deployment region was WEST-1."
+            source: audit-fixture
+          - memory_id: region-current
+            kind: long_term
+            content: "Newer synthetic record: deployment region is EAST-9."
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: EAST-9
+          case_sensitive: true
+      memories:
+        - query_id: temporal-before
+          query:
+            query: current deployment region
+            top_k: 5
+          required_memory_ids: [region-old, region-current]
+          required_kinds: [long_term]
+          minimum_matches: 2
+    evaluators:
+      - evaluator_id: temporal-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: temporal-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-overwrite
+    name: Replace an obsolete synthetic preference
+    mode: single_turn
+    input:
+      message: Replace my old synthetic dashboard color with teal using memory, then confirm the new color.
+    execution:
+      enabled_toolsets: [memory]
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: dashboard-color-old
+            kind: user_profile
+            content: Synthetic dashboard color preference is amber.
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: teal
+          case_sensitive: false
+      tool_trajectories:
+        - required_tools: [memory]
+          required_successful_tools: [memory]
+          minimum_tool_calls: 1
+      memories:
+        - query_id: overwrite-after
+          phase: after_conversation
+          query:
+            query: dashboard color preference
+            top_k: 5
+          forbidden_memory_ids: [dashboard-color-old]
+          required_kinds: [user_profile]
+          minimum_matches: 0
+      memory_states:
+        - state_id: overwrite-state
+          required_absent_memory_ids: [dashboard-color-old]
+          required_removed_memory_ids: [dashboard-color-old]
+          required_added_content:
+            - content: teal
+              match: contains
+              kind: user_profile
+          allow_other_changes: false
+    evaluators:
+      - evaluator_id: overwrite-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: overwrite-tool
+        kind: tool_trajectory
+        required: true
+      - evaluator_id: overwrite-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-conflict
+    name: Expose conflicting synthetic records without fake reranking
+    mode: single_turn
+    input:
+      message: Which synthetic support tier is marked current?
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: tier-legacy
+            kind: long_term
+            content: Legacy synthetic record says support tier SILVER.
+            source: audit-fixture
+          - memory_id: tier-current
+            kind: long_term
+            content: Current synthetic record says support tier GOLD.
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: GOLD
+          case_sensitive: true
+      memories:
+        - query_id: conflict-before
+          query:
+            query: current support tier
+            top_k: 5
+          required_memory_ids: [tier-legacy, tier-current]
+          required_kinds: [long_term]
+          minimum_matches: 2
+    evaluators:
+      - evaluator_id: conflict-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: conflict-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-irrelevant-distractors
+    name: Retain evidence among irrelevant synthetic entries
+    mode: single_turn
+    input:
+      message: State the synthetic archive key.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: distractor-fruit
+            kind: long_term
+            content: Synthetic cafeteria fruit is pear.
+            source: audit-fixture
+          - memory_id: archive-key
+            kind: long_term
+            content: The synthetic archive key is ATLAS-44.
+            source: audit-fixture
+          - memory_id: distractor-weather
+            kind: long_term
+            content: Synthetic weather marker is cloudy.
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: ATLAS-44
+          case_sensitive: true
+      memories:
+        - query_id: distractor-before
+          query:
+            query: archive key
+            top_k: 3
+          required_memory_ids: [archive-key]
+          required_kinds: [long_term]
+          minimum_matches: 1
+    evaluators:
+      - evaluator_id: distractor-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: distractor-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-cross-session
+    name: Share persistent Memory across isolated logical Sessions
+    mode: scripted_multi_turn
+    input:
+      turns:
+        - role: user
+          session_id: session-a
+          message: Remember with the memory tool that the synthetic project code is ORION-X.
+        - role: user
+          session_id: session-b
+          message: What is the synthetic project code?
+    execution:
+      enabled_toolsets: [memory]
+      memory_strategy: subject_native
+    expected:
+      texts:
+        - target: final_output
+          contains: ORION-X
+          case_sensitive: true
+      tool_trajectories:
+        - required_tools: [memory]
+          required_successful_tools: [memory]
+          minimum_tool_calls: 1
+      memories:
+        - query_id: cross-session-after
+          phase: after_conversation
+          query:
+            query: synthetic project code
+            top_k: 5
+          required_kinds: [long_term]
+          minimum_matches: 0
+      memory_states:
+        - state_id: cross-session-write
+          required_added_content:
+            - content: ORION-X
+              match: contains
+              kind: long_term
+          allow_other_changes: false
+    evaluators:
+      - evaluator_id: cross-session-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: cross-session-tool
+        kind: tool_trajectory
+        required: true
+      - evaluator_id: cross-session-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-should-not-write
+    name: Answer from context without changing Memory
+    mode: single_turn
+    input:
+      message: Read the synthetic notification preference and answer without changing memory.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: notification-preference
+            kind: user_profile
+            content: Synthetic notification preference is weekly digest.
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: weekly digest
+          case_sensitive: false
+      memories:
+        - query_id: no-write-before
+          query:
+            query: notification preference
+            top_k: 5
+          required_memory_ids: [notification-preference]
+          required_kinds: [user_profile]
+          minimum_matches: 1
+      memory_states:
+        - state_id: no-write-state
+          required_present_memory_ids: [notification-preference]
+          unchanged_memory_ids: [notification-preference]
+          allow_other_changes: false
+    evaluators:
+      - evaluator_id: no-write-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: no-write-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-trial-isolation
+    name: Use only the current Trial synthetic marker
+    mode: single_turn
+    input:
+      message: Return the current isolated synthetic marker.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: isolated-current-marker
+            kind: long_term
+            content: Current isolated synthetic marker is TRIAL-NOVA.
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: TRIAL-NOVA
+          case_sensitive: true
+      memories:
+        - query_id: isolation-before
+          query:
+            query: isolated marker
+            top_k: 5
+          required_memory_ids: [isolated-current-marker]
+          forbidden_memory_ids:
+            - native-memory-dd91c76187eb158f5764210a592f89ca3b35ebbdd31f9b9e9aaaf7be454d8de7
+          runtime_generated_memory_ids:
+            - native-memory-dd91c76187eb158f5764210a592f89ca3b35ebbdd31f9b9e9aaaf7be454d8de7
+          required_kinds: [long_term]
+          minimum_matches: 1
+      memory_states:
+        - state_id: isolation-state
+          required_present_memory_ids: [isolated-current-marker]
+          unchanged_memory_ids: [isolated-current-marker]
+          allow_other_changes: false
+    evaluators:
+      - evaluator_id: isolation-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: isolation-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-disabled-control
+    name: Keep seeded Memory invisible in the disabled control
+    mode: single_turn
+    input:
+      message: If no visible context provides the synthetic control token, say that it is unavailable.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: disabled
+    fixture:
+      memory:
+        items:
+          - memory_id: disabled-secret-token
+            kind: long_term
+            content: Synthetic control token is VEGA-000.
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          not_contains: VEGA-000
+          case_sensitive: true
+      memories:
+        - query_id: disabled-before
+          query:
+            query: synthetic control token
+            top_k: 5
+          forbidden_memory_ids: [disabled-secret-token]
+          minimum_matches: 0
+      memory_states:
+        - state_id: disabled-state
+          required_present_memory_ids: [disabled-secret-token]
+          unchanged_memory_ids: [disabled-secret-token]
+          allow_other_changes: false
+    evaluators:
+      - evaluator_id: disabled-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: disabled-memory
+        kind: retrieval
+        required: true

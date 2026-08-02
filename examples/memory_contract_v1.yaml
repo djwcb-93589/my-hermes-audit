@@ -1,7 +1,7 @@
 schema_version: "1.0"
 suite_id: memory-contract-v1
 name: Memory retrieval contract declaration
-description: Multi-turn Memory fixture and retrieval expectation without a provider.
+description: Capability-negative hybrid declaration for a Subject without ranked retrieval.
 tags:
   - memory
   - contract-only
@@ -21,13 +21,13 @@ cases:
       turns:
         - role: user
           message: My synthetic report preference is a concise Markdown table.
-        - role: assistant
-          message: I will use that format for the next synthetic report.
         - role: user
           message: What report format did I request?
     execution:
       runner: conversation
       workdir: workspace
+      enabled_toolsets: []
+      memory_strategy: hybrid
       config_overrides: {}
       environment_overrides: {}
     fixture:
@@ -38,27 +38,17 @@ cases:
             kind: user_profile
             content: Synthetic user prefers concise Markdown tables for reports.
             source: audit-fixture
-            user_id: synthetic-user
-            session_id: synthetic-session
             metadata:
               confidence: declared
-          - memory_id: unrelated-episodic-item
-            kind: episodic
-            content: A synthetic example task was completed on a prior turn.
-            source: audit-fixture
-            user_id: synthetic-user
-            metadata: {}
       skills: []
       review_requests: []
     expected:
       memories:
-        - query:
+        - query_id: preference-format-query
+          phase: before_conversation
+          query:
             query: preferred report format
             top_k: 3
-            user_id: synthetic-user
-            session_id: synthetic-session
-            filters:
-              scope: profile
           required_memory_ids:
             - preference-report-format
           required_kinds:
@@ -69,9 +59,11 @@ cases:
           contains: Markdown table
           case_sensitive: false
     evaluators:
+      - evaluator_id: preference-answer
+        kind: deterministic
+        required: true
+        config:
+          expectation_group: texts
       - evaluator_id: preference-retrieval
         kind: retrieval
         required: true
-        config:
-          declared_provider_family: hybrid
-          score_semantics: provider-defined

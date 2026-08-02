@@ -42,7 +42,13 @@ from myhermes_audit.contracts.data import (
     is_classification_downgrade,
 )
 from myhermes_audit.contracts.judge import JudgeExpectation
-from myhermes_audit.contracts.memory import MemoryFixture, MemoryKind, MemoryQuery
+from myhermes_audit.contracts.memory import (
+    MemoryFixture,
+    MemoryKind,
+    MemoryQuery,
+    MemoryQueryPhase,
+    RetrievalStrategy,
+)
 
 
 class CaseMode(str, Enum):
@@ -59,6 +65,7 @@ class ConversationRole(str, Enum):
 class ConversationTurn(ContractModel):
     role: ConversationRole
     message: NonEmptyText
+    session_id: Identifier | None = None
 
 
 class SimulatedUserGoal(ContractModel):
@@ -71,6 +78,7 @@ class SimulatedUserGoal(ContractModel):
 
 class CaseInput(ContractModel):
     message: NonEmptyText | None = None
+    session_id: Identifier | None = None
     turns: list[ConversationTurn] = Field(default_factory=list)
     simulated_user: SimulatedUserGoal | None = None
 
@@ -87,6 +95,8 @@ class CaseInput(ContractModel):
             raise ValueError(
                 "exactly one of message, turns, or simulated_user must be provided"
             )
+        if self.session_id is not None and self.message is None:
+            raise ValueError("input.session_id is only valid with input.message")
         return self
 
 
@@ -117,12 +127,14 @@ class RunnerKind(str, Enum):
 class ToolsetName(str, Enum):
     FILE = "file"
     TERMINAL = "terminal"
+    MEMORY = "memory"
 
 
 class ExecutionSpec(ContractModel):
     runner: RunnerKind = RunnerKind.CONVERSATION
     workdir: SafeRelativePath = "workspace"
     enabled_toolsets: list[ToolsetName] = Field(default_factory=list)
+    memory_strategy: RetrievalStrategy | None = None
     config_overrides: JsonObject = Field(default_factory=dict)
     environment_overrides: dict[NonEmptyText, StrictStr] = Field(default_factory=dict)
 
@@ -368,17 +380,108 @@ class ToolTrajectoryExpectation(ContractModel):
 
 
 class MemoryExpectation(ContractModel):
+    query_id: Identifier
+    phase: MemoryQueryPhase = MemoryQueryPhase.BEFORE_CONVERSATION
     query: MemoryQuery
     required_memory_ids: list[Identifier] = Field(default_factory=list)
+    forbidden_memory_ids: list[Identifier] = Field(default_factory=list)
+    runtime_generated_memory_ids: list[Identifier] = Field(default_factory=list)
     required_kinds: list[MemoryKind] = Field(default_factory=list)
     minimum_matches: NonNegativeInt = 0
+    minimum_recall_at_k: StrictFloat | None = Field(default=None, ge=0, le=1)
+    minimum_mrr: StrictFloat | None = Field(default=None, ge=0, le=1)
 
-    @field_validator("required_memory_ids")
+    @field_validator(
+        "required_memory_ids",
+        "forbidden_memory_ids",
+        "runtime_generated_memory_ids",
+        "required_kinds",
+    )
     @classmethod
-    def validate_unique_memory_ids(cls, value: list[str]) -> list[str]:
+    def validate_unique_memory_values(cls, value: list) -> list:
         if len(value) != len(set(value)):
-            raise ValueError("required_memory_ids must not repeat")
+            raise ValueError("Memory expectation lists must not repeat values")
         return value
+
+    @model_validator(mode="after")
+    def validate_memory_expectation(self) -> "MemoryExpectation":
+        required = set(self.required_memory_ids)
+        forbidden = set(self.forbidden_memory_ids)
+        if required & forbidden:
+            raise ValueError("required and forbidden memory IDs must be disjoint")
+        if self.minimum_matches > len(self.required_memory_ids):
+            raise ValueError("minimum_matches cannot exceed required_memory_ids")
+        if not self.required_memory_ids and (
+            self.minimum_recall_at_k is not None or self.minimum_mrr is not None
+        ):
+            raise ValueError("Recall/MRR thresholds require required_memory_ids")
+        return self
+
+
+class MemoryContentMatchMode(str, Enum):
+    EXACT = "exact"
+    CONTAINS = "contains"
+    NORMALIZED_EXACT = "normalized_exact"
+
+
+class MemoryContentExpectation(ContractModel):
+    content: NonEmptyText
+    match: MemoryContentMatchMode = MemoryContentMatchMode.EXACT
+    kind: MemoryKind | None = None
+
+
+class MemoryStateExpectation(ContractModel):
+    state_id: Identifier
+    required_present_memory_ids: list[Identifier] = Field(default_factory=list)
+    required_absent_memory_ids: list[Identifier] = Field(default_factory=list)
+    required_added_content: list[MemoryContentExpectation] = Field(default_factory=list)
+    forbidden_added_content: list[MemoryContentExpectation] = Field(default_factory=list)
+    required_removed_memory_ids: list[Identifier] = Field(default_factory=list)
+    unchanged_memory_ids: list[Identifier] = Field(default_factory=list)
+    runtime_generated_memory_ids: list[Identifier] = Field(default_factory=list)
+    allow_other_changes: StrictBool = False
+
+    @field_validator(
+        "required_present_memory_ids",
+        "required_absent_memory_ids",
+        "required_removed_memory_ids",
+        "unchanged_memory_ids",
+        "runtime_generated_memory_ids",
+    )
+    @classmethod
+    def validate_unique_state_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("Memory state ID lists must not repeat")
+        return value
+
+    @model_validator(mode="after")
+    def validate_state_expectation(self) -> "MemoryStateExpectation":
+        present = set(self.required_present_memory_ids)
+        absent = set(self.required_absent_memory_ids)
+        removed = set(self.required_removed_memory_ids)
+        unchanged = set(self.unchanged_memory_ids)
+        if present & absent:
+            raise ValueError("present and absent Memory IDs must be disjoint")
+        if present & removed:
+            raise ValueError("present and removed Memory IDs must be disjoint")
+        if absent & unchanged:
+            raise ValueError("absent and unchanged Memory IDs must be disjoint")
+        if removed & unchanged:
+            raise ValueError("removed and unchanged Memory IDs must be disjoint")
+        content_values: dict[str, set[str]] = {}
+        for field_name in ("required_added_content", "forbidden_added_content"):
+            values = [item.stable_json() for item in getattr(self, field_name)]
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} must not repeat")
+            content_values[field_name] = set(values)
+        if (
+            content_values["required_added_content"]
+            & content_values["forbidden_added_content"]
+        ):
+            raise ValueError(
+                "required and forbidden added Memory content must be disjoint"
+            )
+        return self
 
 
 class ExpectedSpec(ContractModel):
@@ -387,6 +490,7 @@ class ExpectedSpec(ContractModel):
     json_values: list[JsonExpectation] = Field(default_factory=list)
     tool_trajectories: list[ToolTrajectoryExpectation] = Field(default_factory=list)
     memories: list[MemoryExpectation] = Field(default_factory=list)
+    memory_states: list[MemoryStateExpectation] = Field(default_factory=list)
     background_reviews: list[BackgroundReviewExpectation] = Field(default_factory=list)
     judges: list[JudgeExpectation] = Field(default_factory=list)
 
@@ -453,6 +557,52 @@ class AuditCase(ContractModel):
             raise ValueError("case tags must not repeat")
         if "data_classification" in self.metadata:
             classification_from_metadata(self.metadata)
+        query_ids = [item.query_id for item in self.expected.memories]
+        if len(query_ids) != len(set(query_ids)):
+            raise ValueError("Memory query_id must be unique within an AuditCase")
+        state_ids = [item.state_id for item in self.expected.memory_states]
+        if len(state_ids) != len(set(state_ids)):
+            raise ValueError("Memory state_id must be unique within an AuditCase")
+        fixture_ids = {
+            item.memory_id
+            for item in (
+                [] if self.fixture.memory is None else self.fixture.memory.items
+            )
+        }
+        runtime_ids = {
+            memory_id
+            for expectation in (
+                *self.expected.memories,
+                *self.expected.memory_states,
+            )
+            for memory_id in expectation.runtime_generated_memory_ids
+        }
+        known_ids = fixture_ids | runtime_ids
+        if fixture_ids & runtime_ids:
+            raise ValueError("runtime-generated Memory IDs cannot shadow fixture IDs")
+        referenced_ids = {
+            memory_id
+            for expectation in self.expected.memories
+            for memory_id in (
+                *expectation.required_memory_ids,
+                *expectation.forbidden_memory_ids,
+            )
+        } | {
+            memory_id
+            for expectation in self.expected.memory_states
+            for memory_id in (
+                *expectation.required_present_memory_ids,
+                *expectation.required_absent_memory_ids,
+                *expectation.required_removed_memory_ids,
+                *expectation.unchanged_memory_ids,
+            )
+        }
+        unknown_ids = sorted(referenced_ids - known_ids)
+        if unknown_ids:
+            raise ValueError(
+                "Memory expectation IDs must reference fixture or explicitly "
+                "runtime-generated IDs: " + ", ".join(unknown_ids)
+            )
         return self
 
 

@@ -20,6 +20,10 @@ from myhermes_audit.validators.base import (
 )
 from myhermes_audit.validators.file import FileValidator
 from myhermes_audit.validators.json_file import JsonFileValidator
+from myhermes_audit.validators.memory import (
+    evaluate_memory_expectation,
+    evaluate_memory_state_expectation,
+)
 from myhermes_audit.validators.text import TextValidator
 from myhermes_audit.validators.tool_trajectory import ToolTrajectoryValidator
 
@@ -76,12 +80,41 @@ class ValidatorResultsArtifact(ContractModel):
             if item.required and item.evaluator_kind is EvaluatorKind.DETERMINISTIC
         )
 
+    def required_gate_status(
+        self,
+        *,
+        evaluator_kind: EvaluatorKind,
+        metric_types: frozenset[str] | None = None,
+    ) -> bool | None:
+        evaluator_ids = {
+            item.evaluator_id
+            for item in self.evaluator_results
+            if item.required and item.evaluator_kind is evaluator_kind
+        }
+        selected = [
+            metric
+            for metric in self.metrics
+            if metric.metadata.get("evaluator_id") in evaluator_ids
+            and metric.metadata.get("hard_gate") is True
+            and (
+                metric_types is None
+                or metric.metadata.get("metric_type") in metric_types
+            )
+        ]
+        if not selected:
+            return None
+        return all(
+            metric.status.value == "completed" and metric.passed is True
+            for metric in selected
+        )
+
 
 def preflight_evaluators(case: AuditCase) -> None:
     """Reject unsupported or ambiguous evaluator declarations before execution."""
 
     covered_groups: set[str] = set()
     tool_trajectory_covered = False
+    retrieval_covered = False
     covered_judges: set[int] = set()
     for evaluator in case.evaluators:
         if evaluator.kind is EvaluatorKind.DETERMINISTIC:
@@ -128,6 +161,27 @@ def preflight_evaluators(case: AuditCase) -> None:
                 )
             covered_judges.add(index)
             continue
+        if evaluator.kind is EvaluatorKind.RETRIEVAL:
+            if evaluator.config:
+                raise UnsupportedCaseError(
+                    "retrieval evaluator config must be empty; use strict expectations",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            if retrieval_covered:
+                raise UnsupportedCaseError(
+                    "Memory expectations cannot be evaluated more than once",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            if not case.expected.memories and not case.expected.memory_states:
+                raise UnsupportedCaseError(
+                    "retrieval evaluator selects no Memory expectations",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            retrieval_covered = True
+            continue
         raise UnsupportedCaseError(
             "evaluator kind is outside the P1 boundary",
             case_id=case.case_id,
@@ -149,6 +203,8 @@ def preflight_evaluators(case: AuditCase) -> None:
         range(len(case.expected.judges))
     ):
         orphan_groups.append("judges")
+    if (case.expected.memories or case.expected.memory_states) and not retrieval_covered:
+        orphan_groups.append("memories")
     if orphan_groups:
         raise UnsupportedCaseError(
             "P1 expectations must be attached to an evaluator",
@@ -177,7 +233,11 @@ def evaluate_case(
                 evaluator_id=evaluator.evaluator_id,
                 evaluator_kind=evaluator.kind,
                 required=evaluator.required,
-                passed=all(metric.passed is True for metric in current),
+                passed=all(
+                    metric.status.value == "completed" and metric.passed is True
+                    for metric in current
+                    if metric.metadata.get("hard_gate") is True
+                ),
                 metric_names=[metric.metric_name for metric in current],
             )
         )
@@ -205,6 +265,37 @@ def _evaluate_one(
                 case.expected.tool_trajectories,
                 start=1,
             )
+        ]
+    elif evaluator.kind is EvaluatorKind.RETRIEVAL:
+        if evaluator.config:
+            raise UnsupportedCaseError(
+                "retrieval evaluator config must be empty",
+                evaluator_id=evaluator.evaluator_id,
+            )
+        results: list[MetricResult] = []
+        for expectation in case.expected.memories:
+            results.extend(
+                evaluate_memory_expectation(
+                    expectation,
+                    context,
+                    metric_prefix=(
+                        f"{evaluator.evaluator_id}.memory.{expectation.query_id}"
+                    ),
+                )
+            )
+        for expectation in case.expected.memory_states:
+            results.append(
+                evaluate_memory_state_expectation(
+                    expectation,
+                    context,
+                    metric_name=(
+                        f"{evaluator.evaluator_id}.state.{expectation.state_id}"
+                    ),
+                )
+            )
+        return [
+            _attach_evaluator_metadata(result, evaluator)
+            for result in results
         ]
     else:
         raise UnsupportedCaseError(
@@ -234,18 +325,26 @@ def _evaluate_one(
                 source=MetricSource(source),
                 error=exc,
             )
-        result = result.model_copy(
-            update={
-                "metadata": {
-                    **result.metadata,
-                    "evaluator_id": evaluator.evaluator_id,
-                    "evaluator_kind": evaluator.kind.value,
-                    "required": evaluator.required,
-                }
-            }
-        )
+        result = _attach_evaluator_metadata(result, evaluator)
         results.append(result)
     return results
+
+
+def _attach_evaluator_metadata(
+    result: MetricResult,
+    evaluator: EvaluatorSpec,
+) -> MetricResult:
+    return result.model_copy(
+        update={
+            "metadata": {
+                **result.metadata,
+                "evaluator_id": evaluator.evaluator_id,
+                "evaluator_kind": evaluator.kind.value,
+                "required": evaluator.required,
+                "hard_gate": result.metadata.get("hard_gate", True),
+            }
+        }
+    )
 
 
 def _deterministic_group(evaluator: EvaluatorSpec, *, case_id: str) -> str:

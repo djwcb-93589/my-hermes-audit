@@ -15,6 +15,7 @@ from myhermes_audit.contracts import (
     AuditCase,
     AuditRunResult,
     AuditSuite,
+    EvaluatorKind,
     MetricStatus,
     TrialError,
     TrialResult,
@@ -207,6 +208,10 @@ class AuditOrchestrator:
                 final_output=outcome.final_output,
                 tool_calls=outcome.tool_calls,
                 tool_trace_complete=outcome.tool_trace_complete,
+                memory_query_results=outcome.memory_query_results,
+                memory_snapshots=outcome.memory_snapshots,
+                memory_state_changes=outcome.memory_state_changes,
+                memory_errors=outcome.memory_errors,
             )
             validator_result = evaluate_case(
                 case,
@@ -226,6 +231,18 @@ class AuditOrchestrator:
                         tool_calls=(None if outcome is None else outcome.tool_calls),
                         tool_trace_complete=(
                             False if outcome is None else outcome.tool_trace_complete
+                        ),
+                        memory_query_results=(
+                            () if outcome is None else outcome.memory_query_results
+                        ),
+                        memory_snapshots=(
+                            () if outcome is None else outcome.memory_snapshots
+                        ),
+                        memory_state_changes=(
+                            () if outcome is None else outcome.memory_state_changes
+                        ),
+                        memory_errors=(
+                            () if outcome is None else outcome.memory_errors
                         ),
                     )
                     validator_result = evaluate_case(
@@ -285,7 +302,7 @@ class AuditOrchestrator:
             and outcome is not None
             and outcome.status is RunnerStatus.COMPLETED
             and validator_result is not None
-            and validator_result.deterministic_hard_gates_passed
+            and validator_result.hard_gates_passed
         )
         local_required_gates_passed = (
             failure is None
@@ -365,6 +382,43 @@ class AuditOrchestrator:
                 turns=[] if outcome is None else list(outcome.turns),
                 runtime=(None if outcome is None else outcome.runtime),
                 observations=(None if outcome is None else outcome.observations),
+                memory_query_results=(
+                    [] if outcome is None else list(outcome.memory_query_results)
+                ),
+                memory_snapshots=(
+                    [] if outcome is None else list(outcome.memory_snapshots)
+                ),
+                memory_state_changes=(
+                    [] if outcome is None else list(outcome.memory_state_changes)
+                ),
+                memory_errors=(
+                    [] if outcome is None else list(outcome.memory_errors)
+                ),
+                retrieval_gate_passed=(
+                    None
+                    if validator_result is None
+                    else validator_result.required_gate_status(
+                        evaluator_kind=EvaluatorKind.RETRIEVAL,
+                        metric_types=frozenset(
+                            {"required_evidence", "recall_at_k", "mrr"}
+                        ),
+                    )
+                ),
+                final_answer_gate_passed=(
+                    None
+                    if validator_result is None
+                    else validator_result.required_gate_status(
+                        evaluator_kind=EvaluatorKind.DETERMINISTIC,
+                    )
+                ),
+                memory_state_gate_passed=(
+                    None
+                    if validator_result is None
+                    else validator_result.required_gate_status(
+                        evaluator_kind=EvaluatorKind.RETRIEVAL,
+                        metric_types=frozenset({"memory_state_gate"}),
+                    )
+                ),
                 metrics=metrics,
                 judge_result=(
                     None if judge_evaluation is None else judge_evaluation.result

@@ -18,18 +18,35 @@ The subprocess checks these public surfaces:
 - public Observation repository and view contracts;
 - database initialization, session creation, and resource cleanup entrypoints;
 - exported config projections used by the Worker;
-- resolution of file and terminal declarations through a temporary registry.
+- public file and terminal lightweight declaration surfaces;
+- public Memory read/write, User Profile read/write, prompt render/toggles,
+  Memory tool declaration/handler/registration, ranked query, scores and
+  user/session/filter call shapes;
+- derived supported Memory kinds, retrieval strategies and provider semantics.
 
-The file/terminal check registers inert placeholder handlers from public tool
-declarations. It never calls `register_all`, executes a handler, starts a
-process, initializes SQLite, creates a session, or triggers Background Review.
+Tool checks inspect public lightweight declarations and public handler/register
+signatures. The probe never calls `register_all`, constructs a runtime registry,
+executes a handler, invokes Memory read/render/write, starts a process,
+initializes SQLite, creates a session, reads Memory content, or triggers
+Background Review.
 
 `SubjectCapabilityReport` records the protocol version, Subject commit,
 individual checks, missing capabilities, bounded warnings, and a public API
-fingerprint. The fingerprint uses only module names, public object names, safe
-call signatures, and the probe protocol version; it never hashes MyHermes
-source text. If any required capability is absent, Suite preflight fails once
-and lists the missing names before any Trial Sandbox is created.
+fingerprint. Capability protocol `2.0` distinguishes baseline-required checks
+from optional P3 capabilities, so a Subject without Memory support can still run
+an old non-Memory Suite. The fingerprint uses only module names, public object
+names, availability, safe call signatures, the stable Memory
+kind/strategy/provider projection, and the probe protocol version; it never
+hashes MyHermes source text or function `repr`. If a Case requests an optional
+capability that is absent, runner preflight fails before any Trial Sandbox and
+reports only safe names.
+
+For the current public MyHermes surface, the report derives kinds
+`long_term`/`user_profile`, strategies `subject_native`/`disabled`, and provider
+`prompt_context_injection`. `ranked_query`, `query_scores`, `user_filtering`,
+`session_filtering` and `query_filters` remain unavailable, so Dense/BM25/Hybrid
+cannot pass P3 preflight. `doctor` prints these names and statuses but no Memory
+body.
 
 Audit no longer imports `hermes.config._config`. The generated config validated
 by the parent process is authoritative for disabled plugins. The Worker may

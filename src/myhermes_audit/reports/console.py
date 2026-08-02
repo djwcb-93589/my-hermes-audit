@@ -37,6 +37,9 @@ def render_console_summary(result: AuditRunResult) -> str:
         f"Total tokens:      {_integer_or_missing(summary.total_tokens)}",
         "Langfuse experiment: " + _langfuse_experiment(result),
     ]
+    memory_lines = _memory_summary(result)
+    if memory_lines:
+        lines.extend(memory_lines)
     if result.integration_errors:
         lines.append(f"Langfuse errors:   {len(result.integration_errors)}")
     publication = result.langfuse_publish_result
@@ -126,6 +129,67 @@ def _langfuse_experiment(result: AuditRunResult) -> str:
     if identity.url is not None:
         value += f" {identity.url}"
     return value
+
+
+def _memory_summary(result: AuditRunResult) -> list[str]:
+    query_results = [
+        item
+        for trial in result.trials
+        for item in trial.memory_query_results
+    ]
+    memory_metrics = [
+        metric
+        for trial in result.trials
+        for metric in trial.metrics
+        if metric.source.value == "retrieval"
+    ]
+    if not query_results and not memory_metrics:
+        return []
+    evidence = [
+        metric
+        for metric in memory_metrics
+        if metric.metadata.get("metric_type") == "required_evidence"
+    ]
+    recalls = [
+        float(metric.value)
+        for metric in memory_metrics
+        if metric.metadata.get("metric_type") == "recall_at_k"
+        and metric.status is MetricStatus.COMPLETED
+        and type(metric.value) in (int, float)
+    ]
+    mrrs = [
+        float(metric.value)
+        for metric in memory_metrics
+        if metric.metadata.get("metric_type") == "mrr"
+        and metric.status is MetricStatus.COMPLETED
+        and type(metric.value) in (int, float)
+    ]
+    state_gates = [
+        trial.memory_state_gate_passed
+        for trial in result.trials
+        if trial.memory_state_gate_passed is not None
+    ]
+    evidence_rate = (
+        "not evaluated"
+        if not evidence
+        else f"{sum(item.passed is True for item in evidence) / len(evidence) * 100:.1f}%"
+    )
+    state_rate = (
+        "not evaluated"
+        if not state_gates
+        else f"{sum(item is True for item in state_gates)}/{len(state_gates)}"
+    )
+    return [
+        f"Memory queries:     {len(query_results)}/{len(evidence)} completed",
+        f"Memory evidence:    {evidence_rate}",
+        f"Memory Recall@K:    {_mean_or_missing(recalls)}",
+        f"Memory MRR:         {_mean_or_missing(mrrs)}",
+        f"Memory state gate:  {state_rate}",
+    ]
+
+
+def _mean_or_missing(values: list[float]) -> str:
+    return "not evaluated" if not values else f"{sum(values) / len(values):.3f}"
 
 
 __all__ = ("render_console_summary",)

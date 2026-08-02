@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Iterable
 from typing import Any
 
-from myhermes_audit.contracts import MetricSource
+from myhermes_audit.contracts import MemorySnapshotPhase, MetricSource
 from myhermes_audit.integrations.langfuse.redaction import project_remote_content
 from myhermes_audit.ports.langfuse import LangfuseTrialRequest
 
@@ -16,6 +17,10 @@ MODEL_NAME = "myhermes.agent.model"
 TOOL_NAME = "myhermes.agent.tool"
 VALIDATOR_NAME = "myhermes.audit.validator"
 JUDGE_NAME = "myhermes.audit.judge"
+MEMORY_SEED_NAME = "myhermes.audit.memory.seed"
+MEMORY_QUERY_NAME = "myhermes.audit.memory.query"
+MEMORY_SNAPSHOT_NAME = "myhermes.audit.memory.snapshot"
+MEMORY_EVALUATOR_NAME = "myhermes.audit.memory.evaluator"
 
 
 def publish_replay_observations(
@@ -27,6 +32,7 @@ def publish_replay_observations(
 ) -> None:
     trial = request.trial
     runtime = trial.runtime
+    memory_enabled = _has_memory_facts(request)
     metadata = {
         "suite_id": request.suite_id,
         "suite_sha256": request.suite_sha256,
@@ -72,6 +78,17 @@ def publish_replay_observations(
             None if runtime is None else runtime.tool_call_count
         ),
         "runtime_total_tokens": None if runtime is None else runtime.total_tokens,
+        **(
+            {
+                "memory_query_count": len(trial.memory_query_results),
+                "memory_error_count": len(trial.memory_errors),
+                "retrieval_gate_passed": trial.retrieval_gate_passed,
+                "final_answer_gate_passed": trial.final_answer_gate_passed,
+                "memory_state_gate_passed": trial.memory_state_gate_passed,
+            }
+            if memory_enabled
+            else {}
+        ),
         "post_hoc_publication": True,
         "runtime_timestamps_not_replayed": True,
         "experiment_runner_replay": True,
@@ -89,6 +106,7 @@ def publish_replay_observations(
         sensitive_values=sensitive_values,
     )
     session_id = f"audit:{request.experiment.audit_run_id}:{trial.trial_id}"
+    version = "p3" if memory_enabled else "p2"
     with propagate_attributes(
         session_id=session_id[:200],
         metadata={
@@ -96,7 +114,7 @@ def publish_replay_observations(
             "audit_case_id": request.case.case_id,
             "audit_trial_id": trial.trial_id,
         },
-        tags=["myhermes-audit", "p2", request.case.mode.value],
+        tags=["myhermes-audit", version, request.case.mode.value],
         trace_name=TRACE_NAME,
     ):
         with client.start_as_current_observation(
@@ -105,9 +123,10 @@ def publish_replay_observations(
             input=root_input,
             output=root_output,
             metadata=metadata,
-            version="p2",
+            version=version,
         ) as root:
             _publish_turns(root, request, sensitive_values=sensitive_values)
+            _publish_memory(root, request, sensitive_values=sensitive_values)
             _publish_evaluators(root, request, sensitive_values=sensitive_values)
 
 
@@ -118,6 +137,10 @@ def _publish_turns(
     sensitive_values: Iterable[str],
 ) -> None:
     observations = request.trial.observations
+    omit_content = (
+        request.no_content
+        or request.data_classification.value == "sensitive"
+    )
     model_calls = [] if observations is None else list(observations.model_calls)
     tool_calls = [] if observations is None else list(observations.tool_calls)
     handled_runs: set[str] = set()
@@ -139,6 +162,16 @@ def _publish_turns(
             ),
             metadata={
                 "turn_number": turn.turn_number,
+                **(
+                    {}
+                    if turn.session_id is None
+                    else {
+                        "logical_session_id": (
+                            None if omit_content else turn.session_id
+                        ),
+                        "logical_session_declared": True,
+                    }
+                ),
                 "run_id": turn.run_id,
                 "runtime_status": turn.runtime_status,
                 "runtime_started_at": turn.started_at.isoformat(),
@@ -265,7 +298,15 @@ def _publish_evaluators(
                 sensitive_values=sensitive_values,
             )
             continue
-        name = JUDGE_NAME if metric.source is MetricSource.JUDGE else VALIDATOR_NAME
+        name = (
+            JUDGE_NAME
+            if metric.source is MetricSource.JUDGE
+            else (
+                MEMORY_EVALUATOR_NAME
+                if metric.source is MetricSource.RETRIEVAL
+                else VALIDATOR_NAME
+            )
+        )
         evaluator = root.start_observation(
             name=name,
             as_type="evaluator",
@@ -286,9 +327,226 @@ def _publish_evaluators(
                 "evaluator_version": metric.evaluator_version,
                 "post_hoc_publication": True,
             },
-            version="p2",
+            version=(
+                "p3" if metric.source is MetricSource.RETRIEVAL else "p2"
+            ),
         )
         evaluator.end()
+
+
+def _publish_memory(
+    root: Any,
+    request: LangfuseTrialRequest,
+    *,
+    sensitive_values: Iterable[str],
+) -> None:
+    trial = request.trial
+    if not _has_memory_facts(request):
+        return
+    omit_content = (
+        request.no_content
+        or request.data_classification.value == "sensitive"
+    )
+    required_by_query = {
+        item.query_id: set(item.required_memory_ids)
+        for item in request.case.expected.memories
+    }
+    before = next(
+        (
+            item
+            for item in trial.memory_snapshots
+            if item.phase is MemorySnapshotPhase.BEFORE_CONVERSATION
+        ),
+        None,
+    )
+    seed = root.start_observation(
+        name=MEMORY_SEED_NAME,
+        as_type="span",
+        input={
+            "declared_fixture_count": (
+                0
+                if request.case.fixture.memory is None
+                else len(request.case.fixture.memory.items)
+            ),
+            "content_omitted": omit_content,
+        },
+        output={
+            "snapshot_item_count": 0 if before is None else len(before.items),
+            "items": (
+                []
+                if before is None
+                else [
+                    _memory_item_projection(
+                        item,
+                        omit_content=omit_content,
+                        classification=request.data_classification,
+                        sensitive_values=sensitive_values,
+                    )
+                    for item in before.items
+                ]
+            ),
+        },
+        metadata={
+            "strategy": (
+                "unavailable"
+                if before is None or before.strategy is None
+                else before.strategy.value
+            ),
+            "provider": (
+                "unavailable"
+                if before is None or before.provider is None
+                else before.provider
+            ),
+            "post_hoc_publication": True,
+        },
+        version="p3",
+    )
+    seed.end()
+
+    for result in trial.memory_query_results:
+        required_ids = required_by_query.get(result.query_id, set())
+        query = root.start_observation(
+            name=MEMORY_QUERY_NAME,
+            as_type="span",
+            input={
+                "query_id": result.query_id,
+                "query": _text_projection(
+                    result.query.query,
+                    omit_content=omit_content,
+                    classification=request.data_classification,
+                    sensitive_values=sensitive_values,
+                ),
+                "top_k": result.query.top_k,
+            },
+            output={
+                "item_count": len(result.items),
+                "items": [
+                    {
+                        **_memory_item_projection(
+                            item,
+                            omit_content=omit_content,
+                            classification=request.data_classification,
+                            sensitive_values=sensitive_values,
+                        ),
+                        "rank": item.rank,
+                        "score": item.score,
+                        "required_hit": item.memory_id in required_ids,
+                    }
+                    for item in result.items
+                ],
+            },
+            metadata={
+                "query_id": result.query_id,
+                "phase": result.phase.value,
+                "strategy": result.strategy.value,
+                "provider": result.provider,
+                "duration_ms": result.duration_ms,
+                "query_used": result.metadata.get("query_used"),
+                "score_semantics": result.metadata.get("score_semantics"),
+                "post_hoc_publication": True,
+            },
+            version="p3",
+        )
+        query.end()
+
+    for snapshot in trial.memory_snapshots:
+        if (
+            snapshot.phase is None
+            or snapshot.strategy is None
+            or snapshot.provider is None
+        ):
+            raise ValueError("P3 Memory snapshot semantics are incomplete")
+        span = root.start_observation(
+            name=MEMORY_SNAPSHOT_NAME,
+            as_type="span",
+            input={"phase": snapshot.phase.value},
+            output={
+                "item_count": len(snapshot.items),
+                "items": [
+                    _memory_item_projection(
+                        item,
+                        omit_content=omit_content,
+                        classification=request.data_classification,
+                        sensitive_values=sensitive_values,
+                    )
+                    for item in snapshot.items
+                ],
+            },
+            metadata={
+                "snapshot_id": snapshot.snapshot_id,
+                "phase": snapshot.phase.value,
+                "strategy": snapshot.strategy.value,
+                "provider": snapshot.provider,
+                "state_change_count": len(trial.memory_state_changes),
+                "post_hoc_publication": True,
+            },
+            version="p3",
+        )
+        span.end()
+
+
+def _memory_item_projection(
+    item,
+    *,
+    omit_content: bool,
+    classification,
+    sensitive_values: Iterable[str],
+) -> dict:
+    return {
+        **({} if omit_content else {"memory_id": item.memory_id}),
+        "kind": item.kind.value,
+        "content": _text_projection(
+            item.content,
+            omit_content=omit_content,
+            classification=classification,
+            sensitive_values=sensitive_values,
+        ),
+    }
+
+
+def _text_projection(
+    value: str,
+    *,
+    omit_content: bool,
+    classification,
+    sensitive_values: Iterable[str],
+) -> dict:
+    projected = project_remote_content(
+        value,
+        classification=classification,
+        no_content=False,
+        sensitive_values=sensitive_values,
+    )
+    if not isinstance(projected, str):
+        return {
+            "sha256": projected.get("sha256"),
+            "length": projected.get("serialized_length"),
+            "size_bytes": projected.get("serialized_size_bytes"),
+            "content_omitted": True,
+        }
+    encoded = projected.encode("utf-8")
+    result = {
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "length": len(projected),
+        "size_bytes": len(encoded),
+        "content_omitted": omit_content,
+    }
+    if not omit_content:
+        result["value"] = projected
+    return result
+
+
+def _has_memory_facts(request: LangfuseTrialRequest) -> bool:
+    trial = request.trial
+    return any(
+        (
+            request.case.execution.memory_strategy is not None,
+            bool(trial.memory_query_results),
+            bool(trial.memory_snapshots),
+            bool(trial.memory_state_changes),
+            bool(trial.memory_errors),
+        )
+    )
 
 
 def _publish_judge_generation(
@@ -365,10 +623,20 @@ def _publish_judge_generation(
 def _case_input(request: LangfuseTrialRequest) -> dict:
     case_input = request.case.input
     if case_input.message is not None:
-        return {"message": case_input.message}
+        value = {"message": case_input.message}
+        if case_input.session_id is not None:
+            value["session_id"] = case_input.session_id
+        return value
     return {
         "turns": [
-            {"role": turn.role.value, "message": turn.message}
+            {
+                **{"role": turn.role.value, "message": turn.message},
+                **(
+                    {}
+                    if turn.session_id is None
+                    else {"session_id": turn.session_id}
+                ),
+            }
             for turn in case_input.turns
         ]
     }
@@ -376,6 +644,10 @@ def _case_input(request: LangfuseTrialRequest) -> dict:
 
 __all__ = (
     "JUDGE_NAME",
+    "MEMORY_EVALUATOR_NAME",
+    "MEMORY_QUERY_NAME",
+    "MEMORY_SEED_NAME",
+    "MEMORY_SNAPSHOT_NAME",
     "MODEL_NAME",
     "TOOL_NAME",
     "TRACE_NAME",

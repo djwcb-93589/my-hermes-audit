@@ -8,7 +8,19 @@ from typing import Literal
 
 from pydantic import Field, StrictBool, StrictStr, model_validator
 
-from myhermes_audit.contracts import ToolsetName, TurnResult
+from myhermes_audit.contracts import (
+    MemoryFixture,
+    MemoryOperationError,
+    MemoryQuery,
+    MemoryQueryPhase,
+    MemoryQueryResult,
+    MemorySnapshotPhase,
+    MemoryStateChange,
+    MemoryStateSnapshot,
+    RetrievalStrategy,
+    ToolsetName,
+    TurnResult,
+)
 from myhermes_audit.contracts.common import (
     ContractModel,
     Identifier,
@@ -19,8 +31,8 @@ from myhermes_audit.contracts.common import (
 )
 
 
-WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v1"
-WorkerProtocolVersion = Literal["myhermes-audit-worker-v1"]
+WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v2"
+WorkerProtocolVersion = Literal["myhermes-audit-worker-v2"]
 
 
 class WorkerMode(str, Enum):
@@ -33,6 +45,17 @@ class WorkerStatus(str, Enum):
     FAILED = "failed"
 
 
+class WorkerTurn(ContractModel):
+    message: NonEmptyText
+    session_id: Identifier | None = None
+
+
+class MemoryQueryPlan(ContractModel):
+    query_id: Identifier
+    phase: MemoryQueryPhase = MemoryQueryPhase.BEFORE_CONVERSATION
+    query: MemoryQuery
+
+
 class WorkerArtifactPaths(ContractModel):
     worker_request: Path
     worker_result: Path
@@ -41,10 +64,16 @@ class WorkerArtifactPaths(ContractModel):
     validator_results: Path
     stdout_log: Path
     stderr_log: Path
+    memory: Path | None = None
 
     @model_validator(mode="after")
     def validate_artifact_paths(self) -> "WorkerArtifactPaths":
-        paths = [getattr(self, name) for name in type(self).model_fields if name != "schema_version"]
+        paths = [
+            value
+            for name in type(self).model_fields
+            if name != "schema_version"
+            and (value := getattr(self, name)) is not None
+        ]
         if any(not path.is_absolute() for path in paths):
             raise ValueError("worker artifact paths must be absolute")
         parents = {path.resolve(strict=False).parent for path in paths}
@@ -60,11 +89,14 @@ class MyHermesWorkerRequest(ContractModel):
     trial_id: Identifier
     case_id: Identifier
     mode: WorkerMode
-    turns: list[NonEmptyText] = Field(min_length=1)
+    turns: list[WorkerTurn] = Field(min_length=1)
     workspace: Path
     hermes_home: Path
     sqlite_path: Path
     enabled_toolsets: list[ToolsetName] = Field(default_factory=list)
+    memory_strategy: RetrievalStrategy | None = None
+    memory_fixture: MemoryFixture | None = None
+    memory_queries: list[MemoryQueryPlan] = Field(default_factory=list)
     timeout_seconds: PositiveInt
     artifact_paths: WorkerArtifactPaths
 
@@ -77,6 +109,28 @@ class MyHermesWorkerRequest(ContractModel):
             raise ValueError("workspace and hermes_home must be distinct")
         if len(self.enabled_toolsets) != len(set(self.enabled_toolsets)):
             raise ValueError("enabled_toolsets must not repeat")
+        query_ids = [item.query_id for item in self.memory_queries]
+        if len(query_ids) != len(set(query_ids)):
+            raise ValueError("worker Memory query IDs must not repeat")
+        memory_requested = any(
+            (
+                self.memory_fixture is not None,
+                bool(self.memory_queries),
+                ToolsetName.MEMORY in self.enabled_toolsets,
+                self.memory_strategy is not None,
+            )
+        )
+        if memory_requested and self.memory_strategy is None:
+            raise ValueError("worker Memory requests require memory_strategy")
+        if memory_requested and self.artifact_paths.memory is None:
+            raise ValueError("worker Memory requests require a Memory Artifact path")
+        if not memory_requested and self.artifact_paths.memory is not None:
+            raise ValueError("non-Memory worker requests cannot name a Memory Artifact")
+        if (
+            self.memory_strategy is RetrievalStrategy.DISABLED
+            and ToolsetName.MEMORY in self.enabled_toolsets
+        ):
+            raise ValueError("disabled strategy cannot enable the memory toolset")
         return self
 
 
@@ -167,6 +221,66 @@ class WorkerTranscript(ContractModel):
         return self
 
 
+class MemoryArtifact(ContractModel):
+    protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
+    trial_id: Identifier
+    case_id: Identifier
+    strategy: RetrievalStrategy
+    provider: NonEmptyText
+    seeded_memory_ids: list[Identifier] = Field(default_factory=list)
+    query_results: list[MemoryQueryResult] = Field(default_factory=list)
+    snapshots: list[MemoryStateSnapshot] = Field(default_factory=list)
+    state_changes: list[MemoryStateChange] = Field(default_factory=list)
+    errors: list[MemoryOperationError] = Field(default_factory=list)
+    clear_attempted: StrictBool = False
+    clear_succeeded: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def validate_memory_artifact(self) -> "MemoryArtifact":
+        if len(self.seeded_memory_ids) != len(set(self.seeded_memory_ids)):
+            raise ValueError("seeded_memory_ids must not repeat")
+        query_ids = [item.query_id for item in self.query_results]
+        if len(query_ids) != len(set(query_ids)):
+            raise ValueError("Memory Artifact query IDs must not repeat")
+        snapshot_ids = [item.snapshot_id for item in self.snapshots]
+        if len(snapshot_ids) != len(set(snapshot_ids)):
+            raise ValueError("Memory Artifact snapshot IDs must not repeat")
+        snapshot_phases = [item.phase for item in self.snapshots]
+        if len(snapshot_phases) != len(set(snapshot_phases)):
+            raise ValueError("Memory Artifact snapshot phases must not repeat")
+        if any(
+            item.phase is None
+            or item.strategy is not self.strategy
+            or item.provider is None
+            for item in self.snapshots
+        ):
+            raise ValueError(
+                "Memory Artifact snapshots require matching P3 semantics"
+            )
+        if any(
+            item.strategy is not self.strategy or item.provider != self.provider
+            for item in self.query_results
+        ):
+            raise ValueError(
+                "Memory Artifact queries require matching P3 semantics"
+            )
+        if len({item.provider for item in self.snapshots}) > 1:
+            raise ValueError("Memory Artifact snapshots must share a provider")
+        if self.state_changes and set(snapshot_phases) != {
+            MemorySnapshotPhase.BEFORE_CONVERSATION,
+            MemorySnapshotPhase.AFTER_CONVERSATION,
+        }:
+            raise ValueError(
+                "Memory Artifact state changes require before/after snapshots"
+            )
+        changed_ids = [item.memory_id for item in self.state_changes]
+        if len(changed_ids) != len(set(changed_ids)):
+            raise ValueError("Memory Artifact state change IDs must not repeat")
+        if not self.clear_attempted and self.clear_succeeded is not None:
+            raise ValueError("clear_succeeded requires clear_attempted")
+        return self
+
+
 class MyHermesWorkerResult(ContractModel):
     protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
     worker_status: WorkerStatus
@@ -187,6 +301,11 @@ class MyHermesWorkerResult(ContractModel):
     duration_ms: NonNegativeInt
     observations_artifact: SafeRelativePath
     transcript_artifact: SafeRelativePath
+    memory_artifact: SafeRelativePath | None = None
+    memory_query_results: list[MemoryQueryResult] = Field(default_factory=list)
+    memory_snapshots: list[MemoryStateSnapshot] = Field(default_factory=list)
+    memory_state_changes: list[MemoryStateChange] = Field(default_factory=list)
+    memory_errors: list[MemoryOperationError] = Field(default_factory=list)
     warnings: list[WorkerWarning] = Field(default_factory=list)
     error: WorkerError | None = None
 
@@ -232,12 +351,35 @@ class MyHermesWorkerResult(ContractModel):
             and self.total_tokens != self.prompt_tokens + self.completion_tokens
         ):
             raise ValueError("total_tokens must equal prompt_tokens + completion_tokens")
+        query_ids = [item.query_id for item in self.memory_query_results]
+        if len(query_ids) != len(set(query_ids)):
+            raise ValueError("worker Memory query IDs must not repeat")
+        snapshot_ids = [item.snapshot_id for item in self.memory_snapshots]
+        if len(snapshot_ids) != len(set(snapshot_ids)):
+            raise ValueError("worker Memory snapshot IDs must not repeat")
+        snapshot_phases = [item.phase for item in self.memory_snapshots]
+        if len(snapshot_phases) != len(set(snapshot_phases)):
+            raise ValueError("worker Memory snapshot phases must not repeat")
+        if any(
+            item.phase is None
+            or item.strategy is None
+            or item.provider is None
+            for item in self.memory_snapshots
+        ):
+            raise ValueError(
+                "worker Memory snapshots require phase, strategy, and provider"
+            )
+        changed_ids = [item.memory_id for item in self.memory_state_changes]
+        if len(changed_ids) != len(set(changed_ids)):
+            raise ValueError("worker Memory state change IDs must not repeat")
         return self
 
 
 __all__ = (
     "MyHermesWorkerRequest",
     "MyHermesWorkerResult",
+    "MemoryArtifact",
+    "MemoryQueryPlan",
     "ModelObservationRecord",
     "ObservationBundle",
     "RunObservationRecord",
@@ -248,5 +390,6 @@ __all__ = (
     "WorkerMode",
     "WorkerStatus",
     "WorkerTranscript",
+    "WorkerTurn",
     "WorkerWarning",
 )

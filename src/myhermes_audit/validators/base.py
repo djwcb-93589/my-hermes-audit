@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from myhermes_audit.contracts import (
+    MemoryOperationError,
+    MemoryQueryResult,
+    MemoryStateChange,
+    MemoryStateSnapshot,
     MetricError,
     MetricEvidence,
     MetricResult,
@@ -37,6 +41,10 @@ class ValidationContext:
     final_output: str | None
     tool_calls: tuple[ToolTraceEntry, ...] | None = None
     tool_trace_complete: bool = True
+    memory_query_results: tuple[MemoryQueryResult, ...] = ()
+    memory_snapshots: tuple[MemoryStateSnapshot, ...] = ()
+    memory_state_changes: tuple[MemoryStateChange, ...] = ()
+    memory_errors: tuple[MemoryOperationError, ...] = ()
 
 
 def resolve_validation_path(context: ValidationContext, declared: str) -> Path:

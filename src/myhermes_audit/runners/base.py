@@ -9,6 +9,10 @@ from typing import Protocol, Sequence
 
 from myhermes_audit.contracts import (
     AuditCase,
+    MemoryOperationError,
+    MemoryQueryResult,
+    MemoryStateChange,
+    MemoryStateSnapshot,
     TrialObservationSummary,
     TrialRuntimeSummary,
     TrialWarning,
@@ -41,6 +45,10 @@ class TrialRunnerOutcome:
     error_message: str | None = None
     retryable: bool = False
     warnings: tuple[TrialWarning, ...] = ()
+    memory_query_results: tuple[MemoryQueryResult, ...] = ()
+    memory_snapshots: tuple[MemoryStateSnapshot, ...] = ()
+    memory_state_changes: tuple[MemoryStateChange, ...] = ()
+    memory_errors: tuple[MemoryOperationError, ...] = ()
 
 
 class TrialRunnerPort(Protocol):

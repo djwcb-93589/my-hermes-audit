@@ -8,6 +8,7 @@ import inspect
 import json
 import re
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Callable, Sequence
 
 from pydantic import ValidationError
@@ -21,6 +22,7 @@ from myhermes_audit.integrations.myhermes.capability_contracts import (
     SubjectCapabilityReport,
     SubjectCapabilityWarning,
 )
+from myhermes_audit.contracts.memory import MemoryKind, RetrievalStrategy
 from myhermes_audit.serialization import canonical_sha256
 
 
@@ -104,6 +106,43 @@ def _bind_run_conversation_worker_call(signature: inspect.Signature) -> None:
     )
 
 
+def _bind_memory_read(signature: inspect.Signature) -> None:
+    signature.bind(target=_BIND_PLACEHOLDER)
+
+
+def _bind_memory_write(signature: inspect.Signature) -> None:
+    signature.bind(
+        _BIND_PLACEHOLDER,
+        target=_BIND_PLACEHOLDER,
+        content=_BIND_PLACEHOLDER,
+        old_text=_BIND_PLACEHOLDER,
+    )
+
+
+def _bind_memory_render(signature: inspect.Signature) -> None:
+    signature.bind(
+        include_long=_BIND_PLACEHOLDER,
+        include_user=_BIND_PLACEHOLDER,
+    )
+
+
+def _bind_memory_handler(signature: inspect.Signature) -> None:
+    signature.bind(_BIND_PLACEHOLDER)
+
+
+def _bind_memory_register(signature: inspect.Signature) -> None:
+    signature.bind(_BIND_PLACEHOLDER)
+
+
+def _bind_prompt_memory_toggle(signature: inspect.Signature) -> None:
+    signature.bind(
+        _BIND_PLACEHOLDER,
+        enabled_toolsets=_BIND_PLACEHOLDER,
+        include_memory=_BIND_PLACEHOLDER,
+        include_user_profile=_BIND_PLACEHOLDER,
+    )
+
+
 class _ProbeBuilder:
     def __init__(self) -> None:
         self.checks: list[SubjectCapabilityCheck] = []
@@ -117,6 +156,8 @@ class _ProbeBuilder:
         object_name: str,
         predicate: Callable[[object], bool] | None = None,
         signature_validator: Callable[[inspect.Signature], None] | None = None,
+        *,
+        required: bool = True,
     ) -> object | None:
         value: object | None = None
         available = False
@@ -178,6 +219,7 @@ class _ProbeBuilder:
         self.checks.append(
             SubjectCapabilityCheck(
                 name=name,
+                required=required,
                 available=available,
                 module=module_name,
                 public_object=object_name,
@@ -190,9 +232,36 @@ class _ProbeBuilder:
                 "module": module_name,
                 "object": object_name,
                 "signature": signature,
+                "available": "yes" if available else "no",
             }
         )
         return value if available else None
+
+    def derived_check(
+        self,
+        name: str,
+        *,
+        available: bool,
+        public_object: str,
+    ) -> None:
+        self.checks.append(
+            SubjectCapabilityCheck(
+                name=name,
+                required=False,
+                available=available,
+                module="<derived-public-capability>",
+                public_object=public_object,
+                failure_type=None if available else "capability_incompatible",
+            )
+        )
+        self.api_entries.append(
+            {
+                "module": "<derived-public-capability>",
+                "object": public_object,
+                "signature": None,
+                "available": "yes" if available else "no",
+            }
+        )
 
     def result_check(
         self,
@@ -200,6 +269,8 @@ class _ProbeBuilder:
         module_name: str,
         object_name: str,
         operation: Callable[[], bool],
+        *,
+        required: bool = True,
     ) -> None:
         available = False
         failure_type: str | None = None
@@ -214,6 +285,7 @@ class _ProbeBuilder:
         self.checks.append(
             SubjectCapabilityCheck(
                 name=name,
+                required=required,
                 available=available,
                 module=module_name,
                 public_object=object_name,
@@ -221,7 +293,12 @@ class _ProbeBuilder:
             )
         )
         self.api_entries.append(
-            {"module": module_name, "object": object_name, "signature": None}
+            {
+                "module": module_name,
+                "object": object_name,
+                "signature": None,
+                "available": "yes" if available else "no",
+            }
         )
 
 
@@ -258,30 +335,48 @@ def _public_config_surface(value: object) -> bool:
     return all(hasattr(value, name) for name in required)
 
 
-def _resolve_file_and_terminal_toolsets() -> bool:
-    tools = importlib.import_module("hermes.tools")
-    file_declarations = getattr(
-        importlib.import_module("hermes.tool_declarations.file"),
-        "TOOL_DECLARATIONS",
+def _tool_declaration_surface(
+    value: object,
+    *,
+    expected_toolsets: frozenset[str],
+    expected_names: frozenset[str] | None = None,
+) -> bool:
+    if not isinstance(value, tuple) or not value:
+        return False
+    names = {getattr(item, "name", None) for item in value}
+    toolsets = {getattr(item, "toolset", None) for item in value}
+    if not all(
+        isinstance(getattr(item, "schema", None), Mapping)
+        and isinstance(getattr(item, "name", None), str)
+        and isinstance(getattr(item, "toolset", None), str)
+        for item in value
+    ):
+        return False
+    return toolsets == set(expected_toolsets) and (
+        expected_names is None or names == set(expected_names)
     )
-    terminal_declarations = getattr(
-        importlib.import_module("hermes.tool_declarations.terminal"),
-        "TOOL_DECLARATIONS",
-    )
-    registry = tools.ToolRegistry()
 
-    def never_execute(_arguments: dict, **_kwargs) -> str:
-        raise RuntimeError("capability probe handlers must never execute")
 
-    for declaration in (*file_declarations, *terminal_declarations):
-        registry.register_declaration(declaration, never_execute)
-    policy = tools.ToolPolicy(
-        tools.ExecutionEnvironment.CLI,
-        enabled_toolsets=frozenset({"file", "terminal"}),
-        unattended=True,
+def _file_declaration_surface(value: object) -> bool:
+    return _tool_declaration_surface(
+        value,
+        expected_toolsets=frozenset({"file"}),
     )
-    resolution = registry.resolve(policy)
-    return resolution.toolsets == frozenset({"file", "terminal"})
+
+
+def _terminal_declaration_surface(value: object) -> bool:
+    return _tool_declaration_surface(
+        value,
+        expected_toolsets=frozenset({"terminal"}),
+    )
+
+
+def _memory_declaration_surface(value: object) -> bool:
+    return _tool_declaration_surface(
+        value,
+        expected_toolsets=frozenset({"memory"}),
+        expected_names=frozenset({"memory"}),
+    )
 
 
 def _validate_subject_origin(request: SubjectCapabilityProbeRequest) -> bool:
@@ -320,6 +415,125 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         "hermes.prompt",
         "build_system_prompt",
         _has_parameters("cwd", "enabled_toolsets"),
+    )
+    memory_prompt_toggle = builder.check(
+        "memory_prompt_toggle",
+        "hermes.prompt",
+        "build_system_prompt",
+        signature_validator=_bind_prompt_memory_toggle,
+        required=False,
+    )
+    memory_read = builder.check(
+        "memory_read",
+        "hermes.tools.memory",
+        "read_memory_entries",
+        signature_validator=_bind_memory_read,
+        required=False,
+    )
+    memory_write = builder.check(
+        "memory_write",
+        "hermes.tools.memory",
+        "mutate_memory_entries",
+        signature_validator=_bind_memory_write,
+        required=False,
+    )
+    user_profile_read = builder.check(
+        "user_profile_read",
+        "hermes.tools.memory",
+        "read_memory_entries",
+        signature_validator=_bind_memory_read,
+        required=False,
+    )
+    user_profile_write = builder.check(
+        "user_profile_write",
+        "hermes.tools.memory",
+        "mutate_memory_entries",
+        signature_validator=_bind_memory_write,
+        required=False,
+    )
+    memory_prompt_render = builder.check(
+        "memory_prompt_render",
+        "hermes.tools.memory",
+        "render_memory_section",
+        signature_validator=_bind_memory_render,
+        required=False,
+    )
+    memory_declaration = builder.check(
+        "memory_tool_declaration",
+        "hermes.tool_declarations.memory",
+        "TOOL_DECLARATIONS",
+        _memory_declaration_surface,
+        required=False,
+    )
+    memory_handler = builder.check(
+        "memory_tool_handler",
+        "hermes.tools.memory",
+        "handle_memory",
+        signature_validator=_bind_memory_handler,
+        required=False,
+    )
+    memory_registration = builder.check(
+        "memory_tool_registration",
+        "hermes.tools.memory",
+        "register",
+        signature_validator=_bind_memory_register,
+        required=False,
+    )
+    memory_tool_available = all(
+        item is not None
+        for item in (memory_declaration, memory_handler, memory_registration)
+    )
+    builder.derived_check(
+        "memory_tool",
+        available=memory_tool_available,
+        public_object="memory declaration+handler+registration",
+    )
+    ranked_query = builder.check(
+        "ranked_query",
+        "hermes.tools.memory",
+        "query_memory_entries",
+        callable,
+        required=False,
+    )
+    query_scores = builder.check(
+        "query_scores",
+        "hermes.tools.memory",
+        "query_memory_entries",
+        _has_parameters("include_scores"),
+        required=False,
+    )
+    user_filtering = builder.check(
+        "user_filtering",
+        "hermes.tools.memory",
+        "query_memory_entries",
+        _has_parameters("user_id"),
+        required=False,
+    )
+    session_filtering = builder.check(
+        "session_filtering",
+        "hermes.tools.memory",
+        "query_memory_entries",
+        _has_parameters("session_id"),
+        required=False,
+    )
+    query_filters = builder.check(
+        "query_filters",
+        "hermes.tools.memory",
+        "query_memory_entries",
+        _has_parameters("filters"),
+        required=False,
+    )
+    declared_strategies = builder.check(
+        "declared_retrieval_strategies",
+        "hermes.tools.memory",
+        "SUPPORTED_RETRIEVAL_STRATEGIES",
+        lambda value: isinstance(value, (tuple, list, frozenset))
+        and all(
+            isinstance(item, str)
+            and item in {strategy.value for strategy in RetrievalStrategy}
+            for item in value
+        ),
+        required=False,
     )
     builder.check(
         "observation_repository",
@@ -368,18 +582,87 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         "<module>",
         _public_config_surface,
     )
-    builder.result_check(
-        "file_terminal_toolsets",
-        "hermes.tool_declarations",
-        "file+terminal",
-        _resolve_file_and_terminal_toolsets,
+    builder.check(
+        "file_tool_declaration",
+        "hermes.tool_declarations.file",
+        "TOOL_DECLARATIONS",
+        _file_declaration_surface,
+    )
+    builder.check(
+        "terminal_tool_declaration",
+        "hermes.tool_declarations.terminal",
+        "TOOL_DECLARATIONS",
+        _terminal_declaration_surface,
     )
 
-    missing = [item.name for item in builder.checks if not item.available]
+    supported_memory_kinds: list[MemoryKind] = []
+    if memory_read is not None and memory_write is not None:
+        supported_memory_kinds.append(MemoryKind.LONG_TERM)
+    if user_profile_read is not None and user_profile_write is not None:
+        supported_memory_kinds.append(MemoryKind.USER_PROFILE)
+    builder.derived_check(
+        "supported_memory_kinds",
+        available=bool(supported_memory_kinds),
+        public_object="read/write target signatures",
+    )
+
+    supported_strategies: list[RetrievalStrategy] = []
+    if memory_prompt_toggle is not None:
+        supported_strategies.append(RetrievalStrategy.DISABLED)
+    native_supported = all(
+        item is not None
+        for item in (
+            memory_read,
+            memory_prompt_render,
+            memory_prompt_toggle,
+        )
+    )
+    if native_supported:
+        supported_strategies.insert(0, RetrievalStrategy.SUBJECT_NATIVE)
+    if ranked_query is not None and declared_strategies is not None:
+        declared_values = {str(item) for item in declared_strategies}
+        for strategy in (
+            RetrievalStrategy.DENSE,
+            RetrievalStrategy.BM25,
+            RetrievalStrategy.HYBRID,
+        ):
+            if strategy.value in declared_values:
+                supported_strategies.append(strategy)
+    builder.derived_check(
+        "supported_retrieval_strategies",
+        available=bool(supported_strategies),
+        public_object="prompt toggle+ranked query declarations",
+    )
+
+    # Keep these local names intentionally referenced: their presence is recorded
+    # by the individual checks and consumed by case preflight.
+    _ = (
+        query_scores,
+        user_filtering,
+        session_filtering,
+        query_filters,
+        memory_tool_available,
+    )
+    missing = [
+        item.name
+        for item in builder.checks
+        if item.required and not item.available
+    ]
     fingerprint = canonical_sha256(
         {
             "protocol_version": CAPABILITY_PROTOCOL_VERSION,
             "public_api": builder.api_entries,
+            "memory_projection": {
+                "supported_kinds": [
+                    item.value for item in supported_memory_kinds
+                ],
+                "supported_strategies": [
+                    item.value for item in supported_strategies
+                ],
+                "provider": (
+                    "prompt_context_injection" if native_supported else None
+                ),
+            },
         }
     )
     error = (
@@ -395,6 +678,9 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         compatible=not missing,
         capabilities=builder.checks,
         missing_capabilities=missing,
+        supported_memory_kinds=supported_memory_kinds,
+        supported_retrieval_strategies=supported_strategies,
+        memory_provider=("prompt_context_injection" if native_supported else None),
         warnings=builder.warnings,
         public_api_fingerprint=fingerprint,
         error=error,

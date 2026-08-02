@@ -7,7 +7,9 @@ from typing import Protocol, runtime_checkable
 from myhermes_audit.contracts.memory import (
     MemoryFixture,
     MemoryQuery,
+    MemoryQueryPhase,
     MemoryQueryResult,
+    MemorySnapshotPhase,
     MemoryStateSnapshot,
 )
 
@@ -20,11 +22,21 @@ class MemoryEvaluationPort(Protocol):
         """注入声明式 Memory Fixture。"""
         ...
 
-    async def query(self, query: MemoryQuery) -> MemoryQueryResult:
+    async def query(
+        self,
+        query: MemoryQuery,
+        *,
+        query_id: str,
+        phase: MemoryQueryPhase,
+    ) -> MemoryQueryResult:
         """执行 Provider 自身语义下的检索。"""
         ...
 
-    async def snapshot(self) -> MemoryStateSnapshot:
+    async def snapshot(
+        self,
+        *,
+        phase: MemorySnapshotPhase,
+    ) -> MemoryStateSnapshot:
         """获取算法无关状态快照。"""
         ...
 

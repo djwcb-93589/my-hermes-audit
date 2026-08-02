@@ -160,6 +160,68 @@ class WorkerTimeoutError(WorkerProcessError):
         self.code = "worker_timeout"
 
 
+class MemoryEvaluationError(RunnerError):
+    """A safe, stable Memory pipeline failure without Memory content."""
+
+    def __init__(self, message: str, *, code: str, **details: Any) -> None:
+        super().__init__(message, code=code, **details)
+
+
+class MemoryCapabilityError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_capability_error", **details)
+
+
+class MemoryStrategyUnsupportedError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_strategy_unsupported", **details)
+
+
+class MemoryKindUnsupportedError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_kind_unsupported", **details)
+
+
+class MemoryScopeUnsupportedError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_scope_unsupported", **details)
+
+
+class MemorySeedError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_seed_error", **details)
+
+
+class MemorySnapshotError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_snapshot_error", **details)
+
+
+class MemoryQueryError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_query_error", **details)
+
+
+class MemoryClearError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_clear_error", **details)
+
+
+class MemoryMappingError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_mapping_error", **details)
+
+
+class MemoryStateValidationError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_state_validation_error", **details)
+
+
+class MemoryProtocolError(MemoryEvaluationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="memory_protocol_error", **details)
+
+
 class FixtureMaterializationError(RunnerError):
     def __init__(self, message: str, **details: Any) -> None:
         super().__init__(message, code="fixture_materialization_error", **details)

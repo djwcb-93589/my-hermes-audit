@@ -17,6 +17,8 @@
 
 `environment_overrides` 的变量名必须有效，且不能声明 `HERMES_HOME`、`DB_PATH`、`HERMES_WORKSPACE` 或 `MYHERMES_AUDIT_ARTIFACTS_DIR`；这些隔离值由 Sandbox 与未来 runner 最终控制。
 
+P3 为单轮 input 和 scripted user turn 增加可选逻辑 `session_id`；未声明时仍使用 Trial 默认 Session。`execution.memory_strategy` 仅在 Memory Case 显式声明，严格枚举为 `subject_native`、`disabled`、`dense`、`bm25`、`hybrid`。未声明 Memory 的旧 Case 保持 `null`，不会加载 Memory Adapter。
+
 `EvaluatorSpec.required: true` 表示硬门禁；`false` 表示软评分，后者可声明 `weight`。`config` 只属于单个 evaluator，不能向 Case 顶层扩散。
 
 ## Fixture 路径
@@ -33,7 +35,8 @@
 - `texts`：final output、artifact、file 或 tool output 的文本匹配；
 - `json_values`：exact/subset 声明；
 - `tool_trajectories`：顺序、工具名与参数；
-- `memories`：MemoryQuery、所需 ID/kind 与最少命中数；
+- `memories`：稳定 query ID、before/after phase、MemoryQuery、required/forbidden ID、runtime-generated ID、kind、最少命中数和可选 Recall/MRR 阈值；
+- `memory_states`：present/absent、added/forbidden content、removed、unchanged 与额外变化策略；
 - `background_reviews`：action、目标、变更保护、证据来源和 stale rejection；
 - `judges`：未来 Judge 的 rubric、criteria 与分数范围。
 
@@ -49,7 +52,9 @@
 
 ## Memory 合同
 
-`MemoryKind` 支持 short-term、long-term、user-profile、episodic、semantic 与 unknown。`MemoryQuery.top_k` 为正整数。`MemoryQueryResult.items` 必须从 rank 1 开始、按 rank 升序且不重复；score 不限定范围或方向，Provider 必须自行说明语义。
+`MemoryKind` 支持 short-term、long-term、user-profile、episodic、semantic 与 unknown。`MemoryQuery.top_k` 为正整数。`MemoryQueryResult` 明确 query ID、phase、strategy 和 provider；items 必须从 rank 1 开始、按 rank 升序且不重复。`prompt_context_injection` 强制 `query_used=false`、`score_semantics=none` 且 score 为空；disabled 强制 items 为空。
+
+`MemoryStateSnapshot` 为兼容旧 Background Review 声明允许省略 P3 语义字段；一旦进入 P3 `TrialResult` / Worker Artifact，则必须带 before/after phase、strategy、provider 和稳定 item ID。`MemoryStateChange` 严格表达 added/removed/modified/unchanged；`MemoryOperationError` 只接受 P3 稳定错误枚举。`TrialResult` 分开保存 query results、snapshots、state changes、Memory errors 和 retrieval/final-answer/state 三个门禁。
 
 合同不假设向量数据库，也不把 Dense/BM25/Hybrid 当成运行实现。
 
