@@ -21,6 +21,11 @@ MEMORY_SEED_NAME = "myhermes.audit.memory.seed"
 MEMORY_QUERY_NAME = "myhermes.audit.memory.query"
 MEMORY_SNAPSHOT_NAME = "myhermes.audit.memory.snapshot"
 MEMORY_EVALUATOR_NAME = "myhermes.audit.memory.evaluator"
+COMPRESSION_NAME = "myhermes.audit.compression"
+CHECKPOINT_NAME = "myhermes.audit.checkpoint"
+FACT_RETENTION_NAME = "myhermes.audit.fact_retention"
+DISTORTION_NAME = "myhermes.audit.distortion"
+ABLATION_COMPARISON_NAME = "myhermes.audit.ablation.comparison"
 
 
 def publish_replay_observations(
@@ -33,6 +38,7 @@ def publish_replay_observations(
     trial = request.trial
     runtime = trial.runtime
     memory_enabled = _has_memory_facts(request)
+    p4_enabled = trial.variant_id is not None
     metadata = {
         "suite_id": request.suite_id,
         "suite_sha256": request.suite_sha256,
@@ -89,6 +95,28 @@ def publish_replay_observations(
             if memory_enabled
             else {}
         ),
+        **(
+            {
+                "variant_id": trial.variant_id,
+                "memory_mode": trial.memory_mode.value,
+                "compression_mode": trial.compression_mode.value,
+                "configuration_fingerprint": trial.configuration_fingerprint,
+                "comparison_basis_fingerprint": (
+                    trial.comparison_basis_fingerprint
+                ),
+                "required_fact_gate_passed": trial.required_fact_gate_passed,
+                "compression_event_count": len(trial.compression_events),
+                "distortion_count": len(trial.distortion_results),
+                "effective_subject_configuration": (
+                    trial.effective_subject_configuration.model_dump(
+                        mode="json",
+                        exclude={"schema_version"},
+                    )
+                ),
+            }
+            if p4_enabled
+            else {}
+        ),
         "post_hoc_publication": True,
         "runtime_timestamps_not_replayed": True,
         "experiment_runner_replay": True,
@@ -106,7 +134,7 @@ def publish_replay_observations(
         sensitive_values=sensitive_values,
     )
     session_id = f"audit:{request.experiment.audit_run_id}:{trial.trial_id}"
-    version = "p3" if memory_enabled else "p2"
+    version = "p4" if p4_enabled else ("p3" if memory_enabled else "p2")
     with propagate_attributes(
         session_id=session_id[:200],
         metadata={
@@ -128,6 +156,7 @@ def publish_replay_observations(
             _publish_turns(root, request, sensitive_values=sensitive_values)
             _publish_memory(root, request, sensitive_values=sensitive_values)
             _publish_evaluators(root, request, sensitive_values=sensitive_values)
+            _publish_ablation(root, request)
 
 
 def _publish_turns(
@@ -304,7 +333,11 @@ def _publish_evaluators(
             else (
                 MEMORY_EVALUATOR_NAME
                 if metric.source is MetricSource.RETRIEVAL
-                else VALIDATOR_NAME
+                else (
+                    FACT_RETENTION_NAME
+                    if metric.source is MetricSource.COMPRESSION
+                    else VALIDATOR_NAME
+                )
             )
         )
         evaluator = root.start_observation(
@@ -328,10 +361,178 @@ def _publish_evaluators(
                 "post_hoc_publication": True,
             },
             version=(
-                "p3" if metric.source is MetricSource.RETRIEVAL else "p2"
+                "p4"
+                if metric.source is MetricSource.COMPRESSION
+                else (
+                    "p3" if metric.source is MetricSource.RETRIEVAL else "p2"
+                )
             ),
         )
         evaluator.end()
+
+
+def _publish_ablation(root: Any, request: LangfuseTrialRequest) -> None:
+    trial = request.trial
+    if trial.variant_id is None:
+        return
+    compression = root.start_observation(
+        name=COMPRESSION_NAME,
+        as_type="span",
+        input={
+            "variant_id": trial.variant_id,
+            "mode": trial.compression_mode.value,
+            "control": (
+                trial.effective_subject_configuration.compression_control.value
+            ),
+            "threshold": (
+                trial.effective_subject_configuration.compression_threshold
+            ),
+        },
+        output={
+            "event_count": len(trial.compression_events),
+            "events": [
+                item.model_dump(mode="json", exclude={"schema_version"})
+                for item in trial.compression_events
+            ],
+            "context_diagnostics": [
+                item.model_dump(mode="json", exclude={"schema_version"})
+                for item in trial.context_diagnostics
+            ],
+            "token_diagnostics": (
+                None
+                if trial.token_diagnostics is None
+                else trial.token_diagnostics.model_dump(
+                    mode="json",
+                    exclude={"schema_version"},
+                )
+            ),
+            "duration_diagnostics": (
+                None
+                if trial.duration_diagnostics is None
+                else trial.duration_diagnostics.model_dump(
+                    mode="json",
+                    exclude={"schema_version"},
+                )
+            ),
+        },
+        metadata={
+            "compression_observation_available": (
+                trial.effective_subject_configuration.compression_observation_available
+            ),
+            "post_hoc_publication": True,
+            "content_uploaded": False,
+        },
+        version="p4",
+    )
+    compression.end()
+
+    for checkpoint in trial.checkpoint_results:
+        observation = root.start_observation(
+            name=CHECKPOINT_NAME,
+            as_type="evaluator",
+            input={
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "after_turn": checkpoint.after_turn,
+                "required_fact_ids": checkpoint.required_fact_ids,
+            },
+            output={
+                "fact_gate_passed": checkpoint.fact_gate_passed,
+                "answer_gate_passed": checkpoint.answer_gate_passed,
+                "context_diagnostic_available": (
+                    checkpoint.context_diagnostic_available
+                ),
+                "compression_applied": checkpoint.compression_applied,
+            },
+            metadata={"post_hoc_publication": True, "content_uploaded": False},
+            version="p4",
+        )
+        observation.end()
+
+    for fact in trial.fact_retention_results:
+        observation = root.start_observation(
+            name=FACT_RETENTION_NAME,
+            as_type="evaluator",
+            input={
+                "expectation_id": fact.expectation_id,
+                "fact_id": fact.fact_id,
+                "scope": fact.scope.value,
+                "expected_projection": _safe_fact_projection(
+                    fact.expected_projection
+                ),
+            },
+            output={
+                "status": fact.status.value,
+                "actual_projection": _safe_fact_projection(
+                    fact.actual_projection
+                ),
+                "hard_gate": fact.hard_gate,
+                "error_type": fact.error_type,
+            },
+            metadata={
+                "checkpoint_id": fact.checkpoint_id,
+                "evidence_source": fact.evidence_source,
+                "post_hoc_publication": True,
+                "content_uploaded": False,
+            },
+            version="p4",
+        )
+        observation.end()
+
+    for distortion in trial.distortion_results:
+        observation = root.start_observation(
+            name=DISTORTION_NAME,
+            as_type="evaluator",
+            input={
+                "fact_id": distortion.fact_id,
+                "expected_projection": _safe_fact_projection(
+                    distortion.expected_projection
+                ),
+            },
+            output={
+                "distortion_type": distortion.distortion_type.value,
+                "actual_projection": _safe_fact_projection(
+                    distortion.actual_projection
+                ),
+                "hard_gate": distortion.hard_gate,
+            },
+            metadata={
+                "expectation_id": distortion.expectation_id,
+                "evidence_source": distortion.evidence_source,
+                "post_hoc_publication": True,
+                "content_uploaded": False,
+            },
+            version="p4",
+        )
+        observation.end()
+
+    comparison = request.ablation_comparison
+    if (
+        comparison is not None
+        and trial.variant_id == comparison.reference_variant_id
+        and trial.trial_number == 1
+    ):
+        observation = root.start_observation(
+            name=ABLATION_COMPARISON_NAME,
+            as_type="span",
+            input={
+                "case_id": comparison.case_id,
+                "reference_variant_id": comparison.reference_variant_id,
+            },
+            output=comparison.model_dump(mode="json", exclude={"schema_version"}),
+            metadata={"post_hoc_publication": True, "content_uploaded": False},
+            version="p4",
+        )
+        observation.end()
+
+
+def _safe_fact_projection(projection) -> dict | None:
+    if projection is None:
+        return None
+    return {
+        "sha256": projection.sha256,
+        "length": projection.length,
+        "content_omitted": True,
+    }
 
 
 def _publish_memory(
@@ -643,6 +844,11 @@ def _case_input(request: LangfuseTrialRequest) -> dict:
 
 
 __all__ = (
+    "ABLATION_COMPARISON_NAME",
+    "CHECKPOINT_NAME",
+    "COMPRESSION_NAME",
+    "DISTORTION_NAME",
+    "FACT_RETENTION_NAME",
     "JUDGE_NAME",
     "MEMORY_EVALUATOR_NAME",
     "MEMORY_QUERY_NAME",

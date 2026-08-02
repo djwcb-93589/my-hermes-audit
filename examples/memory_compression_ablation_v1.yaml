@@ -1,0 +1,307 @@
+schema_version: "1.0"
+suite_id: memory-compression-ablation-v1
+name: P4 synthetic Memory and Subject-native Compression ablation
+description: Explicit serial Variants for Memory boundaries, Compression retention, and combined behavior.
+tags: [memory, compression, ablation, p4, synthetic]
+defaults:
+  trials: 1
+  timeout_seconds: 120
+  preserve_sandbox: false
+  metadata:
+    data_classification: synthetic
+cases:
+  - case_id: memory-mode-boundary
+    name: Separate short-term Session context from long-term Memory
+    mode: scripted_multi_turn
+    input:
+      turns:
+        - role: user
+          session_id: boundary-a
+          message: The synthetic marker for this Session is COBALT-17. Keep it only in this conversation and reply ACK.
+        - role: user
+          session_id: boundary-a
+          message: What was the synthetic Session marker I gave earlier?
+        - role: user
+          session_id: boundary-b
+          message: State my synthetic constellation preference, then say whether any prior Session marker is visible.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: boundary-long-preference
+            kind: user_profile
+            content: The synthetic constellation preference is LYRA-9.
+            source: audit-fixture
+    expected:
+      required_facts:
+        - expectation_id: boundary-short-retained
+          required: true
+          applicable_variant_ids: [short-disabled, combined-disabled]
+          facts:
+            - fact_id: short-marker-retained
+              canonical_value: COBALT-17
+              accepted_variants: []
+              match: contains
+              scope: subject_context
+              checkpoint_id: same-session-checkpoint
+        - expectation_id: boundary-short-absent
+          required: true
+          applicable_variant_ids: [no-memory-disabled, long-disabled]
+          facts:
+            - fact_id: short-marker-absent
+              canonical_value: COBALT-17
+              accepted_variants: []
+              match: contains
+              scope: subject_context
+              checkpoint_id: same-session-checkpoint
+              must_be_absent: true
+        - expectation_id: boundary-long-retained
+          required: true
+          applicable_variant_ids: [long-disabled, combined-disabled]
+          facts:
+            - fact_id: long-preference-retained
+              canonical_value: LYRA-9
+              accepted_variants: []
+              match: contains
+              scope: final_answer
+        - expectation_id: boundary-long-absent
+          required: true
+          applicable_variant_ids: [no-memory-disabled, short-disabled]
+          facts:
+            - fact_id: long-preference-absent
+              canonical_value: LYRA-9
+              accepted_variants: []
+              match: contains
+              scope: final_answer
+              must_be_absent: true
+        - expectation_id: boundary-no-short-leak
+          required: true
+          facts:
+            - fact_id: short-marker-cross-session-absent
+              canonical_value: COBALT-17
+              accepted_variants: []
+              match: contains
+              scope: final_answer
+              must_be_absent: true
+    ablation:
+      reference_variant_id: no-memory-disabled
+      maximum_turns: 3
+      maximum_compression_events: 0
+      variants:
+        - variant_id: no-memory-disabled
+          memory_mode: no_memory
+          compression_mode: disabled
+          config_overrides: {}
+        - variant_id: short-disabled
+          memory_mode: short_term_only
+          compression_mode: disabled
+          config_overrides: {}
+        - variant_id: long-disabled
+          memory_mode: long_term_only
+          compression_mode: disabled
+          config_overrides: {}
+        - variant_id: combined-disabled
+          memory_mode: short_and_long_term
+          compression_mode: disabled
+          config_overrides: {}
+      checkpoints:
+        - checkpoint_id: same-session-checkpoint
+          after_turn: 2
+          required_fact_ids: [short-marker-retained, short-marker-absent]
+          required: true
+    evaluators:
+      - evaluator_id: boundary-facts
+        kind: compression
+        required: true
+
+  - case_id: compression-fact-retention
+    name: Preserve deterministic facts across Subject-native Compression
+    description: Capability-negative on Subjects without public Compression observation.
+    tags: [capability-negative-compression-observation]
+    metadata:
+      capability_negative: compression_observation
+    mode: scripted_multi_turn
+    input:
+      turns:
+        - role: user
+          session_id: compression-a
+          message: Synthetic quota is 37 units. Reply ACK-1.
+        - role: user
+          session_id: compression-a
+          message: Synthetic event ALPHA occurs before synthetic event BETA. Reply ACK-2.
+        - role: user
+          session_id: compression-a
+          message: Add harmless synthetic filler about red, green, blue, and amber labels. Reply ACK-3.
+        - role: user
+          session_id: compression-a
+          message: Add harmless synthetic filler about north, south, east, and west zones. Reply ACK-4.
+        - role: user
+          session_id: compression-a
+          message: Report the quota and the declared event order using only the earlier facts.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: disabled
+    expected:
+      required_facts:
+        - expectation_id: compression-disabled-baseline
+          required: true
+          distortion_hard_gate: true
+          applicable_variant_ids: [short-compression-disabled]
+          facts:
+            - fact_id: quota-disabled
+              canonical_value: 37 units
+              accepted_variants: [quota is 37]
+              match: contains
+              scope: subject_context
+              checkpoint_id: compression-checkpoint
+              distortion_candidates:
+                - value: 73 units
+                  distortion_type: value_changed
+            - fact_id: order-disabled
+              canonical_value: ALPHA occurs before synthetic event BETA
+              accepted_variants: [ALPHA before BETA]
+              match: contains
+              scope: subject_context
+              checkpoint_id: compression-checkpoint
+              distortion_candidates:
+                - value: BETA before ALPHA
+                  distortion_type: temporal_order_changed
+        - expectation_id: compression-enabled-survival
+          required: true
+          distortion_hard_gate: true
+          applicable_variant_ids: [short-compression-enabled]
+          facts:
+            - fact_id: quota-enabled
+              canonical_value: 37 units
+              accepted_variants: [quota is 37]
+              match: contains
+              scope: subject_context
+              checkpoint_id: compression-checkpoint
+              must_survive_compression: true
+              distortion_candidates:
+                - value: 73 units
+                  distortion_type: value_changed
+            - fact_id: order-enabled
+              canonical_value: ALPHA occurs before synthetic event BETA
+              accepted_variants: [ALPHA before BETA]
+              match: contains
+              scope: subject_context
+              checkpoint_id: compression-checkpoint
+              must_survive_compression: true
+              distortion_candidates:
+                - value: BETA before ALPHA
+                  distortion_type: temporal_order_changed
+    ablation:
+      reference_variant_id: short-compression-disabled
+      maximum_turns: 5
+      maximum_compression_events: 8
+      variants:
+        - variant_id: short-compression-disabled
+          memory_mode: short_term_only
+          compression_mode: disabled
+          config_overrides: {}
+        - variant_id: short-compression-enabled
+          memory_mode: short_term_only
+          compression_mode: enabled
+          config_overrides:
+            compression:
+              threshold: 64
+      checkpoints:
+        - checkpoint_id: compression-checkpoint
+          after_turn: 5
+          required_fact_ids: [quota-disabled, order-disabled, quota-enabled, order-enabled]
+          required: true
+    evaluators:
+      - evaluator_id: compression-retention
+        kind: compression
+        required: true
+
+  - case_id: combined-memory-compression
+    name: Combine long-term facts, Session context, and Compression control
+    mode: scripted_multi_turn
+    input:
+      turns:
+        - role: user
+          session_id: combined-a
+          message: The synthetic Session token is SESSION-PINE-8. Reply ACK-1.
+        - role: user
+          session_id: combined-a
+          message: Read the synthetic archive region from long-term Memory and reply ACK-2.
+        - role: user
+          session_id: combined-a
+          message: The current synthetic channel is TEAL-22, replacing obsolete channel AMBER-11. Reply ACK-3.
+        - role: user
+          session_id: combined-a
+          message: Reply with exactly the current synthetic channel and no other text.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: combined-archive-region
+            kind: long_term
+            content: Synthetic archive region is ARCHIVE-NORTH-4.
+            source: audit-fixture
+    expected:
+      memories:
+        - query_id: combined-archive-before
+          query:
+            query: synthetic archive region
+            top_k: 3
+          required_memory_ids: [combined-archive-region]
+          required_kinds: [long_term]
+          minimum_matches: 1
+      required_facts:
+        - expectation_id: combined-required-facts
+          required: true
+          distortion_hard_gate: true
+          facts:
+            - fact_id: combined-long-fact
+              canonical_value: ARCHIVE-NORTH-4
+              accepted_variants: []
+              match: contains
+              scope: long_term_memory
+            - fact_id: combined-short-fact
+              canonical_value: SESSION-PINE-8
+              accepted_variants: []
+              match: contains
+              scope: subject_context
+              checkpoint_id: combined-checkpoint
+            - fact_id: combined-current-channel
+              canonical_value: TEAL-22
+              accepted_variants: [The current synthetic channel is TEAL-22.]
+              match: normalized_exact
+              scope: final_answer
+              distortion_candidates:
+                - value: AMBER-11
+                  distortion_type: value_changed
+    ablation:
+      reference_variant_id: combined-compression-disabled
+      maximum_turns: 4
+      maximum_compression_events: 8
+      variants:
+        - variant_id: combined-compression-disabled
+          memory_mode: short_and_long_term
+          compression_mode: disabled
+          config_overrides: {}
+        - variant_id: combined-compression-enabled
+          memory_mode: short_and_long_term
+          compression_mode: enabled
+          config_overrides:
+            compression:
+              threshold: 96
+      checkpoints:
+        - checkpoint_id: combined-checkpoint
+          after_turn: 4
+          required_fact_ids: [combined-short-fact]
+          required: true
+    evaluators:
+      - evaluator_id: combined-retrieval
+        kind: retrieval
+        required: true
+      - evaluator_id: combined-facts
+        kind: compression
+        required: true

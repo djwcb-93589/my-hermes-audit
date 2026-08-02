@@ -99,6 +99,21 @@ def read_observations(
                     duration_ms=item.duration_ms,
                     tool_call_count=item.tool_call_count,
                     error_category=None,
+                    compression_applied=getattr(
+                        item,
+                        "compression_applied",
+                        None,
+                    ),
+                    input_message_count=getattr(
+                        item,
+                        "input_message_count",
+                        None,
+                    ),
+                    output_message_count=getattr(
+                        item,
+                        "output_message_count",
+                        None,
+                    ),
                 )
             )
         elif isinstance(item, ToolCallObservationView):

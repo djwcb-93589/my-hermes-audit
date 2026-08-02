@@ -7,6 +7,11 @@ import os
 import uuid
 from pathlib import PurePosixPath
 
+from myhermes_audit.ablation import (
+    applicable_checkpoints,
+    applicable_fact_expectations,
+)
+
 from myhermes_audit.contracts import (
     AuditCase,
     AuditSuite,
@@ -61,79 +66,106 @@ def build_dataset_sync_plan(
     for case in suite.cases:
         classification = _case_classification(case, suite_classification)
         case_hash = canonical_sha256(case)
-        remote_item_id = str(
-            uuid.uuid5(
-                _DATASET_ITEM_NAMESPACE,
-                "|".join(
-                    (
-                        dataset_name,
-                        suite.suite_id,
-                        case.case_id,
-                        case_hash,
-                    )
+        variants = [None] if case.ablation is None else case.ablation.variants
+        for variant in variants:
+            variant_id = None if variant is None else variant.variant_id
+            identity_parts = (
+                (
+                    dataset_name,
+                    suite.suite_id,
+                    case.case_id,
+                    case_hash,
+                )
+                if variant_id is None
+                else (
+                    dataset_name,
+                    suite.suite_id,
+                    case.case_id,
+                    variant_id,
+                    case_hash,
+                )
+            )
+            remote_item_id = str(
+                uuid.uuid5(
+                    _DATASET_ITEM_NAMESPACE,
+                    "|".join(identity_parts),
+                )
+            )
+            identity = LangfuseDatasetItemIdentity(
+                dataset_name=dataset_name,
+                case_id=case.case_id,
+                variant_id=variant_id,
+                case_sha256=case_hash,
+                remote_item_id=remote_item_id,
+            )
+            input_projection = _case_input(case)
+            if variant is not None:
+                input_projection = {
+                    **input_projection,
+                    "ablation_variant": variant.model_dump(
+                        mode="json",
+                        exclude={"schema_version"},
+                    ),
+                }
+            remote_input = project_remote_content(
+                input_projection,
+                classification=classification,
+                no_content=no_content,
+                sensitive_values=sensitive_values,
+            )
+            remote_expected_output = project_remote_content(
+                _case_expectations(case, variant_id=variant_id),
+                classification=classification,
+                no_content=no_content,
+                sensitive_values=sensitive_values,
+            )
+            fixture_summary = _fixture_manifest_summary(
+                case,
+                synthetic=classification is DataClassification.SYNTHETIC,
+            )
+            publication_metadata = {
+                "audit_suite_id": suite.suite_id,
+                "audit_suite_sha256": suite_hash,
+                "audit_case_id": case.case_id,
+                **(
+                    {}
+                    if variant_id is None
+                    else {"audit_variant_id": variant_id}
                 ),
-            )
-        )
-        identity = LangfuseDatasetItemIdentity(
-            dataset_name=dataset_name,
-            case_id=case.case_id,
-            case_sha256=case_hash,
-            remote_item_id=remote_item_id,
-        )
-        remote_input = project_remote_content(
-            _case_input(case),
-            classification=classification,
-            no_content=no_content,
-            sensitive_values=sensitive_values,
-        )
-        remote_expected_output = project_remote_content(
-            _case_expectations(case),
-            classification=classification,
-            no_content=no_content,
-            sensitive_values=sensitive_values,
-        )
-        fixture_summary = _fixture_manifest_summary(
-            case,
-            synthetic=classification is DataClassification.SYNTHETIC,
-        )
-        publication_metadata = {
-            "audit_suite_id": suite.suite_id,
-            "audit_suite_sha256": suite_hash,
-            "audit_case_id": case.case_id,
-            "audit_case_sha256": case_hash,
-            "case_mode": case.mode.value,
-            "data_classification": classification.value,
-            "content_omitted": (
-                no_content or classification is DataClassification.SENSITIVE
-            ),
-            "fixture_content_uploaded": False,
-            **fixture_summary,
-            "memory_fixture_uploaded": False,
-            "skill_content_uploaded": False,
-            "database_fixture_uploaded": False,
-        }
-        projection_sha256 = canonical_sha256(
-            {
-                "input": remote_input,
-                "expected_output": remote_expected_output,
-                "metadata": {
-                    key: value
-                    for key, value in publication_metadata.items()
-                    if key != "audit_suite_sha256"
-                },
+                "audit_case_sha256": case_hash,
+                "case_mode": case.mode.value,
+                "data_classification": classification.value,
+                "content_omitted": (
+                    no_content or classification is DataClassification.SENSITIVE
+                ),
+                "fixture_content_uploaded": False,
+                **fixture_summary,
+                "memory_fixture_uploaded": False,
+                "skill_content_uploaded": False,
+                "database_fixture_uploaded": False,
             }
-        )
-        items.append(
-            LangfuseDatasetItemPlan(
-                identity=identity,
-                input=remote_input,
-                expected_output=remote_expected_output,
-                metadata={
-                    **publication_metadata,
-                    "audit_projection_sha256": projection_sha256,
-                },
+            projection_sha256 = canonical_sha256(
+                {
+                    "input": remote_input,
+                    "expected_output": remote_expected_output,
+                    "metadata": {
+                        key: value
+                        for key, value in publication_metadata.items()
+                        if key != "audit_suite_sha256"
+                    },
+                }
             )
-        )
+            items.append(
+                LangfuseDatasetItemPlan(
+                    identity=identity,
+                    input=remote_input,
+                    expected_output=remote_expected_output,
+                    metadata={
+                        **publication_metadata,
+                        "audit_projection_sha256": projection_sha256,
+                    },
+                )
+            )
     return LangfuseDatasetSyncPlan(
         dataset=dataset,
         items=items,
@@ -216,7 +248,11 @@ def _case_input(case: AuditCase) -> dict:
     }
 
 
-def _case_expectations(case: AuditCase) -> dict:
+def _case_expectations(
+    case: AuditCase,
+    *,
+    variant_id: str | None,
+) -> dict:
     expected = case.expected
     return {
         "files": [_without_schema(item) for item in expected.files],
@@ -248,6 +284,20 @@ def _case_expectations(case: AuditCase) -> dict:
                 "memory_states": [
                     _without_schema(item) for item in expected.memory_states
                 ]
+            }
+        ),
+        **(
+            {}
+            if variant_id is None
+            else {
+                "required_facts": [
+                    _without_schema(item)
+                    for item in applicable_fact_expectations(case, variant_id)
+                ],
+                "checkpoints": [
+                    _without_schema(item)
+                    for item in applicable_checkpoints(case, variant_id)
+                ],
             }
         ),
         "judges": [_without_schema(item) for item in expected.judges],

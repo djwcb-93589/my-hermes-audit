@@ -1,5 +1,9 @@
 # P2 Score 模型
 
+## P4 保持三个一级 Score
+
+P4 不新增 `compression_score`、`memory_quality_index`、distortion Score 或 overall score。required fact retention/absence、required checkpoint 和显式 required distortion gate只通过本地 `TrialResult.task_passed` 影响既有 `task_success`。required-fact-loss rate、distortion count、Compression event count、token、retrieval/compression/trial duration 都是诊断或 comparison delta，不发布为第四个 Langfuse Score。
+
 P2 只有三个一级质量指标，不计算跨维度加权总分。
 
 | Score | 本地来源 | 创建条件 | 值 |

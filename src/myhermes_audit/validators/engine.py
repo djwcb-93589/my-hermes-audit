@@ -6,7 +6,15 @@ from collections.abc import Iterable
 
 from pydantic import Field, StrictBool, model_validator
 
-from myhermes_audit.contracts import AuditCase, JudgeExpectation, MetricResult
+from myhermes_audit.contracts import (
+    AuditCase,
+    CheckpointResult,
+    DistortionResult,
+    FactRetentionResult,
+    JudgeExpectation,
+    MetricResult,
+    RequiredFactLossResult,
+)
 from myhermes_audit.contracts.common import ContractModel, Identifier, NonEmptyText
 from myhermes_audit.contracts.suite import (
     EvaluatorKind,
@@ -18,6 +26,7 @@ from myhermes_audit.validators.base import (
     ValidationContext,
     validator_error_metric,
 )
+from myhermes_audit.validators.ablation import evaluate_ablation
 from myhermes_audit.validators.file import FileValidator
 from myhermes_audit.validators.json_file import JsonFileValidator
 from myhermes_audit.validators.memory import (
@@ -54,6 +63,10 @@ class ValidatorResultsArtifact(ContractModel):
     case_id: Identifier
     evaluator_results: list[EvaluatorValidationResult] = Field(default_factory=list)
     metrics: list[MetricResult] = Field(default_factory=list)
+    checkpoint_results: list[CheckpointResult] = Field(default_factory=list)
+    fact_retention_results: list[FactRetentionResult] = Field(default_factory=list)
+    required_fact_loss: RequiredFactLossResult | None = None
+    distortion_results: list[DistortionResult] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_results(self) -> "ValidatorResultsArtifact":
@@ -70,6 +83,34 @@ class ValidatorResultsArtifact(ContractModel):
         }
         if declared != set(metric_names):
             raise ValueError("evaluator metric_names must cover the metrics exactly")
+        checkpoint_ids = [item.checkpoint_id for item in self.checkpoint_results]
+        if len(checkpoint_ids) != len(set(checkpoint_ids)):
+            raise ValueError("checkpoint results must have unique checkpoint IDs")
+        fact_ids = [item.fact_id for item in self.fact_retention_results]
+        if len(fact_ids) != len(set(fact_ids)):
+            raise ValueError("fact retention results must have unique fact IDs")
+        distortion_keys = [
+            (item.fact_id, item.distortion_type)
+            for item in self.distortion_results
+        ]
+        if len(distortion_keys) != len(set(distortion_keys)):
+            raise ValueError("distortion results must be unique per fact and type")
+        has_compression = any(
+            item.evaluator_kind is EvaluatorKind.COMPRESSION
+            for item in self.evaluator_results
+        )
+        has_structured_p4 = any(
+            (
+                self.checkpoint_results,
+                self.fact_retention_results,
+                self.required_fact_loss is not None,
+                self.distortion_results,
+            )
+        )
+        if has_structured_p4 != has_compression:
+            raise ValueError(
+                "structured P4 results require exactly one compression evaluator"
+            )
         return self
 
     @property
@@ -98,6 +139,17 @@ class ValidatorResultsArtifact(ContractModel):
         return self.required_gate_status(
             evaluator_kind=EvaluatorKind.RETRIEVAL,
             metric_types=_MEMORY_STATE_GATE_METRIC_TYPES,
+        )
+
+    @property
+    def required_fact_hard_gates_passed(self) -> bool | None:
+        """Aggregate required P4 fact and checkpoint gates independently."""
+
+        return self.required_gate_status(
+            evaluator_kind=EvaluatorKind.COMPRESSION,
+            metric_types=frozenset(
+                {"required_fact_retention", "checkpoint", "distortion"}
+            ),
         )
 
     @property
@@ -157,6 +209,7 @@ def preflight_evaluators(case: AuditCase) -> None:
     covered_groups: set[str] = set()
     tool_trajectory_covered = False
     retrieval_covered = False
+    compression_covered = False
     covered_judges: set[int] = set()
     for evaluator in case.evaluators:
         if evaluator.kind is EvaluatorKind.DETERMINISTIC:
@@ -224,6 +277,37 @@ def preflight_evaluators(case: AuditCase) -> None:
                 )
             retrieval_covered = True
             continue
+        if evaluator.kind is EvaluatorKind.COMPRESSION:
+            if evaluator.config:
+                raise UnsupportedCaseError(
+                    "compression evaluator config must be empty; use strict P4 contracts",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            if compression_covered:
+                raise UnsupportedCaseError(
+                    "P4 expectations cannot be evaluated more than once",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            if case.ablation is None:
+                raise UnsupportedCaseError(
+                    "compression evaluator requires an ablation plan",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            has_p4_hard_gate = any(
+                item.required or item.distortion_hard_gate
+                for item in case.expected.required_facts
+            ) or any(item.required for item in case.ablation.checkpoints)
+            if evaluator.required is not has_p4_hard_gate:
+                raise UnsupportedCaseError(
+                    "compression evaluator required must match declared P4 hard gates",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            compression_covered = True
+            continue
         raise UnsupportedCaseError(
             "evaluator kind is outside the P1 boundary",
             case_id=case.case_id,
@@ -247,6 +331,8 @@ def preflight_evaluators(case: AuditCase) -> None:
         orphan_groups.append("judges")
     if (case.expected.memories or case.expected.memory_states) and not retrieval_covered:
         orphan_groups.append("memories")
+    if case.ablation is not None and not compression_covered:
+        orphan_groups.append("ablation")
     if orphan_groups:
         raise UnsupportedCaseError(
             "P1 expectations must be attached to an evaluator",
@@ -265,10 +351,29 @@ def evaluate_case(
 
     evaluator_results: list[EvaluatorValidationResult] = []
     metrics: list[MetricResult] = []
+    checkpoint_results: list[CheckpointResult] = []
+    fact_retention_results: list[FactRetentionResult] = []
+    required_fact_loss: RequiredFactLossResult | None = None
+    distortion_results: list[DistortionResult] = []
     for evaluator in case.evaluators:
         if evaluator.kind is EvaluatorKind.LLM_JUDGE:
             continue
-        current = _evaluate_one(case, evaluator, context)
+        if evaluator.kind is EvaluatorKind.COMPRESSION:
+            ablation = evaluate_ablation(
+                case.expected.required_facts,
+                context,
+                evaluator_id=evaluator.evaluator_id,
+            )
+            current = [
+                _attach_evaluator_metadata(item, evaluator)
+                for item in ablation.metrics
+            ]
+            checkpoint_results.extend(ablation.checkpoint_results)
+            fact_retention_results.extend(ablation.fact_retention_results)
+            required_fact_loss = ablation.required_fact_loss
+            distortion_results.extend(ablation.distortion_results)
+        else:
+            current = _evaluate_one(case, evaluator, context)
         metrics.extend(current)
         evaluator_results.append(
             EvaluatorValidationResult(
@@ -288,6 +393,10 @@ def evaluate_case(
         case_id=case.case_id,
         evaluator_results=evaluator_results,
         metrics=metrics,
+        checkpoint_results=checkpoint_results,
+        fact_retention_results=fact_retention_results,
+        required_fact_loss=required_fact_loss,
+        distortion_results=distortion_results,
     )
 
 

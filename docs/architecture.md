@@ -1,5 +1,11 @@
 # 架构与依赖方向
 
+## P4 消融数据流
+
+P4 保持既有依赖方向：Suite 合同声明 `AblationPlan`，Orchestrator 在所有 capability/config/evaluator preflight 完成后按声明顺序展开 Variant，`AuditSandbox` 提供 Variant 级物理隔离，MyHermes Worker 只调用 Subject 公开 Session、Memory、Prompt、Compression 配置和 Observation 表面。Worker v3 写出 `ablation.json`；纯本地 Validator 计算 fact retention/loss/distortion/checkpoint；Orchestrator 再从完整 `TrialResult` 生成 Case-level comparison。Langfuse 最后只回放这些本地事实。
+
+`ablation.py` 只负责有效配置投影、stable identity、诊断和结果比较，不包含压缩算法。`fact_matching.py` 只做 exact/normalized/contains 确定性匹配，不导入 MyHermes、Embedding 或模型。P3 `MyHermesMemoryAdapter` 原样复用，长期 Memory 没有第二套 Adapter。完整边界见 [P4 文档](p4-memory-compression-ablation.md)。
+
 ## 核心规则
 
 `myhermes_audit` 是被测运行时之外的独立包。其核心层可以描述输入、环境与结果，但不能导入 `hermes.*`、触发模型或解释 MyHermes 内部数据库 schema；只有隔离适配层能够启动真实运行。

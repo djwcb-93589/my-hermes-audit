@@ -149,11 +149,16 @@ def publish_audit_result(
             ),
         )
         case_by_id = {case.case_id: case for case in cases}
+        comparison_by_case = {
+            item.case_id: item for item in result.ablation_comparisons
+        }
         for trial in result.trials:
             case = case_by_id[trial.case_id]
             request = LangfuseTrialRequest(
                 experiment=experiment_identity,
-                dataset_item=dataset_items[case.case_id],
+                dataset_item=dataset_items[
+                    (case.case_id, trial.variant_id)
+                ],
                 suite_id=suite.suite_id,
                 suite_sha256=result.audit_fingerprint.suite_sha256,
                 subject_commit=result.subject_fingerprint.git_commit,
@@ -164,6 +169,7 @@ def publish_audit_result(
                 trial=trial,
                 data_classification=_case_classification(suite, case),
                 no_content=no_content,
+                ablation_comparison=comparison_by_case.get(trial.case_id),
             )
             try:
                 receipt = adapter.publish_trial(request)
@@ -293,11 +299,26 @@ def _validate_local_publication_input(
         raise PublicationStateError(
             "local Audit result Case order differs from the publication request"
         )
-    trial_case_ids = [trial.case_id for trial in result.trials]
-    if suite.defaults.trials != 1 or trial_case_ids != selected_ids:
+    expected_trial_keys = [
+        (
+            case.case_id,
+            None if variant is None else variant.variant_id,
+            trial_number,
+        )
+        for case in selected
+        for variant in (
+            [None] if case.ablation is None else case.ablation.variants
+        )
+        for trial_number in range(1, suite.defaults.trials + 1)
+    ]
+    trial_keys = [
+        (trial.case_id, trial.variant_id, trial.trial_number)
+        for trial in result.trials
+    ]
+    if suite.defaults.trials != 1 or trial_keys != expected_trial_keys:
         raise PublicationStateError(
-            "Dataset-backed Experiment publication requires one completed local "
-            "Trial identity per selected Case"
+            "Dataset-backed publication Trial expansion differs from the local "
+            "Case/Variant contract or uses more than one Trial per Variant"
         )
     if result.langfuse_publish_result is not None or result.integration_errors:
         raise PublicationStateError(
@@ -310,7 +331,7 @@ def _preflight_dataset(
     cases: Sequence[AuditCase],
     result: AuditRunResult,
     dataset: LangfuseDatasetSyncResult,
-) -> dict[str, LangfuseDatasetItemIdentity]:
+) -> dict[tuple[str, str | None], LangfuseDatasetItemIdentity]:
     if dataset.dry_run:
         raise PublicationStateError(
             "a dry-run Dataset plan cannot publish an Audit result"
@@ -322,23 +343,32 @@ def _preflight_dataset(
         raise PublicationStateError(
             "synchronized Langfuse Dataset does not match the local Audit result"
         )
-    items = {item.case_id: item for item in dataset.items}
+    items = {
+        (item.case_id, item.variant_id): item for item in dataset.items
+    }
     if len(items) != len(dataset.items):
         raise PublicationStateError(
             "synchronized Langfuse Dataset contains duplicate Case identities"
         )
     for case in cases:
-        item = items.get(case.case_id)
-        if (
-            item is None
-            or item.dataset_name != dataset.dataset.dataset_name
-            or item.case_sha256 != canonical_sha256(case)
-            or not item.remote_item_id
-        ):
-            raise PublicationStateError(
-                "Langfuse Dataset Item is missing or stale during post-processing",
-                case_id=case.case_id,
-            )
+        variant_ids = (
+            [None]
+            if case.ablation is None
+            else [item.variant_id for item in case.ablation.variants]
+        )
+        for variant_id in variant_ids:
+            item = items.get((case.case_id, variant_id))
+            if (
+                item is None
+                or item.dataset_name != dataset.dataset.dataset_name
+                or item.case_sha256 != canonical_sha256(case)
+                or not item.remote_item_id
+            ):
+                raise PublicationStateError(
+                    "Langfuse Dataset Item is missing or stale during post-processing",
+                    case_id=case.case_id,
+                    variant_id=variant_id,
+                )
     return items
 
 

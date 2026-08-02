@@ -40,6 +40,9 @@ def render_console_summary(result: AuditRunResult) -> str:
     memory_lines = _memory_summary(result)
     if memory_lines:
         lines.extend(memory_lines)
+    ablation_lines = _ablation_summary(result)
+    if ablation_lines:
+        lines.extend(ablation_lines)
     if result.integration_errors:
         lines.append(f"Langfuse errors:   {len(result.integration_errors)}")
     publication = result.langfuse_publish_result
@@ -78,7 +81,11 @@ def render_console_summary(result: AuditRunResult) -> str:
     if failures:
         lines.extend(("", "Failures:"))
         for trial in failures:
-            lines.append(f"- {trial.case_id} trial {trial.trial_number}: {_failure(trial)}")
+            variant = "" if trial.variant_id is None else f"/{trial.variant_id}"
+            lines.append(
+                f"- {trial.case_id}{variant} trial {trial.trial_number}: "
+                f"{_failure(trial)}"
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -190,6 +197,43 @@ def _memory_summary(result: AuditRunResult) -> list[str]:
 
 def _mean_or_missing(values: list[float]) -> str:
     return "not evaluated" if not values else f"{sum(values) / len(values):.3f}"
+
+
+def _ablation_summary(result: AuditRunResult) -> list[str]:
+    if not result.ablation_comparisons:
+        return []
+    lines = [f"Ablation cases:     {len(result.ablation_comparisons)}"]
+    for comparison in result.ablation_comparisons:
+        lines.append(
+            f"Ablation {comparison.case_id}: reference="
+            f"{comparison.reference_variant_id}, "
+            f"comparability={comparison.comparability.value}"
+        )
+        for variant in comparison.variant_results:
+            fact_loss = (
+                "not evaluated"
+                if variant.required_fact_loss_rate is None
+                else f"{variant.required_fact_loss_rate * 100:.1f}%"
+            )
+            tokens = (
+                "not evaluated"
+                if variant.total_tokens is None
+                else str(variant.total_tokens)
+            )
+            lines.append(
+                f"- {variant.variant_id}: memory={variant.memory_mode.value}, "
+                f"compression={variant.compression_mode.value}, task="
+                f"{variant.task_success_rate * 100:.1f}%, "
+                f"fact_loss={fact_loss}, distortions="
+                f"{variant.distortion_count}, tokens={tokens}, "
+                f"duration={variant.duration_ms}ms"
+            )
+        if comparison.comparability_reasons:
+            lines.append(
+                "  not comparable: "
+                + ", ".join(comparison.comparability_reasons)
+            )
+    return lines
 
 
 __all__ = ("render_console_summary",)

@@ -27,6 +27,22 @@ from myhermes_audit.contracts.common import (
     Sha256Digest,
     UtcDatetime,
 )
+from myhermes_audit.contracts.ablation import (
+    AblationComparisonResult,
+    CheckpointResult,
+    CompressionEvent,
+    CompressionMode,
+    ContextDiagnostic,
+    DistortionResult,
+    DurationDiagnostics,
+    EffectiveSubjectConfiguration,
+    FactContextObservation,
+    FactRetentionResult,
+    MemoryMode,
+    RequiredFactLossResult,
+    TokenDiagnostics,
+    TrialIdentity,
+)
 from myhermes_audit.contracts.fingerprint import AuditFingerprint, SubjectFingerprint
 from myhermes_audit.contracts.judge import JudgeResult, JudgeRunSummary
 from myhermes_audit.contracts.langfuse import (
@@ -42,6 +58,7 @@ from myhermes_audit.contracts.memory import (
     MemoryStateChange,
     MemoryStateSnapshot,
 )
+from myhermes_audit.serialization import canonical_sha256
 
 
 class TrialStatus(str, Enum):
@@ -255,6 +272,13 @@ class TrialResult(ContractModel):
     run_id: Identifier
     case_id: Identifier
     trial_number: NonNegativeInt
+    trial_identity: TrialIdentity | None = None
+    variant_id: Identifier | None = None
+    memory_mode: MemoryMode | None = None
+    compression_mode: CompressionMode | None = None
+    configuration_fingerprint: Sha256Digest | None = None
+    comparison_basis_fingerprint: Sha256Digest | None = None
+    effective_subject_configuration: EffectiveSubjectConfiguration | None = None
     status: TrialStatus
     task_passed: StrictBool | None = None
     passed: StrictBool | None = None
@@ -269,9 +293,21 @@ class TrialResult(ContractModel):
     memory_snapshots: list[MemoryStateSnapshot] = Field(default_factory=list)
     memory_state_changes: list[MemoryStateChange] = Field(default_factory=list)
     memory_errors: list[MemoryOperationError] = Field(default_factory=list)
+    compression_events: list[CompressionEvent] = Field(default_factory=list)
+    context_diagnostics: list[ContextDiagnostic] = Field(default_factory=list)
+    fact_context_observations: list[FactContextObservation] = Field(
+        default_factory=list
+    )
+    checkpoint_results: list[CheckpointResult] = Field(default_factory=list)
+    fact_retention_results: list[FactRetentionResult] = Field(default_factory=list)
+    required_fact_loss: RequiredFactLossResult | None = None
+    distortion_results: list[DistortionResult] = Field(default_factory=list)
+    token_diagnostics: TokenDiagnostics | None = None
+    duration_diagnostics: DurationDiagnostics | None = None
     retrieval_gate_passed: StrictBool | None = None
     final_answer_gate_passed: StrictBool | None = None
     memory_state_gate_passed: StrictBool | None = None
+    required_fact_gate_passed: StrictBool | None = None
     metrics: list[MetricResult] = Field(default_factory=list)
     judge_result: JudgeResult | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
@@ -282,6 +318,61 @@ class TrialResult(ContractModel):
     def validate_trial_result(self) -> "TrialResult":
         if self.trial_number < 1:
             raise ValueError("trial_number must start at 1")
+        p4_identity_fields = (
+            self.trial_identity,
+            self.variant_id,
+            self.memory_mode,
+            self.compression_mode,
+            self.configuration_fingerprint,
+            self.comparison_basis_fingerprint,
+            self.effective_subject_configuration,
+        )
+        p4_result_present = any(
+            (
+                self.compression_events,
+                self.context_diagnostics,
+                self.fact_context_observations,
+                self.checkpoint_results,
+                self.fact_retention_results,
+                self.required_fact_loss is not None,
+                self.distortion_results,
+                self.token_diagnostics is not None,
+                self.duration_diagnostics is not None,
+                self.required_fact_gate_passed is not None,
+            )
+        )
+        if all(item is None for item in p4_identity_fields):
+            if p4_result_present:
+                raise ValueError("P4 Trial facts require a complete Variant identity")
+        elif any(item is None for item in p4_identity_fields):
+            raise ValueError("P4 Trial identity fields must be all present")
+        else:
+            assert self.trial_identity is not None
+            assert self.variant_id is not None
+            assert self.memory_mode is not None
+            assert self.compression_mode is not None
+            assert self.configuration_fingerprint is not None
+            assert self.effective_subject_configuration is not None
+            if (
+                self.trial_identity.case_id != self.case_id
+                or self.trial_identity.variant_id != self.variant_id
+                or self.trial_identity.trial_ordinal != self.trial_number
+                or self.trial_identity.configuration_sha256
+                != self.configuration_fingerprint
+            ):
+                raise ValueError("Trial identity must match its P4 Trial fields")
+            if (
+                self.effective_subject_configuration.memory_mode
+                is not self.memory_mode
+                or self.effective_subject_configuration.compression_mode
+                is not self.compression_mode
+            ):
+                raise ValueError("effective Subject configuration must match Variant")
+            if (
+                len(self.compression_events)
+                > self.effective_subject_configuration.maximum_compression_events
+            ):
+                raise ValueError("compression event count exceeds the declared limit")
         if (
             self.started_at is not None
             and self.finished_at is not None
@@ -315,6 +406,8 @@ class TrialResult(ContractModel):
             raise ValueError("failed Memory state gate cannot have task_passed=true")
         if self.final_answer_gate_passed is False and self.task_passed is True:
             raise ValueError("failed final-answer gate cannot have task_passed=true")
+        if self.required_fact_gate_passed is False and self.task_passed is True:
+            raise ValueError("failed required-fact gate cannot have task_passed=true")
         if self.task_passed is False and self.passed is True:
             raise ValueError("failed task cannot have passed=true")
         if self.status is TrialStatus.TIMEOUT:
@@ -393,6 +486,36 @@ class TrialResult(ContractModel):
         ]
         if len(changed_memory_ids) != len(set(changed_memory_ids)):
             raise ValueError("memory_state_changes must have unique memory_id values")
+        compression_event_ids = [item.event_id for item in self.compression_events]
+        if len(compression_event_ids) != len(set(compression_event_ids)):
+            raise ValueError("compression_events must have unique event_id values")
+        context_keys = [
+            (item.session_id, item.turn_index) for item in self.context_diagnostics
+        ]
+        if len(context_keys) != len(set(context_keys)):
+            raise ValueError("context diagnostics must have unique session/turn values")
+        fact_observation_keys = [
+            (item.fact_id, item.checkpoint_id)
+            for item in self.fact_context_observations
+        ]
+        if len(fact_observation_keys) != len(set(fact_observation_keys)):
+            raise ValueError("fact context observations must be unique")
+        checkpoint_ids = [item.checkpoint_id for item in self.checkpoint_results]
+        if len(checkpoint_ids) != len(set(checkpoint_ids)):
+            raise ValueError("checkpoint_results must have unique checkpoint_id values")
+        retention_ids = [item.fact_id for item in self.fact_retention_results]
+        if len(retention_ids) != len(set(retention_ids)):
+            raise ValueError("fact_retention_results must have unique fact_id values")
+        distortion_keys = [
+            (item.fact_id, item.distortion_type) for item in self.distortion_results
+        ]
+        if len(distortion_keys) != len(set(distortion_keys)):
+            raise ValueError("distortion_results must be unique by fact and type")
+        if self.duration_diagnostics is not None and (
+            self.duration_ms is not None
+            and self.duration_diagnostics.trial_duration_ms != self.duration_ms
+        ):
+            raise ValueError("duration diagnostics must match Trial duration")
         return self
 
 
@@ -496,6 +619,9 @@ class AuditRunResult(ContractModel):
     cases: list[CaseAggregate] = Field(default_factory=list)
     summary: AuditSummary
     judge_summary: JudgeRunSummary = Field(default_factory=JudgeRunSummary)
+    ablation_comparisons: list[AblationComparisonResult] = Field(
+        default_factory=list
+    )
     local_execution_status: LocalExecutionStatus | None = None
     remote_publication_status: LangfusePublishStatus | None = None
     experiment_identity: LangfuseExperimentIdentity | None = None
@@ -515,6 +641,79 @@ class AuditRunResult(ContractModel):
         run_ids = [trial.run_id for trial in self.trials]
         if len(run_ids) != len(set(run_ids)):
             raise ValueError("Trial run_id must be unique within an AuditRunResult")
+        comparison_case_ids = [
+            item.case_id for item in self.ablation_comparisons
+        ]
+        if len(comparison_case_ids) != len(set(comparison_case_ids)):
+            raise ValueError("ablation comparisons must have unique case_id values")
+        if any(case_id not in set(case_ids) for case_id in comparison_case_ids):
+            raise ValueError("ablation comparisons require a matching case aggregate")
+        p4_case_ids = {
+            trial.case_id for trial in self.trials if trial.variant_id is not None
+        }
+        subject_identity_sha256 = canonical_sha256(
+            {
+                "git_commit": self.subject_fingerprint.git_commit,
+                "tree_hash": self.subject_fingerprint.tree_hash,
+                "dirty": self.subject_fingerprint.dirty,
+                "python_requirement": self.subject_fingerprint.python_requirement,
+            }
+        )
+        for trial in self.trials:
+            if trial.trial_identity is None:
+                continue
+            if (
+                trial.trial_identity.suite_sha256
+                != self.audit_fingerprint.suite_sha256
+                or trial.trial_identity.subject_commit
+                != self.subject_fingerprint.git_commit
+                or trial.trial_identity.subject_fingerprint_sha256
+                != subject_identity_sha256
+            ):
+                raise ValueError(
+                    "P4 Trial identity must match Audit Suite and Subject fingerprints"
+                )
+        if set(comparison_case_ids) != p4_case_ids:
+            raise ValueError(
+                "ablation comparisons must cover every and only P4 Case"
+            )
+        comparison_by_case = {
+            item.case_id: item for item in self.ablation_comparisons
+        }
+        for case_id in p4_case_ids:
+            comparison = comparison_by_case[case_id]
+            case_trials = [
+                trial for trial in self.trials if trial.case_id == case_id
+            ]
+            result_by_variant = {
+                item.variant_id: item for item in comparison.variant_results
+            }
+            trial_variant_ids = {
+                trial.variant_id for trial in case_trials
+            }
+            if set(result_by_variant) != trial_variant_ids:
+                raise ValueError(
+                    "ablation comparison Variants must match local Trials"
+                )
+            for variant_id, variant_result in result_by_variant.items():
+                variant_trials = [
+                    trial
+                    for trial in case_trials
+                    if trial.variant_id == variant_id
+                ]
+                if variant_result.trial_ids != [
+                    trial.trial_id for trial in variant_trials
+                ]:
+                    raise ValueError(
+                        "ablation comparison Trial IDs must replay local order"
+                    )
+                if {
+                    trial.configuration_fingerprint
+                    for trial in variant_trials
+                } != {variant_result.configuration_sha256}:
+                    raise ValueError(
+                        "ablation comparison configuration must match Trials"
+                    )
         if self.summary.case_count != len(self.cases):
             raise ValueError("summary.case_count must match case aggregates")
         if self.summary.trial_count != len(self.trials):

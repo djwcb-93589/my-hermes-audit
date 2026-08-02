@@ -8,11 +8,16 @@ from pathlib import Path
 from typing import Protocol, Sequence
 
 from myhermes_audit.contracts import (
+    AblationVariant,
     AuditCase,
     MemoryOperationError,
     MemoryQueryResult,
     MemoryStateChange,
     MemoryStateSnapshot,
+    CompressionEvent,
+    ContextDiagnostic,
+    EffectiveSubjectConfiguration,
+    FactContextObservation,
     TrialObservationSummary,
     TrialRuntimeSummary,
     TrialWarning,
@@ -49,6 +54,11 @@ class TrialRunnerOutcome:
     memory_snapshots: tuple[MemoryStateSnapshot, ...] = ()
     memory_state_changes: tuple[MemoryStateChange, ...] = ()
     memory_errors: tuple[MemoryOperationError, ...] = ()
+    variant_id: str | None = None
+    effective_subject_configuration: EffectiveSubjectConfiguration | None = None
+    compression_events: tuple[CompressionEvent, ...] = ()
+    context_diagnostics: tuple[ContextDiagnostic, ...] = ()
+    fact_context_observations: tuple[FactContextObservation, ...] = ()
 
 
 class TrialRunnerPort(Protocol):
@@ -62,6 +72,7 @@ class TrialRunnerPort(Protocol):
         *,
         trial_id: str,
         timeout_seconds: int,
+        variant: AblationVariant | None = None,
     ) -> TrialRunnerOutcome:
         """Execute one Trial in its already-created Sandbox."""
 

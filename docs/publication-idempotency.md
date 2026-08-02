@@ -29,6 +29,10 @@
 
 Trial 记录包含本地 Trial/Case/Dataset Item/Trace 身份、尝试次数、远端 Trace/Observation/Dataset Run 身份和错误。Score 记录包含完整 `ScorePublicationIdentity`、尝试次数、remote ID、最后尝试时间、确认时间和错误。每次状态转换都通过同目录临时文件和原子替换写入，文件不包含凭据或完整内容。
 
+## P4 Variant identity
+
+P4 消融 Case 的 Dataset Item 稳定身份包含 dataset、suite、case、`variant_id` 与 case hash，因此同一 Case 的各 Variant 不会互相覆盖；非 P4 Case 保持原单 Item 身份。远端 Experiment 发布要求每个 Case/Variant 恰好一个 Trial，本地仍可执行多个 ordinal。Trial 发布继续以稳定 `trial_id` 为清单键，消融比较结果同时进入内容指纹，重试不得更换 Variant、Trial 身份或比较内容。
+
 ## 状态与重试
 
 单项状态为 pending、publishing、confirmed、uncertain 或 failed：

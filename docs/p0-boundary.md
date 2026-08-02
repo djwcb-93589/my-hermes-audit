@@ -23,7 +23,7 @@
 - MyHermes SQLite schema 初始化；
 - Ragas、Inspect AI、DSPy、LangChain 或 LangGraph。
 
-P0 中的 `llm_judge`、`retrieval`、`compression` 与 `background_review` evaluator kind 是未来配置入口。静态校验成功仅表示声明符合合同，不表示相关运行能力存在。
+在 P0 阶段，`llm_judge`、`retrieval`、`compression` 与 `background_review` evaluator kind 仅是后续配置入口。它们后来分别在独立阶段实现或继续保持边界；P4 Compression 的当前生产能力见 [P4 文档](p4-memory-compression-ablation.md)。
 
 ## 被测项目边界
 

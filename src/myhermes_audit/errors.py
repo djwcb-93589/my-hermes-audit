@@ -222,6 +222,78 @@ class MemoryProtocolError(MemoryEvaluationError):
         super().__init__(message, code="memory_protocol_error", **details)
 
 
+class AblationError(RunnerError):
+    """Safe P4 ablation failure without conversation or fact content."""
+
+    def __init__(self, message: str, *, code: str, **details: Any) -> None:
+        super().__init__(message, code=code, **details)
+
+
+class AblationContractError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="ablation_contract_error", **details)
+
+
+class AblationVariantError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="ablation_variant_error", **details)
+
+
+class AblationCapabilityError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="ablation_capability_error", **details)
+
+
+class ShortTermContextError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="short_term_context_error", **details)
+
+
+class CompressionCapabilityError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="compression_capability_error", **details)
+
+
+class CompressionConfigurationError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="compression_configuration_error", **details)
+
+
+class CompressionObservationError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="compression_observation_error", **details)
+
+
+class CompressionLimitError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="compression_limit_error", **details)
+
+
+class RequiredFactValidationError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="required_fact_validation_error", **details)
+
+
+class FactRetentionError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="fact_retention_error", **details)
+
+
+class DistortionValidationError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="distortion_validation_error", **details)
+
+
+class AblationComparisonError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="ablation_comparison_error", **details)
+
+
+class TokenDiagnosticsError(AblationError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="token_diagnostics_error", **details)
+
+
 class FixtureMaterializationError(RunnerError):
     def __init__(self, message: str, **details: Any) -> None:
         super().__init__(message, code="fixture_materialization_error", **details)

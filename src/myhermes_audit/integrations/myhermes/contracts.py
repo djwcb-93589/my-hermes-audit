@@ -9,6 +9,11 @@ from typing import Literal
 from pydantic import Field, StrictBool, StrictStr, model_validator
 
 from myhermes_audit.contracts import (
+    CompressionEvent,
+    ContextDiagnostic,
+    EffectiveSubjectConfiguration,
+    FactContextObservation,
+    LongConversationCheckpoint,
     MemoryFixture,
     MemoryOperationError,
     MemoryQuery,
@@ -18,6 +23,7 @@ from myhermes_audit.contracts import (
     MemoryStateChange,
     MemoryStateSnapshot,
     RetrievalStrategy,
+    RequiredFactExpectation,
     ToolsetName,
     TurnResult,
 )
@@ -31,8 +37,12 @@ from myhermes_audit.contracts.common import (
 )
 
 
-WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v2"
-WorkerProtocolVersion = Literal["myhermes-audit-worker-v2"]
+WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v3"
+LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v2"
+WorkerProtocolVersion = Literal[
+    "myhermes-audit-worker-v2",
+    "myhermes-audit-worker-v3",
+]
 
 
 class WorkerMode(str, Enum):
@@ -65,6 +75,7 @@ class WorkerArtifactPaths(ContractModel):
     stdout_log: Path
     stderr_log: Path
     memory: Path | None = None
+    ablation: Path | None = None
 
     @model_validator(mode="after")
     def validate_artifact_paths(self) -> "WorkerArtifactPaths":
@@ -97,6 +108,12 @@ class MyHermesWorkerRequest(ContractModel):
     memory_strategy: RetrievalStrategy | None = None
     memory_fixture: MemoryFixture | None = None
     memory_queries: list[MemoryQueryPlan] = Field(default_factory=list)
+    variant_id: Identifier | None = None
+    effective_subject_configuration: EffectiveSubjectConfiguration | None = None
+    required_fact_expectations: list[RequiredFactExpectation] = Field(
+        default_factory=list
+    )
+    checkpoints: list[LongConversationCheckpoint] = Field(default_factory=list)
     timeout_seconds: PositiveInt
     artifact_paths: WorkerArtifactPaths
 
@@ -131,6 +148,38 @@ class MyHermesWorkerRequest(ContractModel):
             and ToolsetName.MEMORY in self.enabled_toolsets
         ):
             raise ValueError("disabled strategy cannot enable the memory toolset")
+        p4_enabled = self.effective_subject_configuration is not None
+        if p4_enabled and self.protocol_version != WORKER_PROTOCOL_VERSION:
+            raise ValueError("P4 requests require Worker protocol v3")
+        if p4_enabled != (self.variant_id is not None):
+            raise ValueError("P4 request requires Variant and effective configuration")
+        if p4_enabled != (self.artifact_paths.ablation is not None):
+            raise ValueError("P4 request requires an Ablation Artifact path")
+        if not p4_enabled and (
+            self.required_fact_expectations or self.checkpoints
+        ):
+            raise ValueError("P4 expectations require an effective configuration")
+        if p4_enabled:
+            configuration = self.effective_subject_configuration
+            if configuration is None:
+                raise ValueError("P4 effective configuration is missing")
+            if len(self.turns) > configuration.maximum_turns:
+                raise ValueError("worker turns exceed the P4 maximum_turns limit")
+            if any(item.after_turn > len(self.turns) for item in self.checkpoints):
+                raise ValueError("worker checkpoint exceeds the requested turns")
+            long_term = configuration.include_memory
+            if long_term != (self.memory_strategy is not None):
+                raise ValueError("worker Memory request must match P4 Memory mode")
+            if self.memory_strategy is not configuration.memory_strategy:
+                raise ValueError("worker Memory strategy must match P4 configuration")
+            if configuration.memory_tool_enabled != (
+                ToolsetName.MEMORY in self.enabled_toolsets
+            ):
+                raise ValueError("worker memory toolset must match P4 configuration")
+            if not long_term and (
+                self.memory_fixture is not None or self.memory_queries
+            ):
+                raise ValueError("non-long-term P4 modes cannot expose Memory facts")
         return self
 
 
@@ -165,6 +214,9 @@ class ModelObservationRecord(ContractModel):
     duration_ms: NonNegativeInt
     tool_call_count: NonNegativeInt
     error_category: Identifier | None = None
+    compression_applied: StrictBool | None = None
+    input_message_count: NonNegativeInt | None = None
+    output_message_count: NonNegativeInt | None = None
 
     @model_validator(mode="after")
     def validate_tokens(self) -> "ModelObservationRecord":
@@ -281,6 +333,44 @@ class MemoryArtifact(ContractModel):
         return self
 
 
+class AblationArtifact(ContractModel):
+    protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
+    trial_id: Identifier
+    case_id: Identifier
+    variant_id: Identifier
+    effective_subject_configuration: EffectiveSubjectConfiguration
+    compression_events: list[CompressionEvent] = Field(default_factory=list)
+    context_diagnostics: list[ContextDiagnostic] = Field(default_factory=list)
+    fact_context_observations: list[FactContextObservation] = Field(
+        default_factory=list
+    )
+
+    @model_validator(mode="after")
+    def validate_ablation_artifact(self) -> "AblationArtifact":
+        if self.protocol_version != WORKER_PROTOCOL_VERSION:
+            raise ValueError("Ablation Artifacts require Worker protocol v3")
+        event_ids = [item.event_id for item in self.compression_events]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("Ablation Artifact event IDs must not repeat")
+        if (
+            len(self.compression_events)
+            > self.effective_subject_configuration.maximum_compression_events
+        ):
+            raise ValueError("Ablation Artifact exceeds compression event limit")
+        context_keys = [
+            (item.session_id, item.turn_index) for item in self.context_diagnostics
+        ]
+        if len(context_keys) != len(set(context_keys)):
+            raise ValueError("Ablation context diagnostics must be unique")
+        fact_keys = [
+            (item.fact_id, item.checkpoint_id)
+            for item in self.fact_context_observations
+        ]
+        if len(fact_keys) != len(set(fact_keys)):
+            raise ValueError("Ablation fact observations must be unique")
+        return self
+
+
 class MyHermesWorkerResult(ContractModel):
     protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
     worker_status: WorkerStatus
@@ -306,6 +396,14 @@ class MyHermesWorkerResult(ContractModel):
     memory_snapshots: list[MemoryStateSnapshot] = Field(default_factory=list)
     memory_state_changes: list[MemoryStateChange] = Field(default_factory=list)
     memory_errors: list[MemoryOperationError] = Field(default_factory=list)
+    variant_id: Identifier | None = None
+    effective_subject_configuration: EffectiveSubjectConfiguration | None = None
+    ablation_artifact: SafeRelativePath | None = None
+    compression_events: list[CompressionEvent] = Field(default_factory=list)
+    context_diagnostics: list[ContextDiagnostic] = Field(default_factory=list)
+    fact_context_observations: list[FactContextObservation] = Field(
+        default_factory=list
+    )
     warnings: list[WorkerWarning] = Field(default_factory=list)
     error: WorkerError | None = None
 
@@ -372,13 +470,34 @@ class MyHermesWorkerResult(ContractModel):
         changed_ids = [item.memory_id for item in self.memory_state_changes]
         if len(changed_ids) != len(set(changed_ids)):
             raise ValueError("worker Memory state change IDs must not repeat")
+        p4_enabled = self.effective_subject_configuration is not None
+        if p4_enabled and self.protocol_version != WORKER_PROTOCOL_VERSION:
+            raise ValueError("P4 results require Worker protocol v3")
+        if p4_enabled != (self.variant_id is not None):
+            raise ValueError("worker P4 result requires Variant and configuration")
+        if p4_enabled != (self.ablation_artifact is not None):
+            raise ValueError("worker P4 result requires an Ablation Artifact")
+        if not p4_enabled and any(
+            (
+                self.compression_events,
+                self.context_diagnostics,
+                self.fact_context_observations,
+            )
+        ):
+            raise ValueError("non-P4 worker results cannot contain P4 observations")
+        if p4_enabled and len(self.compression_events) > (
+            self.effective_subject_configuration.maximum_compression_events
+        ):
+            raise ValueError("worker compression events exceed the declared limit")
         return self
 
 
 __all__ = (
+    "AblationArtifact",
     "MyHermesWorkerRequest",
     "MyHermesWorkerResult",
     "MemoryArtifact",
+    "LEGACY_WORKER_PROTOCOL_VERSION",
     "MemoryQueryPlan",
     "ModelObservationRecord",
     "ObservationBundle",

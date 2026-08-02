@@ -1,5 +1,11 @@
 # Subject Capability Probe
 
+## P4 capability projection
+
+Capability protocol `3.0` 在既有 P3 检查上增加 short-term context、Session isolation、long-term Memory、User Profile、Memory Prompt/tool、Compression runtime/toggle/configuration/observation、token usage 和 context size。Probe 仅导入公开模块、读取公开符号并用 `inspect.signature()` 绑定调用形状；它不运行会话、创建 Session/数据库、执行 Compression、读取真实 Memory 或联网。
+
+当前 MyHermes 的公开 threshold configuration 支持 `compression_mode: disabled|enabled`，四种 Memory Mode 也具备所需公开表面；但 `compression_observation` 和精确 `context_size_observation` 当前 unsupported。需要公开 Compression survival 证据的 Variant 会在 Sandbox 前失败。`doctor` 只显示四行 supported/unsupported 摘要，不显示配置值、Memory 或会话正文。详见 [P4 文档](p4-memory-compression-ablation.md)。
+
 The Subject Capability Probe is a strict JSON file-protocol subprocess started
 with the same `sys.executable` as Audit. It is a compatibility check, not a
 Trial and not a smoke run of MyHermes.
@@ -32,7 +38,7 @@ Background Review.
 
 `SubjectCapabilityReport` records the protocol version, Subject commit,
 individual checks, missing capabilities, bounded warnings, and a public API
-fingerprint. Capability protocol `2.0` distinguishes baseline-required checks
+fingerprint. Capability protocol `3.0` distinguishes baseline-required checks
 from optional P3 capabilities, so a Subject without Memory support can still run
 an old non-Memory Suite. The fingerprint uses only module names, public object
 names, availability, safe call signatures, the stable Memory

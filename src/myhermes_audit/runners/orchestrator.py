@@ -11,7 +11,18 @@ from pathlib import Path
 from typing import Sequence
 
 from myhermes_audit.artifacts import artifact_ref, atomic_write_json
+from myhermes_audit.ablation import (
+    apply_token_savings,
+    build_ablation_comparisons,
+    build_trial_identity,
+    comparison_basis_fingerprint,
+    duration_diagnostics,
+    effective_subject_configuration,
+    stable_trial_id,
+    token_diagnostics,
+)
 from myhermes_audit.contracts import (
+    AblationVariant,
     AuditCase,
     AuditRunResult,
     AuditSuite,
@@ -20,6 +31,8 @@ from myhermes_audit.contracts import (
     TrialResult,
     TrialStatus,
     TrialWarning,
+    EffectiveSubjectConfiguration,
+    TrialIdentity,
 )
 from myhermes_audit.contracts.common import CURRENT_SCHEMA_VERSION
 from myhermes_audit.datasets.fixtures import materialize_fixtures
@@ -111,23 +124,76 @@ class AuditOrchestrator:
 
         trials: list[TrialResult] = []
         preserved: list[Path] = []
+        capability_report = getattr(self.runner, "capability_report", None)
+        compression_observation = (
+            None
+            if capability_report is None
+            else capability_report.capability("compression_observation")
+        )
+        compression_observation_available = (
+            compression_observation is not None
+            and compression_observation.available
+        )
         for case in selected:
-            for trial_number in range(1, suite.defaults.trials + 1):
-                trial, preserved_path = self._run_one(
-                    case,
-                    trial_number=trial_number,
-                    timeout_seconds=suite.defaults.timeout_seconds,
-                    audit_run_id=audit_run_id,
-                    sandbox_base=sandbox_base,
-                    preserve=(
-                        suite.defaults.preserve_sandbox
-                        or preserve_on_failure
-                    ),
-                    preserve_all=suite.defaults.preserve_sandbox,
+            variants: Sequence[AblationVariant | None] = (
+                [None]
+                if case.ablation is None
+                else list(case.ablation.variants)
+            )
+            for variant in variants:
+                configuration = (
+                    None
+                    if variant is None
+                    else effective_subject_configuration(
+                        case,
+                        variant,
+                        compression_observation_available=(
+                            compression_observation_available
+                        ),
+                    )
                 )
-                trials.append(trial)
-                if preserved_path is not None:
-                    preserved.append(preserved_path)
+                basis_fingerprint = (
+                    None
+                    if variant is None
+                    else comparison_basis_fingerprint(case)
+                )
+                for trial_number in range(1, suite.defaults.trials + 1):
+                    trial_identity = (
+                        None
+                        if variant is None or configuration is None
+                        else build_trial_identity(
+                            suite_sha256=audit_fingerprint.suite_sha256,
+                            case=case,
+                            variant=variant,
+                            trial_ordinal=trial_number,
+                            subject_fingerprint=subject_fingerprint,
+                            configuration=configuration,
+                            model_identifier=_p4_model_identifier(
+                                self.runner,
+                                case,
+                                configuration,
+                            ),
+                        )
+                    )
+                    trial, preserved_path = self._run_one(
+                        case,
+                        trial_number=trial_number,
+                        timeout_seconds=suite.defaults.timeout_seconds,
+                        audit_run_id=audit_run_id,
+                        sandbox_base=sandbox_base,
+                        preserve=(
+                            suite.defaults.preserve_sandbox
+                            or preserve_on_failure
+                        ),
+                        preserve_all=suite.defaults.preserve_sandbox,
+                        variant=variant,
+                        configuration=configuration,
+                        trial_identity=trial_identity,
+                        basis_fingerprint=basis_fingerprint,
+                    )
+                    trials.append(trial)
+                    if preserved_path is not None:
+                        preserved.append(preserved_path)
 
         if created_base and not preserved:
             try:
@@ -138,6 +204,8 @@ class AuditOrchestrator:
                     operation="cleanup_run_root",
                 ) from exc
 
+        trials = apply_token_savings(selected, trials)
+        comparisons = build_ablation_comparisons(selected, trials)
         case_ids = [case.case_id for case in selected]
         audit_finished = datetime.now(timezone.utc)
         result = AuditRunResult(
@@ -152,6 +220,7 @@ class AuditOrchestrator:
             cases=aggregate_cases(case_ids, trials),
             summary=aggregate_audit(case_ids, trials),
             judge_summary=aggregate_judges(trials),
+            ablation_comparisons=comparisons,
         )
         return OrchestrationOutcome(
             result=result,
@@ -168,8 +237,16 @@ class AuditOrchestrator:
         sandbox_base: Path,
         preserve: bool,
         preserve_all: bool,
+        variant: AblationVariant | None,
+        configuration: EffectiveSubjectConfiguration | None,
+        trial_identity: TrialIdentity | None,
+        basis_fingerprint: str | None,
     ) -> tuple[TrialResult, Path | None]:
-        trial_id = f"trial-{uuid.uuid4().hex}"
+        trial_id = (
+            f"trial-{uuid.uuid4().hex}"
+            if trial_identity is None
+            else stable_trial_id(trial_identity)
+        )
         trial_run_id = f"run-{uuid.uuid4().hex}"
         started_at = datetime.now(timezone.utc)
         trial_clock = time.perf_counter()
@@ -177,6 +254,7 @@ class AuditOrchestrator:
             run_id=audit_run_id,
             case_id=case.case_id,
             trial_number=trial_number,
+            variant_id=(None if variant is None else variant.variant_id),
             base_dir=sandbox_base,
             preserve=False,
         )
@@ -195,12 +273,21 @@ class AuditOrchestrator:
             sandbox.create()
             sandbox_created = True
             _, fixture_manifest_path = materialize_fixtures(case.fixture, sandbox)
-            outcome = self.runner.run_trial(
-                case,
-                sandbox,
-                trial_id=trial_id,
-                timeout_seconds=timeout_seconds,
-            )
+            if variant is None:
+                outcome = self.runner.run_trial(
+                    case,
+                    sandbox,
+                    trial_id=trial_id,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                outcome = self.runner.run_trial(
+                    case,
+                    sandbox,
+                    trial_id=trial_id,
+                    timeout_seconds=timeout_seconds,
+                    variant=variant,
+                )
             context = ValidationContext(
                 workspace=sandbox.workspace,
                 hermes_home=sandbox.hermes_home,
@@ -211,6 +298,12 @@ class AuditOrchestrator:
                 memory_snapshots=outcome.memory_snapshots,
                 memory_state_changes=outcome.memory_state_changes,
                 memory_errors=outcome.memory_errors,
+                turns=outcome.turns,
+                effective_subject_configuration=configuration,
+                ablation_plan=(None if variant is None else case.ablation),
+                context_diagnostics=outcome.context_diagnostics,
+                fact_context_observations=outcome.fact_context_observations,
+                variant_id=(None if variant is None else variant.variant_id),
             )
             validator_result = evaluate_case(
                 case,
@@ -242,6 +335,20 @@ class AuditOrchestrator:
                         ),
                         memory_errors=(
                             () if outcome is None else outcome.memory_errors
+                        ),
+                        turns=(() if outcome is None else outcome.turns),
+                        effective_subject_configuration=configuration,
+                        ablation_plan=(None if variant is None else case.ablation),
+                        context_diagnostics=(
+                            () if outcome is None else outcome.context_diagnostics
+                        ),
+                        fact_context_observations=(
+                            ()
+                            if outcome is None
+                            else outcome.fact_context_observations
+                        ),
+                        variant_id=(
+                            None if variant is None else variant.variant_id
                         ),
                     )
                     validator_result = evaluate_case(
@@ -355,12 +462,51 @@ class AuditOrchestrator:
         metrics = [] if validator_result is None else list(validator_result.metrics)
         if judge_evaluation is not None:
             metrics.append(judge_evaluation.metric)
+        p4_token_diagnostics = (
+            None
+            if variant is None
+            else token_diagnostics(
+                None if outcome is None else outcome.runtime,
+                () if outcome is None else outcome.compression_events,
+            )
+        )
+        p4_duration_diagnostics = (
+            None
+            if variant is None
+            else duration_diagnostics(
+                trial_duration_ms=duration_ms,
+                retrieval_durations=(
+                    ()
+                    if outcome is None
+                    else tuple(
+                        item.duration_ms
+                        for item in outcome.memory_query_results
+                    )
+                ),
+                compression_events=(
+                    () if outcome is None else outcome.compression_events
+                ),
+            )
+        )
         return (
             TrialResult(
                 trial_id=trial_id,
                 run_id=trial_run_id,
                 case_id=case.case_id,
                 trial_number=trial_number,
+                trial_identity=trial_identity,
+                variant_id=(None if variant is None else variant.variant_id),
+                memory_mode=(None if variant is None else variant.memory_mode),
+                compression_mode=(
+                    None if variant is None else variant.compression_mode
+                ),
+                configuration_fingerprint=(
+                    None
+                    if trial_identity is None
+                    else trial_identity.configuration_sha256
+                ),
+                comparison_basis_fingerprint=basis_fingerprint,
+                effective_subject_configuration=configuration,
                 status=status,
                 task_passed=task_passed,
                 passed=passed,
@@ -387,6 +533,39 @@ class AuditOrchestrator:
                 memory_errors=(
                     [] if outcome is None else list(outcome.memory_errors)
                 ),
+                compression_events=(
+                    [] if outcome is None else list(outcome.compression_events)
+                ),
+                context_diagnostics=(
+                    [] if outcome is None else list(outcome.context_diagnostics)
+                ),
+                fact_context_observations=(
+                    []
+                    if outcome is None
+                    else list(outcome.fact_context_observations)
+                ),
+                checkpoint_results=(
+                    []
+                    if validator_result is None
+                    else list(validator_result.checkpoint_results)
+                ),
+                fact_retention_results=(
+                    []
+                    if validator_result is None
+                    else list(validator_result.fact_retention_results)
+                ),
+                required_fact_loss=(
+                    None
+                    if validator_result is None
+                    else validator_result.required_fact_loss
+                ),
+                distortion_results=(
+                    []
+                    if validator_result is None
+                    else list(validator_result.distortion_results)
+                ),
+                token_diagnostics=p4_token_diagnostics,
+                duration_diagnostics=p4_duration_diagnostics,
                 retrieval_gate_passed=(
                     None
                     if validator_result is None
@@ -401,6 +580,11 @@ class AuditOrchestrator:
                     None
                     if validator_result is None
                     else validator_result.memory_state_hard_gates_passed
+                ),
+                required_fact_gate_passed=(
+                    None
+                    if validator_result is None
+                    else validator_result.required_fact_hard_gates_passed
                 ),
                 metrics=metrics,
                 judge_result=(
@@ -426,6 +610,18 @@ def _trial_status(
         RunnerStatus.TIMEOUT: TrialStatus.TIMEOUT,
         RunnerStatus.ENVIRONMENT_ERROR: TrialStatus.ENVIRONMENT_ERROR,
     }[outcome.status]
+
+
+def _p4_model_identifier(
+    runner: TrialRunnerPort,
+    case: AuditCase,
+    configuration: EffectiveSubjectConfiguration,
+) -> str | None:
+    resolver = getattr(runner, "p4_model_identifier", None)
+    if not callable(resolver):
+        return None
+    value = resolver(case, configuration)
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _trial_error(

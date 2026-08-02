@@ -19,7 +19,11 @@ from pydantic import ValidationError
 
 from myhermes_audit.artifacts import atomic_write_json, atomic_write_text
 from myhermes_audit.contracts import (
+    AblationVariant,
     AuditCase,
+    CompressionMode,
+    EffectiveSubjectConfiguration,
+    MemoryMode,
     MemoryErrorType,
     MemoryOperationError,
     ModelObservationSummary,
@@ -30,6 +34,13 @@ from myhermes_audit.contracts import (
     TrialWarning,
     RetrievalStrategy,
     ToolsetName,
+)
+from myhermes_audit.ablation import (
+    applicable_checkpoints,
+    applicable_fact_expectations,
+    effective_config_overrides,
+    effective_subject_configuration,
+    effective_toolsets,
 )
 from myhermes_audit.contracts.suite import (
     CaseMode,
@@ -43,6 +54,11 @@ from myhermes_audit.environment import (
     WORKER_INHERITED_ENVIRONMENT_ALLOWLIST,
 )
 from myhermes_audit.errors import (
+    AblationCapabilityError,
+    AblationVariantError,
+    CompressionCapabilityError,
+    CompressionConfigurationError,
+    CompressionObservationError,
     MemoryCapabilityError,
     MemoryKindUnsupportedError,
     MemoryMappingError,
@@ -65,6 +81,7 @@ from myhermes_audit.integrations.myhermes.config_builder import (
     MyHermesConfigBuilder,
 )
 from myhermes_audit.integrations.myhermes.contracts import (
+    AblationArtifact,
     MemoryArtifact,
     MemoryQueryPlan,
     MyHermesWorkerRequest,
@@ -164,6 +181,29 @@ class MyHermesTrialRunner:
     def capability_report(self) -> SubjectCapabilityReport | None:
         return self._capability_report
 
+    def p4_model_identifier(
+        self,
+        case: AuditCase,
+        configuration: EffectiveSubjectConfiguration,
+    ) -> str:
+        prepared = self._config_builder.prepare(
+            effective_config_overrides(case, configuration)
+        )
+        value = prepared.document.get("model")
+        if isinstance(value, str) and value.strip():
+            normalized = value.strip()
+            if normalized == "${MODEL}":
+                normalized = (
+                    case.execution.environment_overrides.get("MODEL")
+                    or self._parent_environment.get("MODEL")
+                    or normalized
+                )
+            return redact_text(
+                normalized,
+                self._sensitive_values,
+            )[:256]
+        return "subject-default"
+
     def preflight(self, cases: Sequence[AuditCase]) -> None:
         self._preflight_subject()
         for case in cases:
@@ -236,6 +276,7 @@ class MyHermesTrialRunner:
                 EvaluatorKind.TOOL_TRAJECTORY,
                 EvaluatorKind.LLM_JUDGE,
                 EvaluatorKind.RETRIEVAL,
+                EvaluatorKind.COMPRESSION,
             }
         ]
         if unsupported_evaluators:
@@ -251,6 +292,8 @@ class MyHermesTrialRunner:
             )
         if memory_case:
             self._preflight_memory_case(case)
+        if case.ablation is not None:
+            self._preflight_ablation_case(case)
         if any(
             item.target is not TextTarget.FINAL_OUTPUT
             for item in case.expected.texts
@@ -416,6 +459,84 @@ class MyHermesTrialRunner:
                     missing_capability="query_filters",
                 )
 
+    def _preflight_ablation_case(self, case: AuditCase) -> None:
+        plan = case.ablation
+        report = self._capability_report
+        if plan is None:
+            return
+        if report is None:
+            raise AblationCapabilityError(
+                "Subject capability report is unavailable for P4",
+                case_id=case.case_id,
+            )
+        observation_capability = report.capability("compression_observation")
+        observation_available = (
+            observation_capability is not None
+            and observation_capability.available
+        )
+        for variant in plan.variants:
+            if variant.memory_mode not in report.supported_memory_modes:
+                raise AblationCapabilityError(
+                    "Subject does not support the requested Memory mode",
+                    case_id=case.case_id,
+                    variant_id=variant.variant_id,
+                    memory_mode=variant.memory_mode.value,
+                    missing_capability="memory_mode",
+                )
+            if variant.compression_mode not in report.supported_compression_modes:
+                raise CompressionCapabilityError(
+                    "Subject does not expose safe public Compression control",
+                    case_id=case.case_id,
+                    variant_id=variant.variant_id,
+                    compression_mode=variant.compression_mode.value,
+                    missing_capability="compression_toggle",
+                )
+            variant_expectations = applicable_fact_expectations(
+                case,
+                variant.variant_id,
+            )
+            if (
+                variant.compression_mode is CompressionMode.ENABLED
+                and any(
+                    fact.must_survive_compression
+                    for expectation in variant_expectations
+                    for fact in expectation.facts
+                )
+                and not observation_available
+            ):
+                raise CompressionObservationError(
+                    "required Compression survival cannot be observed publicly",
+                    case_id=case.case_id,
+                    variant_id=variant.variant_id,
+                    missing_capability="compression_observation",
+                )
+            configuration = effective_subject_configuration(
+                case,
+                variant,
+                compression_observation_available=observation_available,
+            )
+            try:
+                self._config_builder.prepare(
+                    effective_config_overrides(case, configuration)
+                )
+            except Exception as exc:
+                raise CompressionConfigurationError(
+                    "Variant public configuration cannot be applied safely",
+                    case_id=case.case_id,
+                    variant_id=variant.variant_id,
+                    error_type=type(exc).__name__,
+                ) from exc
+            if configuration.memory_tool_enabled and not _capability_available(
+                report,
+                "memory_tool",
+            ):
+                raise AblationCapabilityError(
+                    "Variant requires an unavailable public memory tool",
+                    case_id=case.case_id,
+                    variant_id=variant.variant_id,
+                    missing_capability="memory_tool",
+                )
+
     def run_trial(
         self,
         case: AuditCase,
@@ -423,9 +544,46 @@ class MyHermesTrialRunner:
         *,
         trial_id: str,
         timeout_seconds: int,
+        variant: AblationVariant | None = None,
     ) -> TrialRunnerOutcome:
-        memory_case = _is_memory_case(case)
-        paths = _worker_artifact_paths(sandbox, memory_enabled=memory_case)
+        configuration = None
+        if variant is not None:
+            if case.ablation is None:
+                raise AblationVariantError(
+                    "Variant execution requires an AblationPlan",
+                    case_id=case.case_id,
+                    variant_id=variant.variant_id,
+                )
+            report = self._capability_report
+            if report is None:
+                raise AblationCapabilityError(
+                    "P4 capability report is unavailable",
+                    case_id=case.case_id,
+                    variant_id=variant.variant_id,
+                )
+            capability = report.capability("compression_observation")
+            configuration = effective_subject_configuration(
+                case,
+                variant,
+                compression_observation_available=(
+                    capability is not None and capability.available
+                ),
+            )
+        memory_case = (
+            _is_memory_case(case)
+            if configuration is None
+            else configuration.include_memory
+        )
+        memory_strategy = (
+            case.execution.memory_strategy
+            if configuration is None
+            else configuration.memory_strategy
+        )
+        paths = _worker_artifact_paths(
+            sandbox,
+            memory_enabled=memory_case,
+            ablation_enabled=configuration is not None,
+        )
         started = time.perf_counter()
         captured_stdout = ""
         captured_stderr = ""
@@ -439,8 +597,17 @@ class MyHermesTrialRunner:
                         "message": redact_text(turn.message, sensitive_values),
                     }
                 )
-                for turn in _case_turns(case)
+                for turn in _case_turns(
+                    case,
+                    configuration=configuration,
+                    variant_id=(None if variant is None else variant.variant_id),
+                )
             ]
+            enabled_toolsets = (
+                case.execution.enabled_toolsets
+                if configuration is None
+                else effective_toolsets(case, configuration)
+            )
             request = MyHermesWorkerRequest(
                 trial_id=trial_id,
                 case_id=case.case_id,
@@ -449,9 +616,9 @@ class MyHermesTrialRunner:
                 workspace=sandbox.workspace.resolve(strict=True),
                 hermes_home=sandbox.hermes_home.resolve(strict=True),
                 sqlite_path=sandbox.sqlite_path.resolve(strict=False),
-                enabled_toolsets=case.execution.enabled_toolsets,
-                memory_strategy=case.execution.memory_strategy,
-                memory_fixture=case.fixture.memory,
+                enabled_toolsets=enabled_toolsets,
+                memory_strategy=memory_strategy,
+                memory_fixture=(case.fixture.memory if memory_case else None),
                 memory_queries=[
                     MemoryQueryPlan(
                         query_id=item.query_id,
@@ -459,18 +626,44 @@ class MyHermesTrialRunner:
                         query=item.query,
                     )
                     for item in case.expected.memories
-                ],
+                ] if memory_case else [],
+                variant_id=(None if variant is None else variant.variant_id),
+                effective_subject_configuration=configuration,
+                required_fact_expectations=(
+                    []
+                    if configuration is None
+                    else applicable_fact_expectations(
+                        case,
+                        variant.variant_id,
+                    )
+                ),
+                checkpoints=(
+                    []
+                    if case.ablation is None or configuration is None
+                    else applicable_checkpoints(
+                        case,
+                        variant.variant_id,
+                    )
+                ),
                 timeout_seconds=timeout_seconds,
                 artifact_paths=paths,
             )
             atomic_write_json(paths.worker_request, request)
             prepared = self._config_builder.write(
                 sandbox.hermes_home / "config.yaml",
-                case.execution.config_overrides,
+                (
+                    case.execution.config_overrides
+                    if configuration is None
+                    else effective_config_overrides(case, configuration)
+                ),
             )
-            subject_model = _safe_subject_model(
-                prepared.document,
-                sensitive_values,
+            subject_model = (
+                _safe_subject_model(
+                    prepared.document,
+                    sensitive_values,
+                )
+                if configuration is None
+                else self.p4_model_identifier(case, configuration)
             )
             environment = self._build_worker_environment(
                 case,
@@ -521,7 +714,14 @@ class MyHermesTrialRunner:
                     paths,
                     trial_id=trial_id,
                     case_id=case.case_id,
-                    strategy=case.execution.memory_strategy,
+                    strategy=memory_strategy,
+                )
+                recovered_ablation = _recover_parent_ablation_artifact(
+                    paths,
+                    trial_id=trial_id,
+                    case_id=case.case_id,
+                    variant_id=(None if variant is None else variant.variant_id),
+                    configuration=configuration,
                 )
                 result = _fallback_worker_result(
                     paths,
@@ -529,22 +729,32 @@ class MyHermesTrialRunner:
                     message="MyHermes worker exceeded the Trial timeout",
                     duration_ms=duration_ms,
                     warnings=runtime_warnings,
-                    memory_strategy=case.execution.memory_strategy,
+                    memory_strategy=memory_strategy,
                     recovered_memory=recovered_memory,
+                    variant_id=(None if variant is None else variant.variant_id),
+                    configuration=configuration,
+                    recovered_ablation=recovered_ablation,
                 )
                 result, recovered_memory = _redact_memory_facts(
                     result,
                     recovered_memory,
                     sensitive_values,
                 )
+                result, recovered_ablation = _redact_ablation_facts(
+                    result,
+                    recovered_ablation,
+                )
                 atomic_write_json(paths.worker_result, result)
                 _ensure_empty_worker_artifacts(
                     paths,
                     trial_id,
                     case.case_id,
-                    memory_strategy=case.execution.memory_strategy,
+                    memory_strategy=memory_strategy,
                     memory_errors=result.memory_errors,
                     recovered_memory=recovered_memory,
+                    variant_id=(None if variant is None else variant.variant_id),
+                    configuration=configuration,
+                    recovered_ablation=recovered_ablation,
                 )
                 return self._outcome_from_result(
                     result,
@@ -567,12 +777,18 @@ class MyHermesTrialRunner:
                 if paths.memory is None
                 else _read_protocol_model(paths.memory, MemoryArtifact)
             )
+            ablation_artifact = (
+                None
+                if paths.ablation is None
+                else _read_protocol_model(paths.ablation, AblationArtifact)
+            )
             _validate_worker_artifacts(
                 request,
                 result,
                 transcript,
                 observations,
                 memory_artifact,
+                ablation_artifact,
                 returncode=process.returncode,
             )
             result, transcript = _redact_worker_content(
@@ -585,10 +801,16 @@ class MyHermesTrialRunner:
                 memory_artifact,
                 sensitive_values,
             )
+            result, ablation_artifact = _redact_ablation_facts(
+                result,
+                ablation_artifact,
+            )
             atomic_write_json(paths.worker_result, result)
             atomic_write_json(paths.transcript, transcript)
             if paths.memory is not None and memory_artifact is not None:
                 atomic_write_json(paths.memory, memory_artifact)
+            if paths.ablation is not None and ablation_artifact is not None:
+                atomic_write_json(paths.ablation, ablation_artifact)
             status = (
                 RunnerStatus.COMPLETED
                 if result.worker_status is WorkerStatus.COMPLETED
@@ -640,7 +862,14 @@ class MyHermesTrialRunner:
                 paths,
                 trial_id=trial_id,
                 case_id=case.case_id,
-                strategy=case.execution.memory_strategy,
+                strategy=memory_strategy,
+            )
+            recovered_ablation = _recover_parent_ablation_artifact(
+                paths,
+                trial_id=trial_id,
+                case_id=case.case_id,
+                variant_id=(None if variant is None else variant.variant_id),
+                configuration=configuration,
             )
             result = _fallback_worker_result(
                 paths,
@@ -648,13 +877,20 @@ class MyHermesTrialRunner:
                 message=f"worker environment failed: {type(exc).__name__}",
                 duration_ms=duration_ms,
                 warnings=worker_warnings,
-                memory_strategy=case.execution.memory_strategy,
+                memory_strategy=memory_strategy,
                 recovered_memory=recovered_memory,
+                variant_id=(None if variant is None else variant.variant_id),
+                configuration=configuration,
+                recovered_ablation=recovered_ablation,
             )
             result, recovered_memory = _redact_memory_facts(
                 result,
                 recovered_memory,
                 sensitive_values,
+            )
+            result, recovered_ablation = _redact_ablation_facts(
+                result,
+                recovered_ablation,
             )
             try:
                 atomic_write_json(paths.worker_result, result)
@@ -662,9 +898,12 @@ class MyHermesTrialRunner:
                     paths,
                     trial_id,
                     case.case_id,
-                    memory_strategy=case.execution.memory_strategy,
+                    memory_strategy=memory_strategy,
                     memory_errors=result.memory_errors,
                     recovered_memory=recovered_memory,
+                    variant_id=(None if variant is None else variant.variant_id),
+                    configuration=configuration,
+                    recovered_ablation=recovered_ablation,
                 )
             except Exception as artifact_exc:
                 worker_warnings.append(
@@ -676,8 +915,11 @@ class MyHermesTrialRunner:
                     message=f"worker environment failed: {type(exc).__name__}",
                     duration_ms=duration_ms,
                     warnings=worker_warnings,
-                    memory_strategy=case.execution.memory_strategy,
+                    memory_strategy=memory_strategy,
                     recovered_memory=recovered_memory,
+                    variant_id=(None if variant is None else variant.variant_id),
+                    configuration=configuration,
+                    recovered_ablation=recovered_ablation,
                 )
             return self._outcome_from_result(
                 result,
@@ -878,6 +1120,15 @@ class MyHermesTrialRunner:
             memory_snapshots=tuple(result.memory_snapshots),
             memory_state_changes=tuple(result.memory_state_changes),
             memory_errors=tuple(result.memory_errors),
+            variant_id=result.variant_id,
+            effective_subject_configuration=(
+                result.effective_subject_configuration
+            ),
+            compression_events=tuple(result.compression_events),
+            context_diagnostics=tuple(result.context_diagnostics),
+            fact_context_observations=tuple(
+                result.fact_context_observations
+            ),
             tool_calls=tool_calls,
             tool_trace_complete=(
                 status is RunnerStatus.COMPLETED
@@ -1132,6 +1383,48 @@ def _redact_memory_facts(
     return safe_result, safe_artifact
 
 
+def _redact_ablation_facts(
+    result: MyHermesWorkerResult,
+    artifact: AblationArtifact | None,
+) -> tuple[MyHermesWorkerResult, AblationArtifact | None]:
+    """Keep P4 protocol facts content-free even if a Subject exposes values."""
+
+    def safe_observation(item):
+        return item.model_copy(
+            update={
+                "matched_projection": (
+                    None
+                    if item.matched_projection is None
+                    else item.matched_projection.model_copy(
+                        update={"value": None}
+                    )
+                ),
+                "distortion_projection": (
+                    None
+                    if item.distortion_projection is None
+                    else item.distortion_projection.model_copy(
+                        update={"value": None}
+                    )
+                ),
+            }
+        )
+
+    safe_observations = [
+        safe_observation(item) for item in result.fact_context_observations
+    ]
+    safe_result = result.model_copy(
+        update={"fact_context_observations": safe_observations}
+    )
+    safe_artifact = (
+        None
+        if artifact is None
+        else artifact.model_copy(
+            update={"fact_context_observations": safe_observations}
+        )
+    )
+    return safe_result, safe_artifact
+
+
 def _redact_json_value(value, sensitive_values: tuple[str, ...]):
     if isinstance(value, str):
         return redact_text(value, sensitive_values)
@@ -1158,23 +1451,62 @@ def _safe_subject_model(
     return redact_text(value.strip(), sensitive_values)[:256]
 
 
-def _case_turns(case: AuditCase) -> list[WorkerTurn]:
+def _case_turns(
+    case: AuditCase,
+    *,
+    configuration=None,
+    variant_id: str | None = None,
+) -> list[WorkerTurn]:
     if case.mode is CaseMode.SINGLE_TURN:
         if case.input.message is None:
             raise UnsupportedCaseError("single_turn case has no input message")
-        return [
+        turns = [
             WorkerTurn(
                 message=case.input.message,
                 session_id=case.input.session_id,
             )
         ]
+    else:
+        turns = [
+            WorkerTurn(message=turn.message, session_id=turn.session_id)
+            for turn in case.input.turns
+        ]
+    if configuration is None:
+        return turns
+    if variant_id is None:
+        raise AblationVariantError("P4 turns require variant_id")
+    variant_digest = hashlib.sha256(variant_id.encode("utf-8")).hexdigest()[:16]
+    if configuration.session_context_mode.value == "subject_session":
+        return [
+            turn
+            if turn.session_id is None
+            else turn.model_copy(
+                update={
+                    "session_id": (
+                        f"session-{variant_digest}-"
+                        + hashlib.sha256(
+                            turn.session_id.encode("utf-8")
+                        ).hexdigest()[:16]
+                    )
+                }
+            )
+            for turn in turns
+        ]
     return [
-        WorkerTurn(message=turn.message, session_id=turn.session_id)
-        for turn in case.input.turns
+        turn.model_copy(
+            update={"session_id": f"session-{variant_digest}-turn-{index}"}
+        )
+        for index, turn in enumerate(turns, start=1)
     ]
 
 
 def _is_memory_case(case: AuditCase) -> bool:
+    if case.ablation is not None:
+        return any(
+            variant.memory_mode
+            in {MemoryMode.LONG_TERM_ONLY, MemoryMode.SHORT_AND_LONG_TERM}
+            for variant in case.ablation.variants
+        )
     return any(
         (
             case.execution.memory_strategy is not None,
@@ -1199,6 +1531,7 @@ def _worker_artifact_paths(
     sandbox: AuditSandbox,
     *,
     memory_enabled: bool,
+    ablation_enabled: bool,
 ) -> WorkerArtifactPaths:
     root = sandbox.artifacts_dir.resolve(strict=True)
     return WorkerArtifactPaths(
@@ -1210,6 +1543,7 @@ def _worker_artifact_paths(
         stdout_log=root / "worker.stdout.log",
         stderr_log=root / "worker.stderr.log",
         memory=(root / "memory.json" if memory_enabled else None),
+        ablation=(root / "ablation.json" if ablation_enabled else None),
     )
 
 
@@ -1304,9 +1638,28 @@ def _validate_worker_artifacts(
     transcript: WorkerTranscript,
     observations: ObservationBundle,
     memory_artifact: MemoryArtifact | None,
+    ablation_artifact: AblationArtifact | None,
     *,
     returncode: int,
 ) -> None:
+    protocol_versions = {
+        request.protocol_version,
+        result.protocol_version,
+        transcript.protocol_version,
+        observations.protocol_version,
+        *(
+            []
+            if memory_artifact is None
+            else [memory_artifact.protocol_version]
+        ),
+        *(
+            []
+            if ablation_artifact is None
+            else [ablation_artifact.protocol_version]
+        ),
+    }
+    if len(protocol_versions) != 1:
+        raise WorkerProtocolError("worker artifact protocol versions do not match")
     if transcript.trial_id != request.trial_id or transcript.case_id != request.case_id:
         raise WorkerProtocolError("worker transcript identity does not match request")
     if transcript.turns != result.turns:
@@ -1389,6 +1742,52 @@ def _validate_worker_artifacts(
             raise MemoryProtocolError(
                 "Memory snapshot strategy does not match request"
             )
+    if request.effective_subject_configuration is None:
+        if ablation_artifact is not None or result.ablation_artifact is not None:
+            raise WorkerProtocolError(
+                "non-P4 worker returned an Ablation Artifact"
+            )
+        if any(
+            (
+                result.compression_events,
+                result.context_diagnostics,
+                result.fact_context_observations,
+            )
+        ):
+            raise WorkerProtocolError("non-P4 worker returned P4 facts")
+    else:
+        if ablation_artifact is None:
+            raise WorkerProtocolError("P4 worker did not return an Ablation Artifact")
+        if result.ablation_artifact != "artifacts/ablation.json":
+            raise WorkerProtocolError(
+                "worker result names an unexpected Ablation Artifact"
+            )
+        if (
+            ablation_artifact.trial_id != request.trial_id
+            or ablation_artifact.case_id != request.case_id
+            or ablation_artifact.variant_id != request.variant_id
+            or ablation_artifact.effective_subject_configuration
+            != request.effective_subject_configuration
+        ):
+            raise WorkerProtocolError(
+                "Ablation Artifact identity does not match request"
+            )
+        if (
+            result.variant_id != request.variant_id
+            or result.effective_subject_configuration
+            != request.effective_subject_configuration
+        ):
+            raise WorkerProtocolError("worker P4 identity does not match request")
+        if (
+            ablation_artifact.compression_events != result.compression_events
+            or ablation_artifact.context_diagnostics
+            != result.context_diagnostics
+            or ablation_artifact.fact_context_observations
+            != result.fact_context_observations
+        ):
+            raise WorkerProtocolError(
+                "Ablation Artifact facts do not match worker result"
+            )
     if result.worker_status is WorkerStatus.COMPLETED and returncode != 0:
         raise WorkerProtocolError(
             "worker returned a completed envelope with non-zero exit status"
@@ -1424,6 +1823,9 @@ def _fallback_worker_result(
     warnings: Sequence[WorkerWarning] = (),
     memory_strategy: RetrievalStrategy | None = None,
     recovered_memory: MemoryArtifact | None = None,
+    variant_id: str | None = None,
+    configuration: EffectiveSubjectConfiguration | None = None,
+    recovered_ablation: AblationArtifact | None = None,
 ) -> MyHermesWorkerResult:
     protocol_errors = (
         []
@@ -1465,6 +1867,28 @@ def _fallback_worker_result(
         memory_state_changes=(
             [] if recovered_memory is None else recovered_memory.state_changes
         ),
+        variant_id=variant_id,
+        effective_subject_configuration=configuration,
+        ablation_artifact=(
+            None
+            if configuration is None
+            else f"artifacts/{paths.ablation.name}"
+        ),
+        compression_events=(
+            []
+            if recovered_ablation is None
+            else recovered_ablation.compression_events
+        ),
+        context_diagnostics=(
+            []
+            if recovered_ablation is None
+            else recovered_ablation.context_diagnostics
+        ),
+        fact_context_observations=(
+            []
+            if recovered_ablation is None
+            else recovered_ablation.fact_context_observations
+        ),
         warnings=list(warnings),
         error=WorkerError(error_type=error_type, message=message),
     )
@@ -1490,6 +1914,9 @@ def _ensure_empty_worker_artifacts(
     memory_strategy: RetrievalStrategy | None,
     memory_errors: Sequence[MemoryOperationError],
     recovered_memory: MemoryArtifact | None,
+    variant_id: str | None,
+    configuration: EffectiveSubjectConfiguration | None,
+    recovered_ablation: AblationArtifact | None,
 ) -> None:
     if not paths.observations.exists():
         atomic_write_json(paths.observations, ObservationBundle())
@@ -1511,6 +1938,17 @@ def _ensure_empty_worker_artifacts(
                 update={"errors": list(memory_errors)}
             ),
         )
+    if configuration is not None and variant_id is not None and paths.ablation is not None:
+        atomic_write_json(
+            paths.ablation,
+            recovered_ablation
+            or AblationArtifact(
+                trial_id=trial_id,
+                case_id=case_id,
+                variant_id=variant_id,
+                effective_subject_configuration=configuration,
+            ),
+        )
 
 
 def _recover_parent_memory_artifact(
@@ -1530,6 +1968,30 @@ def _recover_parent_memory_artifact(
         artifact.trial_id != trial_id
         or artifact.case_id != case_id
         or artifact.strategy is not strategy
+    ):
+        return None
+    return artifact
+
+
+def _recover_parent_ablation_artifact(
+    paths: WorkerArtifactPaths,
+    *,
+    trial_id: str,
+    case_id: str,
+    variant_id: str | None,
+    configuration: EffectiveSubjectConfiguration | None,
+) -> AblationArtifact | None:
+    if variant_id is None or configuration is None or paths.ablation is None:
+        return None
+    try:
+        artifact = _read_protocol_model(paths.ablation, AblationArtifact)
+    except Exception:
+        return None
+    if (
+        artifact.trial_id != trial_id
+        or artifact.case_id != case_id
+        or artifact.variant_id != variant_id
+        or artifact.effective_subject_configuration != configuration
     ):
         return None
     return artifact

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from myhermes_audit.contracts import (
+    AblationComparisonResult,
     AuditCase,
     DataClassification,
     LangfuseDatasetItemIdentity,
@@ -44,6 +45,7 @@ class LangfuseTrialRequest:
     trial: TrialResult
     data_classification: DataClassification
     no_content: bool
+    ablation_comparison: AblationComparisonResult | None = None
 
 
 class LangfusePort(Protocol):

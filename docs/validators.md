@@ -1,5 +1,11 @@
 # Deterministic Validator
 
+## P4 required facts
+
+`compression` evaluator 消费声明性 `RequiredFactExpectation`，按 Variant 的 `applicable_variant_ids` 选择事实，并从 Subject context Observation、P3 after snapshot 或 final answer 中做 exact/normalized/contains 匹配。它同时产生结构化 checkpoint、fact retention、required-fact loss 和 distortion；证据只含 fact ID、SHA-256、长度和状态。
+
+required fact 不可观察时 Metric 为 error/value null，不填 0。required expectation、required checkpoint 和显式 distortion hard gate 会进入 `task_success`；optional 诊断错误不会自动失败任务。Judge 仍可评开放式答案，但不能替代事实门禁。完整定义见 [P4 文档](p4-memory-compression-ablation.md)。
+
 P1 只做可重复的客观检查，不把文本规则包装成语义 Judge。
 
 - `FileValidator`：存在/不存在、UTF-8 exact/contains/not-contains、SHA-256、大小上下限。

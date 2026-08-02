@@ -26,6 +26,7 @@ class LangfuseDatasetIdentity(ContractModel):
 class LangfuseDatasetItemIdentity(ContractModel):
     dataset_name: NonEmptyText
     case_id: Identifier
+    variant_id: Identifier | None = None
     case_sha256: Sha256Digest
     remote_item_id: StrictStr | None = None
 
@@ -45,10 +46,13 @@ class LangfuseDatasetSyncPlan(ContractModel):
 
     @model_validator(mode="after")
     def validate_items(self) -> "LangfuseDatasetSyncPlan":
-        case_ids = [item.identity.case_id for item in self.items]
+        item_keys = [
+            (item.identity.case_id, item.identity.variant_id)
+            for item in self.items
+        ]
         remote_ids = [item.identity.remote_item_id for item in self.items]
-        if len(case_ids) != len(set(case_ids)):
-            raise ValueError("Dataset sync plan Case identities must be unique")
+        if len(item_keys) != len(set(item_keys)):
+            raise ValueError("Dataset sync plan Case/Variant identities must be unique")
         if any(
             item.identity.dataset_name != self.dataset.dataset_name
             for item in self.items
@@ -84,9 +88,11 @@ class LangfuseDatasetSyncResult(ContractModel):
             raise ValueError("non-dry-run remote action counts must be known")
         if all(value is not None for value in known) and sum(known) != len(self.items):
             raise ValueError("remote action counts must cover synchronized items")
-        case_ids = [item.case_id for item in self.items]
-        if len(case_ids) != len(set(case_ids)):
-            raise ValueError("synchronized Dataset Item Case IDs must be unique")
+        item_keys = [(item.case_id, item.variant_id) for item in self.items]
+        if len(item_keys) != len(set(item_keys)):
+            raise ValueError(
+                "synchronized Dataset Item Case/Variant IDs must be unique"
+            )
         if any(item.dataset_name != self.dataset.dataset_name for item in self.items):
             raise ValueError("synchronized Dataset Item names must match the Dataset")
         return self

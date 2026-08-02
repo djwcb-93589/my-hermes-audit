@@ -1,6 +1,7 @@
 """Deterministic P1 validators."""
 
 from myhermes_audit.validators.file import FileValidator
+from myhermes_audit.validators.ablation import AblationEvaluation, evaluate_ablation
 from myhermes_audit.validators.base import ValidationContext
 from myhermes_audit.validators.engine import (
     EvaluatorValidationResult,
@@ -15,6 +16,7 @@ from myhermes_audit.validators.tool_trajectory import ToolTrajectoryValidator
 
 __all__ = (
     "FileValidator",
+    "AblationEvaluation",
     "EvaluatorValidationResult",
     "JsonFileValidator",
     "TextValidator",
@@ -22,6 +24,7 @@ __all__ = (
     "ValidationContext",
     "ValidatorResultsArtifact",
     "evaluate_case",
+    "evaluate_ablation",
     "preflight_evaluators",
     "resolve_judge_expectation",
 )

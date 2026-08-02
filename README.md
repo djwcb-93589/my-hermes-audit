@@ -1,8 +1,20 @@
 # my-hermes-audit
 
+## P4 长短期记忆与 Compression 消融
+
+当前生产边界支持 Suite 显式声明 `no_memory`、`short_term_only`、`long_term_only`、`short_and_long_term`，并分别组合 `compression_mode: disabled|enabled`。Runner 按 Case、Variant 声明顺序和 Trial ordinal 串行展开；每个 Variant 独占 Session 命名空间、Sandbox、SQLite、`HERMES_HOME`、Memory 文件和 Artifact 目录。没有 `ablation` 的 P1–P3 Suite 不产生隐含 Variant。
+
+Compression 只通过 MyHermes 公开 `compression.*` 配置和 `ConversationAgentLoop` 阈值控制，Audit 不实现摘要或消息裁剪。当前 Subject 可控制 enabled/disabled，但公开 ModelCall Observation 尚不能确认 Compression 事件；需要 `must_survive_compression` 的 Case 会在 Sandbox 前明确失败，不会猜测或静默降级。完整合同、当前能力、事实门禁、比较和 no-content 规则见 [`docs/p4-memory-compression-ablation.md`](docs/p4-memory-compression-ablation.md)。
+
+静态校验 synthetic P4 示例（不会启动 Trial）：
+
+```bash
+myhermes-audit validate examples/memory_compression_ablation_v1.yaml
+```
+
 `my-hermes-audit` 是独立于 MyHermes 运行时的本地评测工具。报告总是从调用方指定的 `--subject-repo` 读取实际 Git fingerprint；文档不再把某个历史 MyHermes commit 当作运行基线。核心合同、数据集、Validator 与报告层不导入 `hermes.*`，MyHermes 也不感知自己正在被评测。
 
-项目要求 Python 3.13 或更高版本，与 MyHermes 的 `requires-python` 保持一致。基础运行依赖仅有 Pydantic v2 与 PyYAML；Langfuse Python SDK `>=4.7.0,<5` 与 OpenAI Python SDK 均为延迟导入的可选 P2 依赖。
+项目要求 Python 3.13 或更高版本，与 MyHermes 的 `requires-python` 保持一致。基础运行依赖仅有 Pydantic v2 与 PyYAML；Langfuse Python SDK `>=4.14.2,<5` 与 OpenAI Python SDK 均为延迟导入的可选依赖。
 
 ## 已实现
 
@@ -34,7 +46,7 @@
 
 P3 已实现当前 MyHermes 公开能力对应的 `subject_native`（准确语义为 `prompt_context_injection`）和 `disabled`。当前 Subject 没有公开 ranked retrieval API，因此 Dense、BM25、Hybrid 只有严格枚举与 capability-negative 边界，`run` 会在创建 Sandbox 前明确拒绝，绝不由 Audit 自己实现或静默降级。
 
-仍未实现 LLM 模拟用户、Compression 消融、Background Review 评测、Baseline Compare、并行调度、CI 或 Langfuse 自定义前端 Dashboard。
+仍未实现 LLM 模拟用户、Background Review 评测、Baseline Compare、并行调度、CI 或 Langfuse 自定义前端 Dashboard。
 
 ## 安装
 
@@ -139,6 +151,7 @@ Judge 只读取 `AUDIT_JUDGE_MODEL`、`AUDIT_JUDGE_API_KEY`、可选 `AUDIT_JUDG
 - [`examples/core_contract_v1.yaml`](examples/core_contract_v1.yaml)：单轮输入、文件 Fixture、文件与工具轨迹预期，以及 deterministic/llm_judge 声明；
 - [`examples/memory_contract_v1.yaml`](examples/memory_contract_v1.yaml)：provider-neutral、capability-negative 的 Memory 合同示例，不代表当前 `hybrid` 可运行；
 - [`examples/memory_retrieval_v1.yaml`](examples/memory_retrieval_v1.yaml)：十个 P3 synthetic Case，覆盖事实、偏好、时间、覆盖、冲突、干扰、跨 Session、no-write、隔离与 disabled 对照；
+- [`examples/memory_compression_ablation_v1.yaml`](examples/memory_compression_ablation_v1.yaml)：三个 P4 synthetic Case，覆盖四种 Memory Mode、Compression 事实保留和长短期联合；需要公开 Compression Observation 的 Case 已显式标记 capability-negative；
 - [`examples/background_review_contract_v1.yaml`](examples/background_review_contract_v1.yaml)：Memory no-op、Skill update、stale rejection，以及五类 Review 证据；
 - [`examples/core_run_v1.yaml`](examples/core_run_v1.yaml)：P1 可运行的六个合成 Case；本仓库开发阶段不执行该示例。
 - [`examples/core_judge_v1.yaml`](examples/core_judge_v1.yaml)：六个合成 P2 Case，将原有确定性门禁与单个 `answer_quality` Judge 组合；代码建设阶段不执行该示例。
@@ -155,6 +168,6 @@ Judge 与 Langfuse 仅在 Audit 父进程的 `integrations/` 适配层初始化�
 
 ## 开发与验证分离
 
-当前 P3 阶段只构建生产代码、合同、示例与文档。本仓库不创建或修改测试文件，也不在本阶段运行 pytest、unittest、真实 Trial、模型、Judge 或远端集成。后续独立 T3 应从公开合同和端口验证真实行为，不应给 MyHermes 增加评测专用分支。
+当前 P4 阶段只构建生产代码、合同、示例与文档。本仓库不创建或修改测试文件，也不在本阶段运行 pytest、unittest、真实 Trial、模型、Judge 或远端集成。后续独立 T4 应从公开合同和端口验证真实行为，不应给 MyHermes 增加评测专用分支。
 
-更多边界见 [`docs/architecture.md`](docs/architecture.md)、[`docs/p3-memory-retrieval.md`](docs/p3-memory-retrieval.md)、[`docs/p1-runner.md`](docs/p1-runner.md)、[`docs/worker-protocol.md`](docs/worker-protocol.md)、[`docs/validators.md`](docs/validators.md)、[`docs/security.md`](docs/security.md)、[`docs/p1-boundary.md`](docs/p1-boundary.md)、[`docs/p2-boundary.md`](docs/p2-boundary.md)、[`docs/langfuse.md`](docs/langfuse.md)、[`docs/langfuse-compatibility.md`](docs/langfuse-compatibility.md)、[`docs/publication-idempotency.md`](docs/publication-idempotency.md)、[`docs/llm-judge.md`](docs/llm-judge.md)、[`docs/score-model.md`](docs/score-model.md) 与 [`docs/data-classification.md`](docs/data-classification.md)。
+更多边界见 [`docs/architecture.md`](docs/architecture.md)、[`docs/p4-memory-compression-ablation.md`](docs/p4-memory-compression-ablation.md)、[`docs/p3-memory-retrieval.md`](docs/p3-memory-retrieval.md)、[`docs/p1-runner.md`](docs/p1-runner.md)、[`docs/worker-protocol.md`](docs/worker-protocol.md)、[`docs/validators.md`](docs/validators.md)、[`docs/security.md`](docs/security.md)、[`docs/p1-boundary.md`](docs/p1-boundary.md)、[`docs/p2-boundary.md`](docs/p2-boundary.md)、[`docs/langfuse.md`](docs/langfuse.md)、[`docs/langfuse-compatibility.md`](docs/langfuse-compatibility.md)、[`docs/publication-idempotency.md`](docs/publication-idempotency.md)、[`docs/llm-judge.md`](docs/llm-judge.md)、[`docs/score-model.md`](docs/score-model.md) 与 [`docs/data-classification.md`](docs/data-classification.md)。

@@ -47,11 +47,17 @@ class AuditSandbox:
         run_id: str,
         case_id: str,
         trial_number: int,
+        variant_id: str | None = None,
         base_dir: Path | None = None,
         preserve: bool = False,
     ) -> None:
         self.run_id = _validated_identifier(run_id, "run_id")
         self.case_id = _validated_identifier(case_id, "case_id")
+        self.variant_id = (
+            None
+            if variant_id is None
+            else _validated_identifier(variant_id, "variant_id")
+        )
         if isinstance(trial_number, bool) or not isinstance(trial_number, int):
             raise SandboxError(
                 "trial_number must be an integer",
@@ -167,7 +173,13 @@ class AuditSandbox:
         owner_token = uuid.uuid4().hex
         run_directory = controlled_root / self.run_id
         case_directory = run_directory / self.case_id
-        candidate = case_directory / f"{self.trial_number}-{sandbox_id}"
+        variant_directory = (
+            None
+            if self.variant_id is None
+            else case_directory / self.variant_id
+        )
+        trial_parent = case_directory if variant_directory is None else variant_directory
+        candidate = trial_parent / f"{self.trial_number}-{sandbox_id}"
         resolved_candidate = candidate.resolve(strict=False)
         if not resolved_candidate.is_relative_to(controlled_root):
             raise SandboxError(
@@ -176,7 +188,10 @@ class AuditSandbox:
             )
         created_parent_dirs: list[Path] = []
         try:
-            for parent in (run_directory, case_directory):
+            parents = [run_directory, case_directory]
+            if variant_directory is not None:
+                parents.append(variant_directory)
+            for parent in parents:
                 resolved_parent = parent.resolve(strict=False)
                 if not resolved_parent.is_relative_to(controlled_root):
                     raise ValueError("sandbox parent escaped the controlled root")
@@ -218,6 +233,7 @@ class AuditSandbox:
                 sandbox_id=sandbox_id,
                 run_id=self.run_id,
                 case_id=self.case_id,
+                variant_id=self.variant_id,
                 trial_number=self.trial_number,
                 created_at=datetime.now(timezone.utc),
                 paths=SandboxManifestPaths(),
@@ -257,7 +273,7 @@ class AuditSandbox:
         self._manifest = manifest
         self._owner_token = owner_token
         self._created_parent_dirs = tuple(created_parent_dirs)
-        self._shared_parent_dirs = (case_directory, run_directory)
+        self._shared_parent_dirs = tuple(reversed(created_parent_dirs))
         self._created = True
         return layout
 

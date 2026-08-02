@@ -22,6 +22,11 @@ from myhermes_audit.integrations.myhermes.capability_contracts import (
     SubjectCapabilityReport,
     SubjectCapabilityWarning,
 )
+from myhermes_audit.contracts.ablation import (
+    CompressionControl,
+    CompressionMode,
+    MemoryMode,
+)
 from myhermes_audit.contracts.memory import MemoryKind, RetrievalStrategy
 from myhermes_audit.serialization import canonical_sha256
 
@@ -335,6 +340,75 @@ def _public_config_surface(value: object) -> bool:
     return all(hasattr(value, name) for name in required)
 
 
+def _compression_runtime_surface(value: object) -> bool:
+    inspect.signature(value).bind(
+        model=_BIND_PLACEHOLDER,
+        max_iterations=_BIND_PLACEHOLDER,
+        tools=_BIND_PLACEHOLDER,
+        system_prompt=_BIND_PLACEHOLDER,
+        registry=_BIND_PLACEHOLDER,
+        client=_BIND_PLACEHOLDER,
+        session_key=_BIND_PLACEHOLDER,
+        conn=_BIND_PLACEHOLDER,
+        db_session_id=_BIND_PLACEHOLDER,
+        existing_messages=_BIND_PLACEHOLDER,
+        max_retries=_BIND_PLACEHOLDER,
+        max_continuations=_BIND_PLACEHOLDER,
+        compression_threshold=_BIND_PLACEHOLDER,
+    )
+    pre_model_call = getattr(value, "pre_model_call", None)
+    if not callable(pre_model_call):
+        return False
+    inspect.signature(pre_model_call).bind(
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+    )
+    return True
+
+
+def _bind_session_creation(signature: inspect.Signature) -> None:
+    signature.bind(_BIND_PLACEHOLDER, source="cli")
+
+
+def _bind_session_message_read(signature: inspect.Signature) -> None:
+    signature.bind(_BIND_PLACEHOLDER, _BIND_PLACEHOLDER)
+
+
+def _compression_configuration_surface(value: object) -> bool:
+    names = (
+        "COMPRESSION_THRESHOLD",
+        "PROTECT_FIRST",
+        "KEEP_RECENT_TOOL_RESULTS",
+        "TAIL_TOKEN_BUDGET",
+    )
+    values = [getattr(value, name, None) for name in names]
+    return all(type(item) is int and item >= 0 for item in values) and values[0] > 0
+
+
+def _token_usage_observation_surface(value: object) -> bool:
+    fields = getattr(value, "__dataclass_fields__", {})
+    return all(
+        name in fields
+        for name in ("prompt_tokens", "completion_tokens", "total_tokens")
+    )
+
+
+def _context_size_observation_surface(value: object) -> bool:
+    fields = getattr(value, "__dataclass_fields__", {})
+    return any(
+        name in fields
+        for name in ("message_count", "context_tokens", "context_size")
+    )
+
+
+def _compression_observation_surface(value: object) -> bool:
+    fields = getattr(value, "__dataclass_fields__", {})
+    return all(
+        name in fields
+        for name in ("compression_applied", "input_message_count", "output_message_count")
+    )
+
+
 def _tool_declaration_surface(
     value: object,
     *,
@@ -396,7 +470,7 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         "__file__",
         lambda: _validate_subject_origin(request),
     )
-    builder.check(
+    run_conversation = builder.check(
         "run_conversation",
         "hermes.conversation",
         "run_conversation",
@@ -488,6 +562,27 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         available=memory_tool_available,
         public_object="memory declaration+handler+registration",
     )
+    compression_available = builder.check(
+        "compression_available",
+        "hermes.conversation",
+        "ConversationAgentLoop",
+        _compression_runtime_surface,
+        required=False,
+    )
+    compression_configuration = builder.check(
+        "compression_configuration",
+        "hermes.config",
+        "<module>",
+        _compression_configuration_surface,
+        required=False,
+    )
+    compression_toggle = builder.check(
+        "compression_toggle",
+        "hermes.config",
+        "<module>",
+        _compression_configuration_surface,
+        required=False,
+    )
     ranked_query = builder.check(
         "ranked_query",
         "hermes.tools.memory",
@@ -552,17 +647,45 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
             name,
             callable,
         )
+    model_observation_view = builder.check(
+        "token_usage_observation",
+        "hermes.observability",
+        "ModelCallObservationView",
+        _token_usage_observation_surface,
+        required=False,
+    )
+    builder.check(
+        "context_size_observation",
+        "hermes.observability",
+        "ModelCallObservationView",
+        _context_size_observation_surface,
+        required=False,
+    )
+    compression_observation = builder.check(
+        "compression_observation",
+        "hermes.observability",
+        "ModelCallObservationView",
+        _compression_observation_surface,
+        required=False,
+    )
     builder.check(
         "database_initialization",
         "hermes.persistence.schema",
         "init_db",
         _has_parameters("db_path"),
     )
-    builder.check(
+    session_creation = builder.check(
         "session_creation",
         "hermes.persistence.core",
         "create_session",
-        _has_parameters("conn"),
+        signature_validator=_bind_session_creation,
+    )
+    session_message_read = builder.check(
+        "session_message_read",
+        "hermes.persistence.core",
+        "get_session_messages",
+        signature_validator=_bind_session_message_read,
+        required=False,
     )
     builder.check(
         "session_resource_cleanup",
@@ -634,6 +757,66 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         public_object="prompt toggle+ranked query declarations",
     )
 
+    short_term_supported = all(
+        item is not None
+        for item in (run_conversation, session_creation, session_message_read)
+    )
+    builder.derived_check(
+        "short_term_context",
+        available=short_term_supported,
+        public_object="run_conversation+public session message persistence",
+    )
+    session_isolation_supported = all(
+        item is not None for item in (run_conversation, session_creation)
+    )
+    builder.derived_check(
+        "session_context_isolation",
+        available=session_isolation_supported,
+        public_object="run_conversation session_id+create_session",
+    )
+    long_term_supported = native_supported
+    builder.derived_check(
+        "long_term_memory",
+        available=long_term_supported,
+        public_object="subject-native Memory prompt projection",
+    )
+    user_profile_supported = MemoryKind.USER_PROFILE in supported_memory_kinds
+    builder.derived_check(
+        "user_profile",
+        available=user_profile_supported,
+        public_object="public User Profile read/write projection",
+    )
+
+    supported_memory_modes: list[MemoryMode] = []
+    if memory_prompt_toggle is not None and session_isolation_supported:
+        supported_memory_modes.append(MemoryMode.NO_MEMORY)
+    if (
+        short_term_supported
+        and session_isolation_supported
+        and memory_prompt_toggle is not None
+    ):
+        supported_memory_modes.append(MemoryMode.SHORT_TERM_ONLY)
+    if (
+        long_term_supported
+        and user_profile_supported
+        and session_isolation_supported
+    ):
+        supported_memory_modes.append(MemoryMode.LONG_TERM_ONLY)
+    if (
+        short_term_supported
+        and long_term_supported
+        and user_profile_supported
+        and session_isolation_supported
+    ):
+        supported_memory_modes.append(MemoryMode.SHORT_AND_LONG_TERM)
+    supported_compression_modes = (
+        [CompressionMode.DISABLED, CompressionMode.ENABLED]
+        if compression_available is not None
+        and compression_configuration is not None
+        and compression_toggle is not None
+        else []
+    )
+
     # Keep these local names intentionally referenced: their presence is recorded
     # by the individual checks and consumed by case preflight.
     _ = (
@@ -642,6 +825,7 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         session_filtering,
         query_filters,
         memory_tool_available,
+        model_observation_view,
     )
     missing = [
         item.name
@@ -663,6 +847,18 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
                     "prompt_context_injection" if native_supported else None
                 ),
             },
+            "ablation_projection": {
+                "memory_modes": [item.value for item in supported_memory_modes],
+                "compression_modes": [
+                    item.value for item in supported_compression_modes
+                ],
+                "compression_control": (
+                    CompressionControl.THRESHOLD_CONFIGURATION.value
+                    if supported_compression_modes
+                    else CompressionControl.UNAVAILABLE.value
+                ),
+                "compression_observation": compression_observation is not None,
+            },
         }
     )
     error = (
@@ -681,6 +877,24 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         supported_memory_kinds=supported_memory_kinds,
         supported_retrieval_strategies=supported_strategies,
         memory_provider=("prompt_context_injection" if native_supported else None),
+        supported_memory_modes=supported_memory_modes,
+        supported_compression_modes=supported_compression_modes,
+        compression_control=(
+            CompressionControl.THRESHOLD_CONFIGURATION
+            if supported_compression_modes
+            else CompressionControl.UNAVAILABLE
+        ),
+        compression_configuration_paths=(
+            [
+                "compression.threshold",
+                "compression.protect_first",
+                "compression.keep_recent_tool_results",
+                "compression.tail_token_budget",
+            ]
+            if supported_compression_modes
+            else []
+        ),
+        compression_observation_available=compression_observation is not None,
         warnings=builder.warnings,
         public_api_fingerprint=fingerprint,
         error=error,

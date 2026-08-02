@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from myhermes_audit.contracts import (
+    AblationPlan,
+    ContextDiagnostic,
+    EffectiveSubjectConfiguration,
+    FactContextObservation,
     MemoryOperationError,
     MemoryQueryResult,
     MemoryStateChange,
@@ -16,6 +20,7 @@ from myhermes_audit.contracts import (
     MetricResult,
     MetricSource,
     MetricStatus,
+    TurnResult,
 )
 from myhermes_audit.contracts.common import validate_relative_path
 from myhermes_audit.errors import UnsafePathError, ValidatorError
@@ -45,6 +50,12 @@ class ValidationContext:
     memory_snapshots: tuple[MemoryStateSnapshot, ...] = ()
     memory_state_changes: tuple[MemoryStateChange, ...] = ()
     memory_errors: tuple[MemoryOperationError, ...] = ()
+    turns: tuple[TurnResult, ...] = ()
+    effective_subject_configuration: EffectiveSubjectConfiguration | None = None
+    ablation_plan: AblationPlan | None = None
+    context_diagnostics: tuple[ContextDiagnostic, ...] = ()
+    fact_context_observations: tuple[FactContextObservation, ...] = ()
+    variant_id: str | None = None
 
 
 def resolve_validation_path(context: ValidationContext, declared: str) -> Path:

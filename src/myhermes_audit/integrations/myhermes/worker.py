@@ -19,15 +19,30 @@ from pydantic import ValidationError
 
 from myhermes_audit.artifacts import atomic_write_json
 from myhermes_audit.contracts import (
+    CompressionEvent,
+    CompressionEventStatus,
+    ContextDiagnostic,
+    DiagnosticStatus,
+    FactContextObservation,
     MemoryErrorType,
     MemoryOperationError,
     MemoryQueryPhase,
     MemorySnapshotPhase,
     RetrievalStrategy,
+    TokenCountSource,
     TurnResult,
 )
-from myhermes_audit.errors import AuditError
+from myhermes_audit.errors import (
+    AuditError,
+    CompressionConfigurationError,
+    CompressionLimitError,
+)
+from myhermes_audit.fact_matching import (
+    match_distortion_candidate,
+    match_required_fact,
+)
 from myhermes_audit.integrations.myhermes.contracts import (
+    AblationArtifact,
     MemoryArtifact,
     MemoryQueryPlan,
     MyHermesWorkerRequest,
@@ -214,12 +229,29 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
     memory_clear_attempted = False
     memory_clear_succeeded: bool | None = None
     memory_blocked = False
+    compression_events = []
+    context_diagnostics: list[ContextDiagnostic] = []
+    fact_context_observations: list[FactContextObservation] = []
+    previous_session_id: str | None = None
+    estimate_context_tokens = None
+    fact_by_id = {
+        fact.fact_id: fact
+        for expectation in request.required_fact_expectations
+        for fact in expectation.facts
+    }
+    checkpoints_by_turn: dict[int, list] = {}
+    for checkpoint in request.checkpoints:
+        checkpoints_by_turn.setdefault(checkpoint.after_turn, []).append(checkpoint)
     try:
         # This is the first hermes import in the worker. All environment and
         # cwd checks above have already completed.
         from hermes.config import (
             BACKGROUND_REVIEW_CONFIG,
             BROWSER_CONFIG,
+            COMPRESSION_THRESHOLD,
+            KEEP_RECENT_TOOL_RESULTS,
+            PROTECT_FIRST,
+            TAIL_TOKEN_BUDGET,
             DB_PATH,
             HERMES_HOME,
             client,
@@ -237,6 +269,11 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
             register_all,
             registry,
         )
+        if request.effective_subject_configuration is not None:
+            try:
+                from hermes.tokens import estimate_tokens as estimate_context_tokens
+            except (ImportError, AttributeError):
+                estimate_context_tokens = None
 
         if Path(HERMES_HOME).resolve(strict=False) != request.hermes_home.resolve(
             strict=True
@@ -250,6 +287,25 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
             browser_config=BROWSER_CONFIG,
             background_review_config=BACKGROUND_REVIEW_CONFIG,
         )
+        if request.effective_subject_configuration is not None:
+            expected_compression = request.effective_subject_configuration.public_config_overrides.get(
+                "compression",
+                {},
+            )
+            actual_compression = {
+                "threshold": COMPRESSION_THRESHOLD,
+                "protect_first": PROTECT_FIRST,
+                "keep_recent_tool_results": KEEP_RECENT_TOOL_RESULTS,
+                "tail_token_budget": TAIL_TOKEN_BUDGET,
+            }
+            if any(
+                actual_compression.get(name) != value
+                for name, value in expected_compression.items()
+            ):
+                raise CompressionConfigurationError(
+                    "Subject compression configuration does not match the Variant",
+                    variant_id=request.variant_id,
+                )
         model_client = client
         process_manager = default_process_manager
         connection = init_db(str(request.sqlite_path))
@@ -399,6 +455,20 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                     run_id=run_id,
                 )
             )
+            if request.effective_subject_configuration is not None:
+                diagnostic, fact_observations = _observe_p4_turn(
+                    request,
+                    turn_index=turn_number,
+                    session_id=session_id,
+                    previous_session_id=previous_session_id,
+                    response=response,
+                    estimate_context_tokens=estimate_context_tokens,
+                    fact_by_id=fact_by_id,
+                    checkpoints=checkpoints_by_turn.get(turn_number, []),
+                )
+                context_diagnostics.append(diagnostic)
+                fact_context_observations.extend(fact_observations)
+                previous_session_id = session_id
             tool_batches += _nonnegative_int(response.get("tool_batches"))
             response_tool_calls += _nonnegative_int(response.get("tool_call_count"))
             if not ok:
@@ -477,12 +547,58 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                 request.sqlite_path,
                 run_durations=run_durations,
             )
+        if request.effective_subject_configuration is not None:
+            compression_events, compression_by_turn = (
+                _project_public_compression_observations(
+                    request,
+                    turns=turns,
+                    observations=observations,
+                )
+            )
+            context_diagnostics = [
+                item.model_copy(
+                    update={
+                        "compression_applied": compression_by_turn.get(
+                            item.turn_index
+                        )
+                    }
+                )
+                for item in context_diagnostics
+            ]
+            fact_context_observations = [
+                item.model_copy(
+                    update={
+                        "compression_applied": compression_by_turn.get(
+                            item.turn_index
+                        )
+                    }
+                )
+                for item in fact_context_observations
+            ]
         if any(turn.run_id is None for turn in turns):
             failed_status = failed_status or "observation_error"
             failed_error_type = failed_error_type or "observation_unavailable"
             failed_fatal = True
             failed_retryable = False
     finally:
+        if request.effective_subject_configuration is not None:
+            ablation_path = request.artifact_paths.ablation
+            if ablation_path is None:
+                raise RuntimeError("P4 worker request has no Ablation Artifact path")
+            try:
+                atomic_write_json(
+                    ablation_path,
+                    _build_ablation_artifact(
+                        request,
+                        compression_events=compression_events,
+                        context_diagnostics=context_diagnostics,
+                        fact_context_observations=fact_context_observations,
+                    ),
+                )
+            except Exception as exc:
+                lifecycle_warnings.append(
+                    _worker_warning("ablation_artifact_checkpoint_error", exc)
+                )
         if request.memory_strategy is not None:
             memory_path = request.artifact_paths.memory
             if memory_path is None:
@@ -574,6 +690,19 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                     clear_succeeded=memory_clear_succeeded,
                 ),
             )
+        if request.effective_subject_configuration is not None:
+            ablation_path = request.artifact_paths.ablation
+            if ablation_path is None:
+                raise RuntimeError("P4 worker request has no Ablation Artifact path")
+            atomic_write_json(
+                ablation_path,
+                _build_ablation_artifact(
+                    request,
+                    compression_events=compression_events,
+                    context_diagnostics=context_diagnostics,
+                    fact_context_observations=fact_context_observations,
+                ),
+            )
 
     duration_ms = max(0, round((time.perf_counter() - started) * 1000))
     prompt_tokens = _complete_optional_sum(
@@ -656,6 +785,16 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         memory_snapshots=memory_snapshots,
         memory_state_changes=memory_state_changes,
         memory_errors=memory_errors,
+        variant_id=request.variant_id,
+        effective_subject_configuration=request.effective_subject_configuration,
+        ablation_artifact=(
+            None
+            if request.effective_subject_configuration is None
+            else _artifact_relative(request.artifact_paths.ablation)
+        ),
+        compression_events=compression_events,
+        context_diagnostics=context_diagnostics,
+        fact_context_observations=fact_context_observations,
     )
 
 
@@ -689,16 +828,224 @@ def _build_memory_artifact(
     )
 
 
+def _build_ablation_artifact(
+    request: MyHermesWorkerRequest,
+    *,
+    compression_events: list,
+    context_diagnostics: list[ContextDiagnostic],
+    fact_context_observations: list[FactContextObservation],
+) -> AblationArtifact:
+    configuration = request.effective_subject_configuration
+    if configuration is None or request.variant_id is None:
+        raise RuntimeError("cannot build an Ablation Artifact without a Variant")
+    return AblationArtifact(
+        trial_id=request.trial_id,
+        case_id=request.case_id,
+        variant_id=request.variant_id,
+        effective_subject_configuration=configuration,
+        compression_events=compression_events,
+        context_diagnostics=context_diagnostics,
+        fact_context_observations=fact_context_observations,
+    )
+
+
 def _build_system_prompt(build_system_prompt, request, enabled_toolsets: list[str]) -> str:
+    configuration = request.effective_subject_configuration
     native = request.memory_strategy is RetrievalStrategy.SUBJECT_NATIVE
+    include_memory = native if configuration is None else configuration.include_memory
+    include_user_profile = (
+        native if configuration is None else configuration.include_user_profile
+    )
     return build_system_prompt(
         str(request.workspace),
         enabled_toolsets=enabled_toolsets,
         include_soul=False,
-        include_memory=native,
-        include_user_profile=native,
+        include_memory=include_memory,
+        include_user_profile=include_user_profile,
         include_project_context=False,
     )
+
+
+def _observe_p4_turn(
+    request: MyHermesWorkerRequest,
+    *,
+    turn_index: int,
+    session_id: str,
+    previous_session_id: str | None,
+    response: object,
+    estimate_context_tokens,
+    fact_by_id: dict,
+    checkpoints: list,
+) -> tuple[ContextDiagnostic, list[FactContextObservation]]:
+    safe_session_id = _safe_identifier(session_id)
+    session_changed = (
+        previous_session_id is not None and previous_session_id != session_id
+    )
+    messages = response.get("messages") if isinstance(response, Mapping) else None
+    if not isinstance(messages, list) or any(
+        not isinstance(item, Mapping) for item in messages
+    ):
+        diagnostic = ContextDiagnostic(
+            session_id=safe_session_id,
+            turn_index=turn_index,
+            token_source=TokenCountSource.UNAVAILABLE,
+            compression_applied=None,
+            session_changed=session_changed,
+            status=DiagnosticStatus.ERROR,
+            error_type="short_term_context_error",
+        )
+        observations = [
+            FactContextObservation(
+                fact_id=fact_id,
+                checkpoint_id=checkpoint.checkpoint_id,
+                turn_index=turn_index,
+                session_id=safe_session_id,
+                matched=None,
+                compression_applied=None,
+                session_changed=session_changed,
+                error_type="fact_retention_error",
+            )
+            for checkpoint in checkpoints
+            for fact_id in checkpoint.required_fact_ids
+        ]
+        return diagnostic, observations
+
+    evidence = [
+        content
+        for message in messages
+        if isinstance((content := message.get("content")), str)
+    ]
+    token_count: int | None = None
+    token_source = TokenCountSource.UNAVAILABLE
+    diagnostic_status = DiagnosticStatus.PARTIAL
+    if callable(estimate_context_tokens):
+        try:
+            estimated = estimate_context_tokens(messages)
+            if type(estimated) is not int or estimated < 0:
+                raise ValueError("invalid context token estimate")
+            token_count = estimated
+            token_source = TokenCountSource.AUDIT_ESTIMATED
+            diagnostic_status = DiagnosticStatus.AVAILABLE
+        except Exception:
+            token_count = None
+    diagnostic = ContextDiagnostic(
+        session_id=safe_session_id,
+        turn_index=turn_index,
+        message_count=len(messages),
+        estimated_or_reported_token_count=token_count,
+        token_source=token_source,
+        compression_applied=None,
+        session_changed=session_changed,
+        status=diagnostic_status,
+    )
+    observations: list[FactContextObservation] = []
+    for checkpoint in checkpoints:
+        for fact_id in checkpoint.required_fact_ids:
+            fact = fact_by_id.get(fact_id)
+            if fact is None:
+                observations.append(
+                    FactContextObservation(
+                        fact_id=fact_id,
+                        checkpoint_id=checkpoint.checkpoint_id,
+                        turn_index=turn_index,
+                        session_id=safe_session_id,
+                        matched=None,
+                        compression_applied=None,
+                        session_changed=session_changed,
+                        error_type="required_fact_validation_error",
+                    )
+                )
+                continue
+            matched = match_required_fact(evidence, fact, include_value=False)
+            distortion = (
+                None
+                if matched is not None
+                else match_distortion_candidate(
+                    evidence,
+                    fact,
+                    include_value=False,
+                )
+            )
+            observations.append(
+                FactContextObservation(
+                    fact_id=fact.fact_id,
+                    checkpoint_id=checkpoint.checkpoint_id,
+                    turn_index=turn_index,
+                    session_id=safe_session_id,
+                    matched=matched is not None,
+                    matched_projection=matched,
+                    distortion_type=(
+                        None if distortion is None else distortion[0].distortion_type
+                    ),
+                    distortion_projection=(
+                        None if distortion is None else distortion[1]
+                    ),
+                    compression_applied=None,
+                    session_changed=session_changed,
+                )
+            )
+    return diagnostic, observations
+
+
+def _project_public_compression_observations(
+    request: MyHermesWorkerRequest,
+    *,
+    turns: list[TurnResult],
+    observations: ObservationBundle,
+) -> tuple[list[CompressionEvent], dict[int, bool | None]]:
+    """Project only public ModelCall fields; absence remains unknown."""
+
+    configuration = request.effective_subject_configuration
+    if configuration is None:
+        return [], {}
+    calls_by_run: dict[str, list] = {}
+    for item in observations.model_calls:
+        calls_by_run.setdefault(item.run_id, []).append(item)
+    applied_by_turn: dict[int, bool | None] = {}
+    events: list[CompressionEvent] = []
+    compression_seen = False
+    observation_gap_seen = False
+    for turn in turns:
+        calls = [] if turn.run_id is None else calls_by_run.get(turn.run_id, [])
+        values = [item.compression_applied for item in calls]
+        compression_seen = compression_seen or any(
+            item is True for item in values
+        )
+        observation_gap_seen = observation_gap_seen or not values or any(
+            item is None for item in values
+        )
+        applied: bool | None = (
+            True
+            if compression_seen
+            else (None if observation_gap_seen else False)
+        )
+        applied_by_turn[turn.turn_number] = applied
+        for call_index, call in enumerate(calls, start=1):
+            if call.compression_applied is not True:
+                continue
+            events.append(
+                CompressionEvent(
+                    event_id=(
+                        f"compression-{turn.turn_number}-{call_index}"
+                    ),
+                    session_id=turn.session_id,
+                    turn_index=turn.turn_number,
+                    trigger="subject_public_observation",
+                    input_message_count=call.input_message_count,
+                    output_message_count=call.output_message_count,
+                    status=CompressionEventStatus.COMPLETED,
+                )
+            )
+    if len(events) > configuration.maximum_compression_events:
+        raise CompressionLimitError(
+            "Subject Compression events exceed the declared P4 limit",
+            variant_id=request.variant_id,
+            observed_event_count=len(events),
+            maximum_compression_events=(
+                configuration.maximum_compression_events
+            ),
+        )
+    return events, applied_by_turn
 
 
 def _run_memory_queries(
@@ -860,11 +1207,55 @@ def _failure_result(
             else _artifact_relative(request.artifact_paths.memory)
         ),
         memory_errors=memory_errors,
+        variant_id=request.variant_id,
+        effective_subject_configuration=request.effective_subject_configuration,
+        ablation_artifact=(
+            None
+            if request.effective_subject_configuration is None
+            else _artifact_relative(request.artifact_paths.ablation)
+        ),
         error=WorkerError(
             error_type=error_type,
             message=f"MyHermes worker failed: {exception_type}",
         ),
     )
+
+
+def _recover_ablation_artifact(
+    request: MyHermesWorkerRequest,
+) -> AblationArtifact | None:
+    configuration = request.effective_subject_configuration
+    path = request.artifact_paths.ablation
+    if configuration is None or request.variant_id is None or path is None:
+        return None
+    recovered: AblationArtifact | None = None
+    try:
+        if (
+            path.is_file()
+            and not path.is_symlink()
+            and path.stat().st_size <= 8 * 1024 * 1024
+        ):
+            candidate = AblationArtifact.model_validate_json(
+                path.read_text(encoding="utf-8")
+            )
+            if (
+                candidate.trial_id == request.trial_id
+                and candidate.case_id == request.case_id
+                and candidate.variant_id == request.variant_id
+                and candidate.effective_subject_configuration == configuration
+            ):
+                recovered = candidate
+    except (OSError, UnicodeError, ValueError, ValidationError):
+        recovered = None
+    if recovered is None:
+        recovered = AblationArtifact(
+            trial_id=request.trial_id,
+            case_id=request.case_id,
+            variant_id=request.variant_id,
+            effective_subject_configuration=configuration,
+        )
+    atomic_write_json(path, recovered)
+    return recovered
 
 
 def _recover_memory_artifact(
@@ -928,7 +1319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         error_type = (
             "worker_terminated"
             if isinstance(exc, WorkerTerminationRequested)
-            else "worker_exception"
+            else (exc.code if isinstance(exc, AuditError) else "worker_exception")
         )
         result = _failure_result(
             request,
@@ -950,6 +1341,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "memory_snapshots": memory_artifact.snapshots,
                     "memory_state_changes": memory_artifact.state_changes,
                     "memory_errors": memory_artifact.errors,
+                }
+            )
+        try:
+            ablation_artifact = _recover_ablation_artifact(request)
+        except Exception:
+            ablation_artifact = None
+        if ablation_artifact is not None:
+            result = result.model_copy(
+                update={
+                    "compression_events": ablation_artifact.compression_events,
+                    "context_diagnostics": ablation_artifact.context_diagnostics,
+                    "fact_context_observations": (
+                        ablation_artifact.fact_context_observations
+                    ),
                 }
             )
         empty_observations = ObservationBundle()

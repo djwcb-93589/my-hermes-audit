@@ -106,4 +106,4 @@ forbidden_memory_ids 均未出现
 
 Orchestrator 先完成 Suite/Subject/strategy/kind/scope preflight，再创建 Trial。每个 Trial 有独立 `HERMES_HOME`、Memory 存储、SQLite、workspace、进程和 Adapter；父进程不缓存 Memory 状态，Case/Trial 之间没有复制。
 
-P3 不实现 Audit 向量库、embedding、BM25、Hybrid、Compression、Background Review、Baseline、并行 Trial、CI 或自定义 Dashboard。检索能力必须来自 Subject 公共 API；否则就明确 unsupported。
+P3 阶段不实现 Audit 向量库、embedding、BM25、Hybrid、Compression、Background Review、Baseline、并行 Trial、CI 或自定义 Dashboard。P4 在独立层增加 Subject-native Compression 控制与消融，但仍不实现 Audit 压缩算法；检索能力继续必须来自 Subject 公共 API，否则就明确 unsupported。

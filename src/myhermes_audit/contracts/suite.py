@@ -24,6 +24,13 @@ from myhermes_audit.contracts.background_review import (
     SkillManagedBy,
     SkillSource,
 )
+from myhermes_audit.contracts.ablation import (
+    AblationPlan,
+    CompressionMode,
+    MemoryMode,
+    RequiredFactExpectation,
+    RequiredFactScope,
+)
 from myhermes_audit.contracts.common import (
     ContractModel,
     FixtureTargetPath,
@@ -491,6 +498,7 @@ class ExpectedSpec(ContractModel):
     tool_trajectories: list[ToolTrajectoryExpectation] = Field(default_factory=list)
     memories: list[MemoryExpectation] = Field(default_factory=list)
     memory_states: list[MemoryStateExpectation] = Field(default_factory=list)
+    required_facts: list[RequiredFactExpectation] = Field(default_factory=list)
     background_reviews: list[BackgroundReviewExpectation] = Field(default_factory=list)
     judges: list[JudgeExpectation] = Field(default_factory=list)
 
@@ -539,6 +547,7 @@ class AuditCase(ContractModel):
     execution: ExecutionSpec = Field(default_factory=ExecutionSpec)
     fixture: FixtureSpec = Field(default_factory=FixtureSpec)
     expected: ExpectedSpec = Field(default_factory=ExpectedSpec)
+    ablation: AblationPlan | None = None
     evaluators: list[EvaluatorSpec] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -563,6 +572,111 @@ class AuditCase(ContractModel):
         state_ids = [item.state_id for item in self.expected.memory_states]
         if len(state_ids) != len(set(state_ids)):
             raise ValueError("Memory state_id must be unique within an AuditCase")
+        expectation_ids = [
+            item.expectation_id for item in self.expected.required_facts
+        ]
+        if len(expectation_ids) != len(set(expectation_ids)):
+            raise ValueError(
+                "required fact expectation_id must be unique within an AuditCase"
+            )
+        required_facts = [
+            fact
+            for expectation in self.expected.required_facts
+            for fact in expectation.facts
+        ]
+        fact_ids = [item.fact_id for item in required_facts]
+        if len(fact_ids) != len(set(fact_ids)):
+            raise ValueError("fact_id must be unique within an AuditCase")
+        if self.ablation is None:
+            if required_facts:
+                raise ValueError("required facts require an ablation plan")
+        else:
+            if self.mode is CaseMode.SIMULATED_USER:
+                raise ValueError("P4 ablation does not support simulated_user mode")
+            turn_count = 1 if self.input.message is not None else len(self.input.turns)
+            if turn_count > self.ablation.maximum_turns:
+                raise ValueError("case turns cannot exceed ablation.maximum_turns")
+            checkpoint_by_id = {
+                item.checkpoint_id: item for item in self.ablation.checkpoints
+            }
+            if any(
+                checkpoint.after_turn > turn_count
+                for checkpoint in self.ablation.checkpoints
+            ):
+                raise ValueError("checkpoint after_turn cannot exceed case turns")
+            known_fact_ids = set(fact_ids)
+            referenced_checkpoint_facts = {
+                fact_id
+                for checkpoint in self.ablation.checkpoints
+                for fact_id in checkpoint.required_fact_ids
+            }
+            unknown_checkpoint_facts = sorted(
+                referenced_checkpoint_facts - known_fact_ids
+            )
+            if unknown_checkpoint_facts:
+                raise ValueError(
+                    "checkpoint fact IDs must reference declared required facts: "
+                    + ", ".join(unknown_checkpoint_facts)
+                )
+            for fact in required_facts:
+                if fact.checkpoint_id is None:
+                    continue
+                checkpoint = checkpoint_by_id.get(fact.checkpoint_id)
+                if checkpoint is None:
+                    raise ValueError(
+                        f"fact {fact.fact_id} references an unknown checkpoint"
+                    )
+                if fact.fact_id not in checkpoint.required_fact_ids:
+                    raise ValueError(
+                        f"checkpoint {checkpoint.checkpoint_id} must reference "
+                        f"fact {fact.fact_id}"
+                    )
+            known_variant_ids = {
+                item.variant_id for item in self.ablation.variants
+            }
+            unknown_expectation_variants = sorted(
+                {
+                    variant_id
+                    for expectation in self.expected.required_facts
+                    for variant_id in expectation.applicable_variant_ids
+                }
+                - known_variant_ids
+            )
+            if unknown_expectation_variants:
+                raise ValueError(
+                    "required fact expectations reference unknown Variants: "
+                    + ", ".join(unknown_expectation_variants)
+                )
+            for expectation in self.expected.required_facts:
+                applicable = [
+                    item
+                    for item in self.ablation.variants
+                    if not expectation.applicable_variant_ids
+                    or item.variant_id in expectation.applicable_variant_ids
+                ]
+                if any(
+                    fact.scope is RequiredFactScope.LONG_TERM_MEMORY
+                    for fact in expectation.facts
+                ) and not any(
+                    item.memory_mode
+                    in {MemoryMode.LONG_TERM_ONLY, MemoryMode.SHORT_AND_LONG_TERM}
+                    for item in applicable
+                ):
+                    raise ValueError(
+                        "long_term_memory facts require an applicable long-term "
+                        "Memory variant"
+                    )
+                if any(
+                    fact.must_survive_compression
+                    for fact in expectation.facts
+                ) and not any(
+                    item.compression_mode is CompressionMode.ENABLED
+                    for item in applicable
+                ):
+                    raise ValueError(
+                        "compression-survival facts require an applicable "
+                        "compression_enabled variant"
+                    )
         fixture_ids = {
             item.memory_id
             for item in (

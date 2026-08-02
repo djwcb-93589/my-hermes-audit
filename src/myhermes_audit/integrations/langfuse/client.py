@@ -283,11 +283,18 @@ class LangfuseV4Adapter:
                 for item in existing_items
                 if isinstance(getattr(item, "id", None), str)
             }
-            prior_case_ids = {
-                metadata.get("audit_case_id")
+            prior_case_variant_ids = {
+                (
+                    metadata.get("audit_case_id"),
+                    metadata.get("audit_variant_id"),
+                )
                 for item in existing_items
                 if isinstance((metadata := getattr(item, "metadata", None)), dict)
                 and isinstance(metadata.get("audit_case_id"), str)
+                and (
+                    metadata.get("audit_variant_id") is None
+                    or isinstance(metadata.get("audit_variant_id"), str)
+                )
             }
             added_count = 0
             updated_count = 0
@@ -327,7 +334,10 @@ class LangfuseV4Adapter:
                         "Langfuse returned an unexpected Dataset Item identity",
                         case_id=item.identity.case_id,
                     )
-                if existing is not None or item.identity.case_id in prior_case_ids:
+                if existing is not None or (
+                    item.identity.case_id,
+                    item.identity.variant_id,
+                ) in prior_case_variant_ids:
                     updated_count += 1
                 else:
                     added_count += 1
@@ -1760,6 +1770,7 @@ def _trial_content_fingerprint(
     return canonical_sha256(
         {
             "trial": request.trial.model_dump(mode="json"),
+            "ablation_comparison": request.ablation_comparison,
             "dataset_item_id": dataset_item_id,
             "data_classification": request.data_classification.value,
             "no_content": request.no_content,

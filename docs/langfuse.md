@@ -1,6 +1,12 @@
 # Langfuse 集成
 
-P2.1 支持 Langfuse Python SDK `>=4.7.0,<5`。下限来自 Langfuse 当前 [版本兼容说明](https://langfuse.com/docs/compatibility)：Python SDK 4.7.0 起可在 v4 数据模型下实时处理 OpenTelemetry Trace；运行时还会逐项检查本项目实际使用的公开方法及参数，版本号本身不是充分条件。
+## P4 本地事实回放
+
+P4 Trace 使用 `p4` version，并回放 Variant metadata、Compression/context diagnostics、checkpoint、required-fact retention、distortion 和 Case comparison Observation。发布请求携带本地 `AblationComparisonResult`；mapper 不重新运行 Agent、Compression、Validator 或 Judge。
+
+事实 projection 永远省略 canonical/actual 正文，仅保留 SHA-256 与长度。`--langfuse-no-content` 或 sensitive 分类还会省略 turn、final answer、Memory、User Profile 和 query正文。Score mapper没有新增名称，仍只有 `task_success`、`tool_correctness`、`answer_quality`。详见 [P4 文档](p4-memory-compression-ablation.md)。
+
+当前支持 Langfuse Python SDK `>=4.14.2,<5`。项目下限要求同时具备适配器使用的 v4 Score 创建与精确查询公开表面；运行时还会逐项检查本项目实际使用的公开方法及参数，版本号本身不是充分条件。
 
 ## 配置与预检
 
@@ -24,7 +30,7 @@ Host 必须是无认证信息、query 或 fragment 的 HTTP(S) URL。Suite、报
 
 ## Dataset
 
-一个 Suite 对应一个 Dataset，一个 Case 内容版本对应一个 Dataset Item。Item ID 是 `dataset_name + suite_id + case_id + case_sha256` 的稳定 UUID5。公开 `create_dataset_item(..., id=...)` 提供同 ID 写入语义；Case hash 与发布投影 hash 都不变时不写，投影变化时更新同一 Case 版本，Case 内容变化时创建新的稳定版本。历史 Item 和历史 Experiment 保留，P2.1 没有 prune 或删除命令。
+一个 Suite 对应一个 Dataset。非 P4 Case 内容版本仍对应一个 Dataset Item，Item ID 保持 `dataset_name + suite_id + case_id + case_sha256` 的稳定 UUID5；P4 在其中加入显式 `variant_id`，使每个 Case/Variant 独占 Item。公开 `create_dataset_item(..., id=...)` 提供同 ID 写入语义；Case hash 与发布投影 hash 都不变时不写，投影变化时更新同一版本，Case 内容变化时创建新的稳定版本。历史 Item 和历史 Experiment 保留，没有 prune 或删除命令。
 
 Item input、expected output 和 metadata 均先经过数据分类投影。Fixture、Memory、Skill 与数据库正文不上传。`sync --dry-run` 只生成本地计划，不导入 SDK、不连接远端；因此远端新增、更新、不变计数保持 unknown。
 
@@ -44,13 +50,13 @@ Runner 的 task 是纯回放函数：它只读取已经完成且已脱敏的 `Tr
 
 重复的单项 Runner 调用使用同一精确 run name；若 SDK 返回不同 Dataset Run ID，发布立即转为关联错误，不会把多个远端 run 拼成一个本地成功结果。适配层不直接访问自动生成客户端资源，不手写旧端点，也没有旧协议 fallback。
 
-一个 Dataset Item 在一个 Dataset-backed run 中只有一个正式 Experiment Item 身份，因此 P2.1 的显式发布要求每个 Case 恰好一个 Trial；不满足时在 Worker 启动前明确失败。普通本地多 Trial 运行保持不变。
+Dataset-backed 发布仍要求每个 Case/Variant 恰好一个 Trial；普通本地多 Trial 运行保持不变。旧 Case 对应一个 Dataset Item，P4 Case 则按显式 Variant 建立稳定、互不复用的 Dataset Item identity，使每个 Variant 获得独立 Experiment Item/Trace。若 `defaults.trials` 大于 1，远端发布在本地结果持久化后明确拒绝，不影响本地消融结果。
 
 ## Observation 投影
 
 `TrialResult` 映射为 Runner task Trace 的子树：Trial span、scripted turn、公共 Model/Tool Observation、Validator evaluator，以及实际完成的 Judge generation。P3 Memory Case 还增加 seed、query、before/after snapshot 和 retrieval evaluator Observation；它们只是本地事实回放，不执行第二次查询或评测。未执行的 Judge 不伪造 generation。真实 runtime duration 和可用时间只进入 metadata；发布发生时创建的 span 不伪装成历史瀑布图。
 
-Trace metadata 保存 Audit/Suite/Case/Trial 身份、subject/audit commit、模型标识（安全可得时）、数据分类、runtime 状态和效率摘要。它不保存 config、绝对路径、隐藏 Prompt、隐藏推理或工具正文。
+Trace metadata 保存 Audit/Suite/Case/Trial 身份、subject/audit commit、模型标识（安全可得时）、数据分类、runtime 状态和效率摘要。P4 另保存经过白名单约束的公开有效配置投影；它不保存基础 config、凭据、绝对路径、隐藏 Prompt、隐藏推理或工具正文。
 
 Memory Observation 在允许内容的 `synthetic`/`internal` 模式下仍先经过统一脱敏与长度限制。`--langfuse-no-content` 时，每个 query/Memory item 只保留 SHA-256、长度/字节数、kind、rank、required hit、duration 与安全 metadata；不上传 Memory、User Profile、Fixture 或 query 正文。`sensitive` 分类无条件使用相同省略规则，即使没有传 no-content。Snapshot 不包含路径，跨 Session 只发布 Suite 的逻辑 ID，不发布 Subject Session ID。
 

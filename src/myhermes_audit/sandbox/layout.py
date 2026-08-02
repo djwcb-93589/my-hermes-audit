@@ -44,6 +44,7 @@ class SandboxManifest(ContractModel):
     sandbox_id: Identifier
     run_id: Identifier
     case_id: Identifier
+    variant_id: Identifier | None = None
     trial_number: PositiveInt
     created_at: UtcDatetime
     paths: SandboxManifestPaths = Field(default_factory=SandboxManifestPaths)

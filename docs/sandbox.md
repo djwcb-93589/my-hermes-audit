@@ -1,5 +1,9 @@
 # AuditSandbox 隔离与清理
 
+## P4 Variant 维度
+
+旧 Case 仍使用 `<root>/<run>/<case>/<trial>-<sandbox-id>/`。只有显式 P4 Variant 使用 `<root>/<run>/<case>/<variant>/<trial>-<sandbox-id>/`，并在 Manifest 记录 `variant_id`。因此不同 Variant 不共享 workspace、`HERMES_HOME`、SQLite、Memory 文件、Artifact 或日志；Session ID 还在 Worker 请求中按 Variant 稳定命名空间化。清理仍只删除通过 ownership marker 校验的当前 Trial 根，并按从深到浅顺序尝试移除空的 Variant/Case/Run 父目录。
+
 ## 布局
 
 每个 `AuditSandbox` 属于一个 `(run_id, case_id, trial_number)`，并增加随机 `sandbox_id` 防止冲突：

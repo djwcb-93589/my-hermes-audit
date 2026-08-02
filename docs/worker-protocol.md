@@ -1,5 +1,13 @@
 # Worker 文件协议
 
+## P4 Worker v3
+
+默认协议升级为 `myhermes-audit-worker-v3`；合同仍可读取非 P4 的 v2 Artifact，但任何 P4 request/result/`ablation.json` 必须使用 v3，且同一 Trial 的 request、result、transcript、observations、memory 和 ablation 协议版本必须一致。
+
+P4 request 增加 `variant_id`、`effective_subject_configuration`、适用的 required-fact expectations、checkpoint 和 `artifacts/ablation.json`。结果及 Ablation Artifact 逐项一致地保存公开 `compression_events`、`context_diagnostics` 和 content-free `fact_context_observations`。超时或父/子进程失败时，父进程只恢复身份匹配的部分 Artifact，并补齐合法空 Artifact，不把缺失观察伪造成事件。所有投影受 `maximum_turns`、`maximum_compression_events` 和协议文件大小限制。
+
+当前 Subject 没有公开 Compression event 字段，因此事件列表为空、`compression_applied` 为 `None`；Worker 不依据 token 或消息变化推断。若未来公开 ModelCall projection 提供声明字段，v3 只从该公开 projection 映射事件。详见 [P4 文档](p4-memory-compression-ablation.md)。
+
 Worker 不使用 stdout 传结构化结果。每个 Trial 的 `artifacts/` 固定包含：
 
 - `worker-request.json`
@@ -10,8 +18,9 @@ Worker 不使用 stdout 传结构化结果。每个 Trial 的 `artifacts/` 固�
 - `worker.stdout.log`
 - `worker.stderr.log`
 - P3 Case 才有的 `memory.json`
+- P4 Variant 才有的 `ablation.json`
 
-请求和结果都使用严格 Pydantic 合同、明确的协议版本、未知字段拒绝、非负计数与有限数值。P3 因 turns 增加逻辑 `session_id`，并增加 strategy、Memory Fixture、稳定 query plan 与 Memory Artifact，协议从 `myhermes-audit-worker-v1` 显式升级为 `myhermes-audit-worker-v2`，没有静默复用旧 envelope。请求不携带环境快照或凭据。
+请求和结果都使用严格 Pydantic 合同、明确的协议版本、未知字段拒绝、非负计数与有限数值。P3 因 turns 增加逻辑 `session_id`，并增加 strategy、Memory Fixture、稳定 query plan 与 Memory Artifact，协议从 v1 显式升级为 `myhermes-audit-worker-v2`；P4 再升级为当前默认 v3。非 P4 可读取遗留 v2 Artifact，P4 不会静默复用旧 envelope。请求不携带环境快照或凭据。
 
 结果只保存安全运行投影：状态、逐 turn 输出、run ID、有限的计数/token/duration、Artifact 相对路径、稳定错误类别与安全摘要。它不序列化 MyHermes 对象、完整 Prompt、模型隐藏推理、完整工具参数或完整工具结果。
 

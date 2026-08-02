@@ -390,6 +390,21 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
         )
     )
     print(f"Memory provider: {report.memory_provider or 'unavailable'}")
+    for label, capability_name in (
+        ("Short-term context", "short_term_context"),
+        ("Long-term memory", "long_term_memory"),
+        ("Compression toggle", "compression_toggle"),
+        ("Compression observation", "compression_observation"),
+    ):
+        capability = report.capability(capability_name)
+        print(
+            f"{label}: "
+            + (
+                "supported"
+                if capability is not None and capability.available
+                else "unsupported"
+            )
+        )
     print(f"Public API fingerprint: {report.public_api_fingerprint}")
     print(f"Optional dependency langfuse: {_presence(langfuse_available)}")
     print(f"Optional dependency openai: {_presence(judge_available)}")

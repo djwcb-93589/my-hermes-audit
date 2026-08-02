@@ -13,11 +13,16 @@ from myhermes_audit.contracts.common import (
     NonEmptyText,
     Sha256Digest,
 )
+from myhermes_audit.contracts.ablation import (
+    CompressionControl,
+    CompressionMode,
+    MemoryMode,
+)
 from myhermes_audit.contracts.memory import MemoryKind, RetrievalStrategy
 
 
-CAPABILITY_PROTOCOL_VERSION = "2.0"
-CapabilityProtocolVersion = Literal["2.0"]
+CAPABILITY_PROTOCOL_VERSION = "3.0"
+CapabilityProtocolVersion = Literal["3.0"]
 
 
 class SubjectCapabilityProbeRequest(ContractModel):
@@ -63,6 +68,15 @@ class SubjectCapabilityReport(ContractModel):
         default_factory=list
     )
     memory_provider: NonEmptyText | None = None
+    supported_memory_modes: list[MemoryMode] = Field(default_factory=list)
+    supported_compression_modes: list[CompressionMode] = Field(
+        default_factory=list
+    )
+    compression_control: CompressionControl = CompressionControl.UNAVAILABLE
+    compression_configuration_paths: list[NonEmptyText] = Field(
+        default_factory=list
+    )
+    compression_observation_available: StrictBool = False
     warnings: list[SubjectCapabilityWarning] = Field(default_factory=list)
     public_api_fingerprint: Sha256Digest
     error: SubjectCapabilityProbeError | None = None
@@ -98,6 +112,35 @@ class SubjectCapabilityReport(ContractModel):
         if native_supported != (self.memory_provider is not None):
             raise ValueError(
                 "memory_provider must be present exactly when subject_native is supported"
+            )
+        if len(self.supported_memory_modes) != len(set(self.supported_memory_modes)):
+            raise ValueError("supported_memory_modes must not repeat")
+        if len(self.supported_compression_modes) != len(
+            set(self.supported_compression_modes)
+        ):
+            raise ValueError("supported_compression_modes must not repeat")
+        if len(self.compression_configuration_paths) != len(
+            set(self.compression_configuration_paths)
+        ):
+            raise ValueError("compression configuration paths must not repeat")
+        compression_toggle = self.capability("compression_toggle")
+        toggle_available = (
+            compression_toggle is not None and compression_toggle.available
+        )
+        if toggle_available != (
+            self.compression_control is not CompressionControl.UNAVAILABLE
+        ):
+            raise ValueError("compression_control must match compression_toggle")
+        if toggle_available != bool(self.supported_compression_modes):
+            raise ValueError(
+                "supported compression modes must match compression control"
+            )
+        observation = self.capability("compression_observation")
+        if self.compression_observation_available != (
+            observation is not None and observation.available
+        ):
+            raise ValueError(
+                "compression observation field must match the capability check"
             )
         warning_types = [item.warning_type for item in self.warnings]
         if len(warning_types) != len(set(warning_types)):
