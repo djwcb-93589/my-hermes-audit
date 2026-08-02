@@ -10,29 +10,33 @@ from myhermes_audit.contracts.ablation import (
     AblationMetricDelta,
     AblationVariant,
     AblationVariantResult,
+    ComparabilityAssessment,
+    ComparabilityReason,
     ComparabilityStatus,
     CompressionControl,
     CompressionEvent,
     CompressionMode,
     DiagnosticStatus,
-    DISABLED_COMPRESSION_THRESHOLD,
+    EffectiveCompressionSemantics,
     DistortionType,
     DurationDiagnostics,
     DurationSource,
     EffectiveSubjectConfiguration,
     MemoryMode,
+    ModelIdentifierSource,
     SessionContextMode,
     TokenCountSource,
+    TokenCountScope,
     TokenDiagnostics,
+    THRESHOLD_DISABLED_COMPRESSION_THRESHOLD,
     TrialIdentity,
     LongConversationCheckpoint,
     RequiredFactExpectation,
 )
 from myhermes_audit.contracts.result import (
-    MetricSource,
-    MetricStatus,
     TrialResult,
     TrialRuntimeSummary,
+    TrialObservationSummary,
 )
 from myhermes_audit.contracts.fingerprint import SubjectFingerprint
 from myhermes_audit.contracts.suite import AuditCase, ToolsetName
@@ -54,7 +58,13 @@ def effective_subject_configuration(
     case: AuditCase,
     variant: AblationVariant,
     *,
-    compression_observation_available: bool,
+    compression_observation_supported: bool,
+    compression_threshold_control: bool = True,
+    emergency_overflow_compression_disable_supported: bool = False,
+    model_identifier: str = "subject-default",
+    model_identifier_source: ModelIdentifierSource = (
+        ModelIdentifierSource.SUBJECT_DEFAULT
+    ),
 ) -> EffectiveSubjectConfiguration:
     plan = case.ablation
     if plan is None:
@@ -82,14 +92,19 @@ def effective_subject_configuration(
     )
     threshold = (
         int(compression_section["threshold"])
-        if variant.compression_mode is CompressionMode.ENABLED
-        else DISABLED_COMPRESSION_THRESHOLD
+        if variant.compression_mode is CompressionMode.THRESHOLD_ENABLED
+        else THRESHOLD_DISABLED_COMPRESSION_THRESHOLD
     )
     compression_section["threshold"] = threshold
     public_overrides = {"compression": compression_section}
     return EffectiveSubjectConfiguration(
         memory_mode=variant.memory_mode,
-        compression_mode=variant.compression_mode,
+        requested_compression_mode=variant.compression_mode,
+        effective_compression_semantics=(
+            EffectiveCompressionSemantics.THRESHOLD_TRIGGER_ENABLED
+            if variant.compression_mode is CompressionMode.THRESHOLD_ENABLED
+            else EffectiveCompressionSemantics.THRESHOLD_TRIGGER_DISABLED
+        ),
         session_context_mode=(
             SessionContextMode.SUBJECT_SESSION
             if short_term
@@ -103,9 +118,22 @@ def effective_subject_configuration(
         memory_strategy=(case.execution.memory_strategy if long_term else None),
         compression_control=CompressionControl.THRESHOLD_CONFIGURATION,
         compression_threshold=threshold,
-        compression_observation_available=compression_observation_available,
+        compression_threshold_control=compression_threshold_control,
+        emergency_overflow_compression_disable_supported=(
+            emergency_overflow_compression_disable_supported
+        ),
+        emergency_compression_possible=(
+            not plan.require_emergency_compression_disable
+        ),
+        compression_events_observable=compression_observation_supported,
         maximum_turns=plan.maximum_turns,
         maximum_compression_events=plan.maximum_compression_events,
+        minimum_compression_events=plan.minimum_compression_events,
+        require_emergency_compression_disable=(
+            plan.require_emergency_compression_disable
+        ),
+        model_identifier=model_identifier,
+        model_identifier_source=model_identifier_source,
         public_config_overrides=public_overrides,
     )
 
@@ -202,17 +230,6 @@ def comparison_basis_fingerprint(case: AuditCase) -> str:
     )
 
 
-def configured_model_identifier(
-    case: AuditCase,
-    configuration: EffectiveSubjectConfiguration,
-) -> str:
-    document = effective_config_overrides(case, configuration)
-    model = document.get("model")
-    if isinstance(model, str) and model.strip():
-        return model.strip()[:256]
-    return "subject-default"
-
-
 def build_trial_identity(
     *,
     suite_sha256: str,
@@ -221,14 +238,8 @@ def build_trial_identity(
     trial_ordinal: int,
     subject_fingerprint: SubjectFingerprint,
     configuration: EffectiveSubjectConfiguration,
-    model_identifier: str | None = None,
 ) -> TrialIdentity:
     config_sha256 = configuration_fingerprint(case, variant, configuration)
-    resolved_model_identifier = (
-        configured_model_identifier(case, configuration)
-        if model_identifier is None
-        else model_identifier
-    )
     payload = {
         "suite_sha256": suite_sha256,
         "case_id": case.case_id,
@@ -239,7 +250,7 @@ def build_trial_identity(
             subject_fingerprint
         ),
         "configuration_sha256": config_sha256,
-        "model_identifier": resolved_model_identifier,
+        "model_identifier": configuration.model_identifier,
     }
     return TrialIdentity(
         **payload,
@@ -267,7 +278,13 @@ def stable_trial_id(identity: TrialIdentity) -> str:
 def token_diagnostics(
     runtime: TrialRuntimeSummary | None,
     compression_events: Sequence[CompressionEvent],
+    observations: TrialObservationSummary | None = None,
 ) -> TokenDiagnostics:
+    model_call_count = (
+        len(observations.model_calls)
+        if observations is not None and not observations.truncated
+        else None
+    )
     if runtime is None or all(
         item is None
         for item in (
@@ -279,6 +296,8 @@ def token_diagnostics(
         return TokenDiagnostics(
             status=DiagnosticStatus.UNAVAILABLE,
             source=TokenCountSource.UNAVAILABLE,
+            scope=TokenCountScope.SUBJECT_TRIAL_MODEL_CALLS,
+            model_call_count=model_call_count,
         )
     complete = all(
         item is not None
@@ -303,6 +322,8 @@ def token_diagnostics(
     return TokenDiagnostics(
         status=(DiagnosticStatus.AVAILABLE if complete else DiagnosticStatus.PARTIAL),
         source=TokenCountSource.PROVIDER_REPORTED,
+        scope=TokenCountScope.SUBJECT_TRIAL_MODEL_CALLS,
+        model_call_count=model_call_count,
         input_tokens=runtime.prompt_tokens,
         output_tokens=runtime.completion_tokens,
         total_tokens=runtime.total_tokens,
@@ -349,11 +370,77 @@ def duration_diagnostics(
     )
 
 
-def _reliable_token_source(source: TokenCountSource) -> bool:
-    return source in {
-        TokenCountSource.SUBJECT_REPORTED,
-        TokenCountSource.PROVIDER_REPORTED,
-    }
+def _comparable_token_source(source: TokenCountSource) -> bool:
+    return source is not TokenCountSource.UNAVAILABLE
+
+
+def _unique_reasons(
+    reasons: Sequence[ComparabilityReason],
+) -> list[ComparabilityReason]:
+    return list(dict.fromkeys(reasons))
+
+
+def _trial_structural_reasons(
+    trial: TrialResult,
+    reference: TrialResult,
+) -> list[ComparabilityReason]:
+    reasons: list[ComparabilityReason] = []
+    if (
+        trial.case_id != reference.case_id
+        or trial.comparison_basis_fingerprint
+        != reference.comparison_basis_fingerprint
+        or trial.comparison_basis_fingerprint is None
+    ):
+        reasons.append(ComparabilityReason.COMPARISON_BASIS_MISMATCH)
+    identity = trial.trial_identity
+    reference_identity = reference.trial_identity
+    if identity is None or reference_identity is None:
+        reasons.append(ComparabilityReason.TRIAL_IDENTITY_UNAVAILABLE)
+        return _unique_reasons(reasons)
+    if identity.suite_sha256 != reference_identity.suite_sha256:
+        reasons.append(ComparabilityReason.SUITE_FINGERPRINT_MISMATCH)
+    if identity.subject_commit != reference_identity.subject_commit:
+        reasons.append(ComparabilityReason.SUBJECT_COMMIT_MISMATCH)
+    if (
+        identity.subject_fingerprint_sha256
+        != reference_identity.subject_fingerprint_sha256
+    ):
+        reasons.append(ComparabilityReason.SUBJECT_FINGERPRINT_MISMATCH)
+    if identity.model_identifier != reference_identity.model_identifier:
+        reasons.append(ComparabilityReason.MODEL_IDENTIFIER_MISMATCH)
+    return _unique_reasons(reasons)
+
+
+def _trial_token_reasons(
+    trial: TrialResult,
+    reference: TrialResult,
+) -> list[ComparabilityReason]:
+    if _trial_structural_reasons(trial, reference):
+        return [ComparabilityReason.STRUCTURAL_INCOMPARABILITY]
+    current = trial.token_diagnostics
+    baseline = reference.token_diagnostics
+    reasons: list[ComparabilityReason] = []
+    if (
+        current is None
+        or baseline is None
+        or current.total_tokens is None
+        or baseline.total_tokens is None
+    ):
+        reasons.append(ComparabilityReason.TOKEN_DATA_UNAVAILABLE)
+    if current is not None and baseline is not None:
+        if current.source is not baseline.source:
+            reasons.append(ComparabilityReason.TOKEN_SOURCE_MISMATCH)
+        elif not _comparable_token_source(current.source):
+            reasons.append(ComparabilityReason.TOKEN_SOURCE_UNSUPPORTED)
+        if current.scope is not baseline.scope:
+            reasons.append(ComparabilityReason.TOKEN_SCOPE_MISMATCH)
+        if current.model_call_count is None or baseline.model_call_count is None:
+            reasons.append(
+                ComparabilityReason.TOKEN_MODEL_CALL_COUNT_UNAVAILABLE
+            )
+        elif current.model_call_count != baseline.model_call_count:
+            reasons.append(ComparabilityReason.TOKEN_MODEL_CALL_COUNT_MISMATCH)
+    return _unique_reasons(reasons)
 
 
 def apply_token_savings(
@@ -379,56 +466,11 @@ def apply_token_savings(
                 trial.trial_number,
             )
         )
-        current_tokens = trial.token_diagnostics
-        reference_tokens = None if reference is None else reference.token_diagnostics
-        comparable = all(
-            (
-                reference is not None,
-                current_tokens is not None,
-                reference_tokens is not None,
-                trial.runtime is not None,
-                reference is not None and reference.runtime is not None,
-                trial.runtime is not None
-                and reference is not None
-                and reference.runtime is not None
-                and trial.runtime.subject_model is not None
-                and trial.runtime.subject_model == reference.runtime.subject_model,
-                trial.comparison_basis_fingerprint
-                == (
-                    None
-                    if reference is None
-                    else reference.comparison_basis_fingerprint
-                ),
-                trial.trial_identity is not None,
-                reference is not None
-                and reference.trial_identity is not None,
-                trial.trial_identity is not None
-                and reference is not None
-                and reference.trial_identity is not None
-                and trial.trial_identity.suite_sha256
-                == reference.trial_identity.suite_sha256,
-                trial.trial_identity is not None
-                and reference is not None
-                and reference.trial_identity is not None
-                and trial.trial_identity.subject_commit
-                == reference.trial_identity.subject_commit,
-                trial.trial_identity is not None
-                and reference is not None
-                and reference.trial_identity is not None
-                and trial.trial_identity.subject_fingerprint_sha256
-                == reference.trial_identity.subject_fingerprint_sha256,
-                current_tokens is not None
-                and reference_tokens is not None
-                and current_tokens.source is reference_tokens.source
-                and _reliable_token_source(current_tokens.source),
-                current_tokens is not None and current_tokens.total_tokens is not None,
-                reference_tokens is not None
-                and reference_tokens.total_tokens is not None,
-            )
-        )
-        if not comparable:
+        if reference is None or _trial_token_reasons(trial, reference):
             updated.append(trial)
             continue
+        current_tokens = trial.token_diagnostics
+        reference_tokens = reference.token_diagnostics
         assert current_tokens is not None
         assert reference_tokens is not None
         assert current_tokens.total_tokens is not None
@@ -473,26 +515,23 @@ def _variant_result(
             "Ablation Variant has inconsistent configuration fingerprints",
             variant_id=variant.variant_id,
         )
-    models = {
-        item.runtime.subject_model
+    model_identifiers = {
+        item.trial_identity.model_identifier
         for item in trials
-        if item.runtime is not None and item.runtime.subject_model is not None
+        if item.trial_identity is not None
     }
-    subject_model = next(iter(models)) if len(models) == 1 else None
+    if len(model_identifiers) != 1:
+        raise AblationComparisonError(
+            "Ablation Variant has inconsistent effective model identifiers",
+            variant_id=variant.variant_id,
+        )
     retrieval_values = [
         float(item.retrieval_gate_passed is True)
         for item in trials
         if item.retrieval_gate_passed is not None
     ]
-    answer_values = [
-        float(metric.value)
-        for item in trials
-        for metric in item.metrics
-        if metric.metric_name == "answer_quality"
-        and metric.source is MetricSource.JUDGE
-        and metric.status is MetricStatus.COMPLETED
-        and type(metric.value) in (int, float)
-    ]
+    judge_results = [item.judge_result for item in trials if item.judge_result is not None]
+    answer_values = [float(item.overall_score) for item in judge_results]
     fact_required = sum(
         item.required_fact_loss.required_fact_count or 0
         for item in trials
@@ -506,32 +545,53 @@ def _variant_result(
         and item.required_fact_loss.status is DiagnosticStatus.AVAILABLE
     )
     token_records = [item.token_diagnostics for item in trials]
-    token_sources = {
-        item.source for item in token_records if item is not None
-    }
+    token_sources = {item.source for item in token_records if item is not None}
+    token_scopes = {item.scope for item in token_records if item is not None}
     token_source = (
         next(iter(token_sources))
         if len(token_sources) == 1
         else TokenCountSource.UNAVAILABLE
     )
+    token_scope = next(iter(token_scopes)) if len(token_scopes) == 1 else None
     total_tokens = (
         sum(item.total_tokens for item in token_records if item is not None)
         if len(token_records) == len(trials)
         and all(item is not None and item.total_tokens is not None for item in token_records)
         else None
     )
+    model_call_count = (
+        sum(item.model_call_count for item in token_records if item is not None)
+        if len(token_records) == len(trials)
+        and all(
+            item is not None and item.model_call_count is not None
+            for item in token_records
+        )
+        else None
+    )
+    duration_ms = (
+        sum(item.duration_ms for item in trials if item.duration_ms is not None)
+        if all(item.duration_ms is not None for item in trials)
+        else None
+    )
     return AblationVariantResult(
         variant_id=variant.variant_id,
         memory_mode=variant.memory_mode,
-        compression_mode=variant.compression_mode,
+        requested_compression_mode=variant.compression_mode,
         trial_ids=[item.trial_id for item in trials],
         configuration_sha256=next(iter(configuration_values)),
-        subject_model=subject_model,
+        model_identifier=next(iter(model_identifiers)),
         task_success_rate=float(
             sum(item.task_passed is True for item in trials) / len(trials)
         ),
         retrieval_success_rate=_mean(retrieval_values),
         answer_quality_mean=_mean(answer_values),
+        judge_completed_trial_count=len(judge_results),
+        judge_prompt_versions=list(
+            dict.fromkeys(item.prompt_version for item in judge_results)
+        ),
+        judge_model_identifiers=list(
+            dict.fromkeys(item.judge_model for item in judge_results)
+        ),
         required_fact_loss_rate=(
             None if fact_required == 0 else float(fact_lost / fact_required)
         ),
@@ -541,9 +601,113 @@ def _variant_result(
             for result in item.distortion_results
         ),
         total_tokens=total_tokens,
-        duration_ms=sum(item.duration_ms or 0 for item in trials),
+        duration_ms=duration_ms,
         token_source=token_source,
+        token_scope=token_scope,
+        model_call_count=model_call_count,
     )
+
+
+def _assessment(
+    reasons: Sequence[ComparabilityReason],
+) -> ComparabilityAssessment:
+    normalized = _unique_reasons(reasons)
+    return ComparabilityAssessment(
+        status=(
+            ComparabilityStatus.COMPARABLE
+            if not normalized
+            else ComparabilityStatus.NOT_COMPARABLE
+        ),
+        reasons=normalized,
+    )
+
+
+def _structural_reasons(
+    trials: Sequence[TrialResult],
+) -> list[ComparabilityReason]:
+    reasons: list[ComparabilityReason] = []
+    basis_values = {item.comparison_basis_fingerprint for item in trials}
+    if len(basis_values) != 1 or None in basis_values:
+        reasons.append(ComparabilityReason.COMPARISON_BASIS_MISMATCH)
+    identities = [item.trial_identity for item in trials]
+    if any(item is None for item in identities):
+        reasons.append(ComparabilityReason.TRIAL_IDENTITY_UNAVAILABLE)
+        return _unique_reasons(reasons)
+    concrete = [item for item in identities if item is not None]
+    if len({item.suite_sha256 for item in concrete}) != 1:
+        reasons.append(ComparabilityReason.SUITE_FINGERPRINT_MISMATCH)
+    if len({item.subject_commit for item in concrete}) != 1:
+        reasons.append(ComparabilityReason.SUBJECT_COMMIT_MISMATCH)
+    if len({item.subject_fingerprint_sha256 for item in concrete}) != 1:
+        reasons.append(ComparabilityReason.SUBJECT_FINGERPRINT_MISMATCH)
+    if len({item.model_identifier for item in concrete}) != 1:
+        reasons.append(ComparabilityReason.MODEL_IDENTIFIER_MISMATCH)
+    return _unique_reasons(reasons)
+
+
+def _token_reasons(
+    trials: Sequence[TrialResult],
+    *,
+    structural_comparable: bool,
+) -> list[ComparabilityReason]:
+    if not structural_comparable:
+        return [ComparabilityReason.STRUCTURAL_INCOMPARABILITY]
+    diagnostics = [item.token_diagnostics for item in trials]
+    reasons: list[ComparabilityReason] = []
+    if any(item is None or item.total_tokens is None for item in diagnostics):
+        return [ComparabilityReason.TOKEN_DATA_UNAVAILABLE]
+    concrete = [item for item in diagnostics if item is not None]
+    sources = {item.source for item in concrete}
+    if len(sources) != 1:
+        reasons.append(ComparabilityReason.TOKEN_SOURCE_MISMATCH)
+    elif not sources or not _comparable_token_source(next(iter(sources))):
+        reasons.append(ComparabilityReason.TOKEN_SOURCE_UNSUPPORTED)
+    if len({item.scope for item in concrete}) != 1:
+        reasons.append(ComparabilityReason.TOKEN_SCOPE_MISMATCH)
+    call_counts = [item.model_call_count for item in concrete]
+    if len(concrete) != len(trials) or any(item is None for item in call_counts):
+        reasons.append(ComparabilityReason.TOKEN_MODEL_CALL_COUNT_UNAVAILABLE)
+    elif len(set(call_counts)) != 1:
+        reasons.append(ComparabilityReason.TOKEN_MODEL_CALL_COUNT_MISMATCH)
+    return _unique_reasons(reasons)
+
+
+def _answer_quality_reasons(
+    variants: Sequence[AblationVariantResult],
+    *,
+    structural_comparable: bool,
+) -> list[ComparabilityReason]:
+    if not structural_comparable:
+        return [ComparabilityReason.STRUCTURAL_INCOMPARABILITY]
+    reasons: list[ComparabilityReason] = []
+    if any(
+        item.judge_completed_trial_count != len(item.trial_ids)
+        for item in variants
+    ):
+        return [ComparabilityReason.JUDGE_RESULT_UNAVAILABLE]
+    prompt_versions = {
+        version for item in variants for version in item.judge_prompt_versions
+    }
+    if len(prompt_versions) != 1:
+        reasons.append(ComparabilityReason.JUDGE_PROMPT_VERSION_MISMATCH)
+    model_identifiers = {
+        model for item in variants for model in item.judge_model_identifiers
+    }
+    if len(model_identifiers) != 1:
+        reasons.append(ComparabilityReason.JUDGE_MODEL_IDENTIFIER_MISMATCH)
+    return _unique_reasons(reasons)
+
+
+def _duration_reasons(
+    variants: Sequence[AblationVariantResult],
+    *,
+    structural_comparable: bool,
+) -> list[ComparabilityReason]:
+    if not structural_comparable:
+        return [ComparabilityReason.STRUCTURAL_INCOMPARABILITY]
+    if any(item.duration_ms is None for item in variants):
+        return [ComparabilityReason.DURATION_DATA_UNAVAILABLE]
+    return []
 
 
 def build_ablation_comparisons(
@@ -569,50 +733,42 @@ def build_ablation_comparisons(
         ]
         by_id = {item.variant_id: item for item in variant_results}
         reference = by_id[plan.reference_variant_id]
-        reasons: list[str] = []
-        if any(item.subject_model is None for item in variant_results):
-            reasons.append("subject_model_unavailable")
-        elif len({item.subject_model for item in variant_results}) != 1:
-            reasons.append("subject_model_mismatch")
-        basis_values = {
-            item.comparison_basis_fingerprint for item in case_trials
-        }
-        if len(basis_values) != 1 or None in basis_values:
-            reasons.append("comparison_basis_mismatch")
-        identity_values = [
-            item.trial_identity for item in case_trials
-        ]
-        if any(item is None for item in identity_values):
-            reasons.append("trial_identity_unavailable")
-        else:
-            if len({item.suite_sha256 for item in identity_values}) != 1:
-                reasons.append("suite_fingerprint_mismatch")
-            if len({item.subject_commit for item in identity_values}) != 1:
-                reasons.append("subject_commit_mismatch")
-            if len(
-                {item.subject_fingerprint_sha256 for item in identity_values}
-            ) != 1:
-                reasons.append("subject_fingerprint_mismatch")
-        if any(item.total_tokens is None for item in variant_results):
-            reasons.append("token_data_unavailable")
-        if len({item.token_source for item in variant_results}) != 1:
-            reasons.append("token_source_mismatch")
-        elif not _reliable_token_source(variant_results[0].token_source):
-            reasons.append("token_source_not_reliable")
-        reasons = list(dict.fromkeys(reasons))
-        token_comparable = not reasons
-        structural_reasons = {
-            "subject_model_unavailable",
-            "subject_model_mismatch",
-            "comparison_basis_mismatch",
-            "trial_identity_unavailable",
-            "suite_fingerprint_mismatch",
-            "subject_commit_mismatch",
-            "subject_fingerprint_mismatch",
-        }
-        structurally_comparable = not (set(reasons) & structural_reasons)
+        structural_reasons = _structural_reasons(case_trials)
+        structural_comparable = not structural_reasons
+        token_reasons = _token_reasons(
+            case_trials,
+            structural_comparable=structural_comparable,
+        )
+        answer_reasons = _answer_quality_reasons(
+            variant_results,
+            structural_comparable=structural_comparable,
+        )
+        duration_reasons = _duration_reasons(
+            variant_results,
+            structural_comparable=structural_comparable,
+        )
+        token_comparable = not token_reasons
+        answer_comparable = not answer_reasons
+        duration_comparable = not duration_reasons
         deltas: list[AblationMetricDelta] = []
         for item in variant_results:
+            if not structural_comparable:
+                deltas.append(AblationMetricDelta(variant_id=item.variant_id))
+                continue
+            token_delta = (
+                item.total_tokens - reference.total_tokens
+                if token_comparable
+                and item.total_tokens is not None
+                and reference.total_tokens is not None
+                else None
+            )
+            token_savings = None if token_delta is None else -token_delta
+            token_savings_rate = (
+                None
+                if token_savings is None
+                or reference.total_tokens in (None, 0)
+                else float(token_savings / reference.total_tokens)
+            )
             deltas.append(
                 AblationMetricDelta(
                     variant_id=item.variant_id,
@@ -628,7 +784,8 @@ def build_ablation_comparisons(
                     ),
                     answer_quality_delta=(
                         None
-                        if item.answer_quality_mean is None
+                        if not answer_comparable
+                        or item.answer_quality_mean is None
                         or reference.answer_quality_mean is None
                         else float(
                             item.answer_quality_mean
@@ -647,17 +804,15 @@ def build_ablation_comparisons(
                     distortion_count_delta=(
                         item.distortion_count - reference.distortion_count
                     ),
-                    token_delta=(
-                        None
-                        if not token_comparable
-                        or item.total_tokens is None
-                        or reference.total_tokens is None
-                        else item.total_tokens - reference.total_tokens
-                    ),
+                    token_delta=token_delta,
+                    token_savings=token_savings,
+                    token_savings_rate=token_savings_rate,
                     duration_delta_ms=(
-                        None
-                        if not structurally_comparable
-                        else item.duration_ms - reference.duration_ms
+                        item.duration_ms - reference.duration_ms
+                        if duration_comparable
+                        and item.duration_ms is not None
+                        and reference.duration_ms is not None
+                        else None
                     ),
                 )
             )
@@ -666,12 +821,10 @@ def build_ablation_comparisons(
                 case_id=case.case_id,
                 reference_variant_id=plan.reference_variant_id,
                 variant_results=variant_results,
-                comparability=(
-                    ComparabilityStatus.COMPARABLE
-                    if token_comparable
-                    else ComparabilityStatus.NOT_COMPARABLE
-                ),
-                comparability_reasons=reasons,
+                structural_comparability=_assessment(structural_reasons),
+                token_comparability=_assessment(token_reasons),
+                answer_quality_comparability=_assessment(answer_reasons),
+                duration_comparability=_assessment(duration_reasons),
                 metric_deltas=deltas,
             )
         )
@@ -686,7 +839,6 @@ __all__ = (
     "build_trial_identity",
     "comparison_basis_fingerprint",
     "configuration_fingerprint",
-    "configured_model_identifier",
     "duration_diagnostics",
     "effective_config_overrides",
     "effective_subject_configuration",

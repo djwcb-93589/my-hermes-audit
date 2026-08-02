@@ -1,7 +1,7 @@
 schema_version: "1.0"
 suite_id: memory-compression-ablation-v1
-name: P4 synthetic Memory and Subject-native Compression ablation
-description: Explicit serial Variants for Memory boundaries, Compression retention, and combined behavior.
+name: P4 synthetic Memory and Compression-threshold ablation
+description: Explicit serial Variants for Memory boundaries and public threshold-control semantics without claiming a Compression event occurred.
 tags: [memory, compression, ablation, p4, synthetic]
 defaults:
   trials: 1
@@ -38,7 +38,7 @@ cases:
       required_facts:
         - expectation_id: boundary-short-retained
           required: true
-          applicable_variant_ids: [short-disabled, combined-disabled]
+          applicable_variant_ids: [short-threshold-disabled, combined-threshold-disabled]
           facts:
             - fact_id: short-marker-retained
               canonical_value: COBALT-17
@@ -48,7 +48,7 @@ cases:
               checkpoint_id: same-session-checkpoint
         - expectation_id: boundary-short-absent
           required: true
-          applicable_variant_ids: [no-memory-disabled, long-disabled]
+          applicable_variant_ids: [no-memory-threshold-disabled, long-threshold-disabled]
           facts:
             - fact_id: short-marker-absent
               canonical_value: COBALT-17
@@ -59,7 +59,7 @@ cases:
               must_be_absent: true
         - expectation_id: boundary-long-retained
           required: true
-          applicable_variant_ids: [long-disabled, combined-disabled]
+          applicable_variant_ids: [long-threshold-disabled, combined-threshold-disabled]
           facts:
             - fact_id: long-preference-retained
               canonical_value: LYRA-9
@@ -68,7 +68,7 @@ cases:
               scope: final_answer
         - expectation_id: boundary-long-absent
           required: true
-          applicable_variant_ids: [no-memory-disabled, short-disabled]
+          applicable_variant_ids: [no-memory-threshold-disabled, short-threshold-disabled]
           facts:
             - fact_id: long-preference-absent
               canonical_value: LYRA-9
@@ -86,25 +86,25 @@ cases:
               scope: final_answer
               must_be_absent: true
     ablation:
-      reference_variant_id: no-memory-disabled
+      reference_variant_id: no-memory-threshold-disabled
       maximum_turns: 3
-      maximum_compression_events: 0
+      maximum_compression_events: 8
       variants:
-        - variant_id: no-memory-disabled
+        - variant_id: no-memory-threshold-disabled
           memory_mode: no_memory
-          compression_mode: disabled
+          compression_mode: threshold_disabled
           config_overrides: {}
-        - variant_id: short-disabled
+        - variant_id: short-threshold-disabled
           memory_mode: short_term_only
-          compression_mode: disabled
+          compression_mode: threshold_disabled
           config_overrides: {}
-        - variant_id: long-disabled
+        - variant_id: long-threshold-disabled
           memory_mode: long_term_only
-          compression_mode: disabled
+          compression_mode: threshold_disabled
           config_overrides: {}
-        - variant_id: combined-disabled
+        - variant_id: combined-threshold-disabled
           memory_mode: short_and_long_term
-          compression_mode: disabled
+          compression_mode: threshold_disabled
           config_overrides: {}
       checkpoints:
         - checkpoint_id: same-session-checkpoint
@@ -113,108 +113,6 @@ cases:
           required: true
     evaluators:
       - evaluator_id: boundary-facts
-        kind: compression
-        required: true
-
-  - case_id: compression-fact-retention
-    name: Preserve deterministic facts across Subject-native Compression
-    description: Capability-negative on Subjects without public Compression observation.
-    tags: [capability-negative-compression-observation]
-    metadata:
-      capability_negative: compression_observation
-    mode: scripted_multi_turn
-    input:
-      turns:
-        - role: user
-          session_id: compression-a
-          message: Synthetic quota is 37 units. Reply ACK-1.
-        - role: user
-          session_id: compression-a
-          message: Synthetic event ALPHA occurs before synthetic event BETA. Reply ACK-2.
-        - role: user
-          session_id: compression-a
-          message: Add harmless synthetic filler about red, green, blue, and amber labels. Reply ACK-3.
-        - role: user
-          session_id: compression-a
-          message: Add harmless synthetic filler about north, south, east, and west zones. Reply ACK-4.
-        - role: user
-          session_id: compression-a
-          message: Report the quota and the declared event order using only the earlier facts.
-    execution:
-      enabled_toolsets: []
-      memory_strategy: disabled
-    expected:
-      required_facts:
-        - expectation_id: compression-disabled-baseline
-          required: true
-          distortion_hard_gate: true
-          applicable_variant_ids: [short-compression-disabled]
-          facts:
-            - fact_id: quota-disabled
-              canonical_value: 37 units
-              accepted_variants: [quota is 37]
-              match: contains
-              scope: subject_context
-              checkpoint_id: compression-checkpoint
-              distortion_candidates:
-                - value: 73 units
-                  distortion_type: value_changed
-            - fact_id: order-disabled
-              canonical_value: ALPHA occurs before synthetic event BETA
-              accepted_variants: [ALPHA before BETA]
-              match: contains
-              scope: subject_context
-              checkpoint_id: compression-checkpoint
-              distortion_candidates:
-                - value: BETA before ALPHA
-                  distortion_type: temporal_order_changed
-        - expectation_id: compression-enabled-survival
-          required: true
-          distortion_hard_gate: true
-          applicable_variant_ids: [short-compression-enabled]
-          facts:
-            - fact_id: quota-enabled
-              canonical_value: 37 units
-              accepted_variants: [quota is 37]
-              match: contains
-              scope: subject_context
-              checkpoint_id: compression-checkpoint
-              must_survive_compression: true
-              distortion_candidates:
-                - value: 73 units
-                  distortion_type: value_changed
-            - fact_id: order-enabled
-              canonical_value: ALPHA occurs before synthetic event BETA
-              accepted_variants: [ALPHA before BETA]
-              match: contains
-              scope: subject_context
-              checkpoint_id: compression-checkpoint
-              must_survive_compression: true
-              distortion_candidates:
-                - value: BETA before ALPHA
-                  distortion_type: temporal_order_changed
-    ablation:
-      reference_variant_id: short-compression-disabled
-      maximum_turns: 5
-      maximum_compression_events: 8
-      variants:
-        - variant_id: short-compression-disabled
-          memory_mode: short_term_only
-          compression_mode: disabled
-          config_overrides: {}
-        - variant_id: short-compression-enabled
-          memory_mode: short_term_only
-          compression_mode: enabled
-          config_overrides:
-            compression:
-              threshold: 64
-      checkpoints:
-        - checkpoint_id: compression-checkpoint
-          after_turn: 5
-          required_fact_ids: [quota-disabled, order-disabled, quota-enabled, order-enabled]
-          required: true
-    evaluators:
-      - evaluator_id: compression-retention
         kind: compression
         required: true
 
@@ -279,17 +177,17 @@ cases:
                 - value: AMBER-11
                   distortion_type: value_changed
     ablation:
-      reference_variant_id: combined-compression-disabled
+      reference_variant_id: combined-threshold-disabled
       maximum_turns: 4
       maximum_compression_events: 8
       variants:
-        - variant_id: combined-compression-disabled
+        - variant_id: combined-threshold-disabled
           memory_mode: short_and_long_term
-          compression_mode: disabled
+          compression_mode: threshold_disabled
           config_overrides: {}
-        - variant_id: combined-compression-enabled
+        - variant_id: combined-threshold-enabled
           memory_mode: short_and_long_term
-          compression_mode: enabled
+          compression_mode: threshold_enabled
           config_overrides:
             compression:
               threshold: 96

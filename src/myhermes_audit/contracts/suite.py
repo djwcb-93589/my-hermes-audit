@@ -26,7 +26,6 @@ from myhermes_audit.contracts.background_review import (
 )
 from myhermes_audit.contracts.ablation import (
     AblationPlan,
-    CompressionMode,
     MemoryMode,
     RequiredFactExpectation,
     RequiredFactScope,
@@ -665,17 +664,6 @@ class AuditCase(ContractModel):
                     raise ValueError(
                         "long_term_memory facts require an applicable long-term "
                         "Memory variant"
-                    )
-                if any(
-                    fact.must_survive_compression
-                    for fact in expectation.facts
-                ) and not any(
-                    item.compression_mode is CompressionMode.ENABLED
-                    for item in applicable
-                ):
-                    raise ValueError(
-                        "compression-survival facts require an applicable "
-                        "compression_enabled variant"
                     )
         fixture_ids = {
             item.memory_id

@@ -29,7 +29,7 @@ from myhermes_audit.contracts.memory import RetrievalStrategy
 from myhermes_audit.serialization import canonical_sha256
 
 
-DISABLED_COMPRESSION_THRESHOLD = 2_147_483_647
+THRESHOLD_DISABLED_COMPRESSION_THRESHOLD = 2_147_483_647
 _ALLOWED_COMPRESSION_OVERRIDE_KEYS = frozenset(
     {
         "threshold",
@@ -48,8 +48,8 @@ class MemoryMode(str, Enum):
 
 
 class CompressionMode(str, Enum):
-    DISABLED = "disabled"
-    ENABLED = "enabled"
+    THRESHOLD_DISABLED = "threshold_disabled"
+    THRESHOLD_ENABLED = "threshold_enabled"
 
 
 class FactMatchMode(str, Enum):
@@ -98,6 +98,10 @@ class TokenCountSource(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class TokenCountScope(str, Enum):
+    SUBJECT_TRIAL_MODEL_CALLS = "subject_trial_model_calls"
+
+
 class DurationSource(str, Enum):
     AUDIT_MEASURED = "audit_measured"
     SUBJECT_REPORTED = "subject_reported"
@@ -111,8 +115,23 @@ class SessionContextMode(str, Enum):
 
 class CompressionControl(str, Enum):
     THRESHOLD_CONFIGURATION = "threshold_configuration"
-    PUBLIC_TOGGLE = "public_toggle"
     UNAVAILABLE = "unavailable"
+
+
+class EffectiveCompressionSemantics(str, Enum):
+    THRESHOLD_TRIGGER_DISABLED = (
+        "threshold_trigger_disabled_emergency_overflow_possible"
+    )
+    THRESHOLD_TRIGGER_ENABLED = (
+        "threshold_trigger_enabled_emergency_overflow_possible"
+    )
+
+
+class ModelIdentifierSource(str, Enum):
+    CASE_ENVIRONMENT_OVERRIDE = "case_environment_override"
+    PARENT_ENVIRONMENT = "parent_environment"
+    SUBJECT_CONFIGURATION = "subject_configuration"
+    SUBJECT_DEFAULT = "subject_default"
 
 
 class CompressionEventStatus(str, Enum):
@@ -124,6 +143,26 @@ class CompressionEventStatus(str, Enum):
 class ComparabilityStatus(str, Enum):
     COMPARABLE = "comparable"
     NOT_COMPARABLE = "not_comparable"
+
+
+class ComparabilityReason(str, Enum):
+    STRUCTURAL_INCOMPARABILITY = "structural_incomparability"
+    MODEL_IDENTIFIER_MISMATCH = "model_identifier_mismatch"
+    COMPARISON_BASIS_MISMATCH = "comparison_basis_mismatch"
+    TRIAL_IDENTITY_UNAVAILABLE = "trial_identity_unavailable"
+    SUITE_FINGERPRINT_MISMATCH = "suite_fingerprint_mismatch"
+    SUBJECT_COMMIT_MISMATCH = "subject_commit_mismatch"
+    SUBJECT_FINGERPRINT_MISMATCH = "subject_fingerprint_mismatch"
+    TOKEN_DATA_UNAVAILABLE = "token_data_unavailable"
+    TOKEN_SOURCE_MISMATCH = "token_source_mismatch"
+    TOKEN_SOURCE_UNSUPPORTED = "token_source_unsupported"
+    TOKEN_SCOPE_MISMATCH = "token_scope_mismatch"
+    TOKEN_MODEL_CALL_COUNT_UNAVAILABLE = "token_model_call_count_unavailable"
+    TOKEN_MODEL_CALL_COUNT_MISMATCH = "token_model_call_count_mismatch"
+    JUDGE_RESULT_UNAVAILABLE = "judge_result_unavailable"
+    JUDGE_PROMPT_VERSION_MISMATCH = "judge_prompt_version_mismatch"
+    JUDGE_MODEL_IDENTIFIER_MISMATCH = "judge_model_identifier_mismatch"
+    DURATION_DATA_UNAVAILABLE = "duration_data_unavailable"
 
 
 class DistortionCandidate(ContractModel):
@@ -249,17 +288,17 @@ class AblationVariant(ContractModel):
     def validate_variant(self) -> "AblationVariant":
         compression = _compression_overrides(self.config_overrides)
         threshold = compression.get("threshold")
-        if self.compression_mode is CompressionMode.ENABLED:
+        if self.compression_mode is CompressionMode.THRESHOLD_ENABLED:
             if threshold is None:
                 raise ValueError(
-                    "compression_enabled variants must explicitly set "
+                    "threshold_enabled variants must explicitly set "
                     "config_overrides.compression.threshold"
                 )
-            if threshold >= DISABLED_COMPRESSION_THRESHOLD:
-                raise ValueError("enabled compression threshold is not actionable")
-        elif threshold not in (None, DISABLED_COMPRESSION_THRESHOLD):
+            if threshold >= THRESHOLD_DISABLED_COMPRESSION_THRESHOLD:
+                raise ValueError("threshold_enabled Compression value is not actionable")
+        elif threshold not in (None, THRESHOLD_DISABLED_COMPRESSION_THRESHOLD):
             raise ValueError(
-                "compression_disabled uses the framework's fixed public threshold"
+                "threshold_disabled uses the framework's fixed public threshold"
             )
         return self
 
@@ -268,8 +307,8 @@ def _normalized_variant_overrides(item: AblationVariant) -> JsonObject:
     compression = dict(_compression_overrides(item.config_overrides))
     compression["threshold"] = (
         compression["threshold"]
-        if item.compression_mode is CompressionMode.ENABLED
-        else DISABLED_COMPRESSION_THRESHOLD
+        if item.compression_mode is CompressionMode.THRESHOLD_ENABLED
+        else THRESHOLD_DISABLED_COMPRESSION_THRESHOLD
     )
     return {"compression": compression}
 
@@ -279,6 +318,8 @@ class AblationPlan(ContractModel):
     reference_variant_id: Identifier
     maximum_turns: PositiveInt
     maximum_compression_events: NonNegativeInt
+    minimum_compression_events: NonNegativeInt = 0
+    require_emergency_compression_disable: StrictBool = False
     checkpoints: list[LongConversationCheckpoint] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -303,12 +344,17 @@ class AblationPlan(ContractModel):
             raise ValueError("checkpoint_id must be unique within an AblationPlan")
         if any(item.after_turn > self.maximum_turns for item in self.checkpoints):
             raise ValueError("checkpoint after_turn cannot exceed maximum_turns")
+        if self.minimum_compression_events > self.maximum_compression_events:
+            raise ValueError(
+                "minimum_compression_events cannot exceed maximum_compression_events"
+            )
         return self
 
 
 class EffectiveSubjectConfiguration(ContractModel):
     memory_mode: MemoryMode
-    compression_mode: CompressionMode
+    requested_compression_mode: CompressionMode
+    effective_compression_semantics: EffectiveCompressionSemantics
     session_context_mode: SessionContextMode
     include_memory: StrictBool
     include_user_profile: StrictBool
@@ -316,9 +362,16 @@ class EffectiveSubjectConfiguration(ContractModel):
     memory_strategy: RetrievalStrategy | None = None
     compression_control: CompressionControl
     compression_threshold: PositiveInt | None = None
-    compression_observation_available: StrictBool = False
+    compression_threshold_control: StrictBool
+    emergency_overflow_compression_disable_supported: StrictBool
+    emergency_compression_possible: StrictBool
+    compression_events_observable: StrictBool
     maximum_turns: PositiveInt
     maximum_compression_events: NonNegativeInt
+    minimum_compression_events: NonNegativeInt = 0
+    require_emergency_compression_disable: StrictBool = False
+    model_identifier: NonEmptyText
+    model_identifier_source: ModelIdentifierSource
     public_config_overrides: JsonObject = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -344,11 +397,42 @@ class EffectiveSubjectConfiguration(ContractModel):
         )
         if self.session_context_mode is not expected_session_mode:
             raise ValueError("session context projection must match memory_mode")
-        if self.compression_control is CompressionControl.UNAVAILABLE:
-            if self.compression_threshold is not None:
-                raise ValueError("unavailable compression cannot name a threshold")
-        elif self.compression_threshold is None:
-            raise ValueError("configured compression requires a threshold")
+        if not self.compression_threshold_control:
+            raise ValueError("P4 configuration requires public threshold control")
+        if self.compression_control is not CompressionControl.THRESHOLD_CONFIGURATION:
+            raise ValueError("P4 Compression control must be threshold configuration")
+        if self.compression_threshold is None:
+            raise ValueError("configured Compression requires a threshold")
+        expected_semantics = (
+            EffectiveCompressionSemantics.THRESHOLD_TRIGGER_ENABLED
+            if self.requested_compression_mode
+            is CompressionMode.THRESHOLD_ENABLED
+            else EffectiveCompressionSemantics.THRESHOLD_TRIGGER_DISABLED
+        )
+        if self.effective_compression_semantics is not expected_semantics:
+            raise ValueError("effective Compression semantics must match requested mode")
+        if (
+            self.require_emergency_compression_disable
+            and not self.emergency_overflow_compression_disable_supported
+        ):
+            raise ValueError(
+                "required emergency Compression disable must be publicly supported"
+            )
+        if self.require_emergency_compression_disable:
+            if self.emergency_compression_possible:
+                raise ValueError("disabled emergency Compression cannot remain possible")
+        elif not self.emergency_compression_possible:
+            raise ValueError(
+                "threshold control alone cannot disable emergency Compression"
+            )
+        if self.minimum_compression_events > self.maximum_compression_events:
+            raise ValueError(
+                "minimum Compression events cannot exceed the maximum"
+            )
+        if self.minimum_compression_events and not self.compression_events_observable:
+            raise ValueError(
+                "minimum Compression events require public event observation"
+            )
         _compression_overrides(self.public_config_overrides)
         return self
 
@@ -587,6 +671,8 @@ class CheckpointResult(ContractModel):
 class TokenDiagnostics(ContractModel):
     status: DiagnosticStatus
     source: TokenCountSource
+    scope: TokenCountScope = TokenCountScope.SUBJECT_TRIAL_MODEL_CALLS
+    model_call_count: NonNegativeInt | None = None
     input_tokens: NonNegativeInt | None = None
     output_tokens: NonNegativeInt | None = None
     total_tokens: NonNegativeInt | None = None
@@ -619,6 +705,10 @@ class TokenDiagnostics(ContractModel):
             self.token_savings_rate
         ):
             raise ValueError("token_savings_rate must be finite")
+        if self.token_savings is None and self.token_savings_rate is not None:
+            raise ValueError("token_savings_rate requires token_savings")
+        if self.token_savings is not None and self.total_tokens is None:
+            raise ValueError("token savings require an available total token count")
         return self
 
 
@@ -666,23 +756,54 @@ class DurationDiagnostics(ContractModel):
 class AblationVariantResult(ContractModel):
     variant_id: Identifier
     memory_mode: MemoryMode
-    compression_mode: CompressionMode
+    requested_compression_mode: CompressionMode
     trial_ids: list[Identifier] = Field(min_length=1)
     configuration_sha256: Sha256Digest
-    subject_model: NonEmptyText | None = None
+    model_identifier: NonEmptyText
     task_success_rate: StrictFloat = Field(ge=0, le=1)
     retrieval_success_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
     answer_quality_mean: StrictFloat | None = None
+    judge_completed_trial_count: NonNegativeInt = 0
+    judge_prompt_versions: list[NonEmptyText] = Field(default_factory=list)
+    judge_model_identifiers: list[NonEmptyText] = Field(default_factory=list)
     required_fact_loss_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
     distortion_count: NonNegativeInt
     total_tokens: NonNegativeInt | None = None
-    duration_ms: NonNegativeInt
+    duration_ms: NonNegativeInt | None = None
     token_source: TokenCountSource
+    token_scope: TokenCountScope | None = None
+    model_call_count: NonNegativeInt | None = None
 
     @model_validator(mode="after")
     def validate_variant_result(self) -> "AblationVariantResult":
         if len(self.trial_ids) != len(set(self.trial_ids)):
             raise ValueError("Ablation variant trial_ids must not repeat")
+        if self.judge_completed_trial_count > len(self.trial_ids):
+            raise ValueError("completed Judge count cannot exceed Trial count")
+        if len(self.judge_prompt_versions) != len(set(self.judge_prompt_versions)):
+            raise ValueError("Judge Prompt versions must not repeat")
+        if len(self.judge_model_identifiers) != len(
+            set(self.judge_model_identifiers)
+        ):
+            raise ValueError("Judge model identifiers must not repeat")
+        if self.judge_completed_trial_count == 0:
+            if (
+                self.answer_quality_mean is not None
+                or self.judge_prompt_versions
+                or self.judge_model_identifiers
+            ):
+                raise ValueError("absent Judge results cannot expose Judge values")
+        elif (
+            self.answer_quality_mean is None
+            or not self.judge_prompt_versions
+            or not self.judge_model_identifiers
+        ):
+            raise ValueError("completed Judge results require Judge identities")
+        if self.total_tokens is not None and (
+            self.token_source is TokenCountSource.UNAVAILABLE
+            or self.token_scope is None
+        ):
+            raise ValueError("available tokens require a source and scope")
         return self
 
 
@@ -694,15 +815,41 @@ class AblationMetricDelta(ContractModel):
     required_fact_loss_delta: StrictFloat | None = None
     distortion_count_delta: StrictInt | None = None
     token_delta: StrictInt | None = None
+    token_savings: StrictInt | None = None
+    token_savings_rate: StrictFloat | None = None
     duration_delta_ms: StrictInt | None = None
+
+    @field_validator("token_savings_rate")
+    @classmethod
+    def validate_token_savings_rate(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("token_savings_rate must be finite")
+        return value
+
+
+class ComparabilityAssessment(ContractModel):
+    status: ComparabilityStatus
+    reasons: list[ComparabilityReason] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_assessment(self) -> "ComparabilityAssessment":
+        if len(self.reasons) != len(set(self.reasons)):
+            raise ValueError("comparability reasons must not repeat")
+        if self.status is ComparabilityStatus.COMPARABLE and self.reasons:
+            raise ValueError("comparable dimensions cannot contain reasons")
+        if self.status is ComparabilityStatus.NOT_COMPARABLE and not self.reasons:
+            raise ValueError("not-comparable dimensions require reasons")
+        return self
 
 
 class AblationComparisonResult(ContractModel):
     case_id: Identifier
     reference_variant_id: Identifier
     variant_results: list[AblationVariantResult] = Field(min_length=1)
-    comparability: ComparabilityStatus
-    comparability_reasons: list[Identifier] = Field(default_factory=list)
+    structural_comparability: ComparabilityAssessment
+    token_comparability: ComparabilityAssessment
+    answer_quality_comparability: ComparabilityAssessment
+    duration_comparability: ComparabilityAssessment
     metric_deltas: list[AblationMetricDelta] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -715,16 +862,71 @@ class AblationComparisonResult(ContractModel):
         delta_ids = [item.variant_id for item in self.metric_deltas]
         if len(delta_ids) != len(set(delta_ids)) or set(delta_ids) != set(variant_ids):
             raise ValueError("metric_deltas must cover every variant exactly once")
-        if self.comparability is ComparabilityStatus.COMPARABLE:
-            if self.comparability_reasons:
-                raise ValueError("comparable results cannot contain reasons")
-        elif not self.comparability_reasons:
-            raise ValueError("not-comparable results require reasons")
+        structural = self.structural_comparability.status
+        token = self.token_comparability.status
+        answer = self.answer_quality_comparability.status
+        duration = self.duration_comparability.status
+        reference = next(
+            item
+            for item in self.variant_results
+            if item.variant_id == self.reference_variant_id
+        )
+        for delta in self.metric_deltas:
+            structural_values = (
+                delta.task_success_changed,
+                delta.retrieval_success_changed,
+                delta.required_fact_loss_delta,
+                delta.distortion_count_delta,
+            )
+            if structural is ComparabilityStatus.NOT_COMPARABLE:
+                if any(item is not None for item in structural_values):
+                    raise ValueError(
+                        "structurally incomparable results cannot expose metric deltas"
+                    )
+                if any(
+                    item is not None
+                    for item in (
+                        delta.answer_quality_delta,
+                        delta.token_delta,
+                        delta.token_savings,
+                        delta.token_savings_rate,
+                        delta.duration_delta_ms,
+                    )
+                ):
+                    raise ValueError(
+                        "structural incomparability must suppress every delta"
+                    )
+                continue
+            if delta.task_success_changed is None or delta.distortion_count_delta is None:
+                raise ValueError("structurally comparable results require core deltas")
+            token_values = (delta.token_delta, delta.token_savings)
+            if token is ComparabilityStatus.COMPARABLE:
+                if any(item is None for item in token_values):
+                    raise ValueError("token-comparable results require token deltas")
+                if reference.total_tokens and delta.token_savings_rate is None:
+                    raise ValueError("token-comparable results require a savings rate")
+            elif any(
+                item is not None
+                for item in (*token_values, delta.token_savings_rate)
+            ):
+                raise ValueError("token-incomparable results cannot expose token deltas")
+            if (answer is ComparabilityStatus.COMPARABLE) != (
+                delta.answer_quality_delta is not None
+            ):
+                raise ValueError(
+                    "answer-quality delta must match answer comparability"
+                )
+            if (duration is ComparabilityStatus.COMPARABLE) != (
+                delta.duration_delta_ms is not None
+            ):
+                raise ValueError("duration delta must match duration comparability")
         return self
 
 
 __all__ = (
     "AblationComparisonResult",
+    "ComparabilityAssessment",
+    "ComparabilityReason",
     "AblationMetricDelta",
     "AblationPlan",
     "AblationVariant",
@@ -737,7 +939,7 @@ __all__ = (
     "CompressionMode",
     "ContextDiagnostic",
     "DiagnosticStatus",
-    "DISABLED_COMPRESSION_THRESHOLD",
+    "EffectiveCompressionSemantics",
     "DistortionCandidate",
     "DistortionResult",
     "DistortionType",
@@ -751,12 +953,15 @@ __all__ = (
     "FactRetentionStatus",
     "LongConversationCheckpoint",
     "MemoryMode",
+    "ModelIdentifierSource",
     "RequiredFact",
     "RequiredFactExpectation",
     "RequiredFactLossResult",
     "RequiredFactScope",
     "SessionContextMode",
     "TokenCountSource",
+    "TokenCountScope",
     "TokenDiagnostics",
+    "THRESHOLD_DISABLED_COMPRESSION_THRESHOLD",
     "TrialIdentity",
 )

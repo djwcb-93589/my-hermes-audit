@@ -58,9 +58,13 @@ def publish_replay_observations(
             else "unavailable"
         ),
         "subject_model": (
-            runtime.subject_model
-            if runtime is not None and runtime.subject_model is not None
-            else "unavailable"
+            trial.trial_identity.model_identifier
+            if trial.trial_identity is not None
+            else (
+                runtime.subject_model
+                if runtime is not None and runtime.subject_model is not None
+                else "unavailable"
+            )
         ),
         "judge_model": (
             trial.judge_result.judge_model
@@ -99,13 +103,19 @@ def publish_replay_observations(
             {
                 "variant_id": trial.variant_id,
                 "memory_mode": trial.memory_mode.value,
-                "compression_mode": trial.compression_mode.value,
+                "requested_compression_mode": (
+                    trial.compression_mode.value
+                ),
                 "configuration_fingerprint": trial.configuration_fingerprint,
                 "comparison_basis_fingerprint": (
                     trial.comparison_basis_fingerprint
                 ),
                 "required_fact_gate_passed": trial.required_fact_gate_passed,
-                "compression_event_count": len(trial.compression_events),
+                "compression_event_count": (
+                    len(trial.compression_events)
+                    if trial.effective_subject_configuration.compression_events_observable
+                    else None
+                ),
                 "distortion_count": len(trial.distortion_results),
                 "effective_subject_configuration": (
                     trial.effective_subject_configuration.model_dump(
@@ -380,7 +390,13 @@ def _publish_ablation(root: Any, request: LangfuseTrialRequest) -> None:
         as_type="span",
         input={
             "variant_id": trial.variant_id,
-            "mode": trial.compression_mode.value,
+            "requested_compression_mode": (
+                trial.compression_mode.value
+            ),
+            "effective_compression_semantics": (
+                trial.effective_subject_configuration
+                .effective_compression_semantics.value
+            ),
             "control": (
                 trial.effective_subject_configuration.compression_control.value
             ),
@@ -389,11 +405,19 @@ def _publish_ablation(root: Any, request: LangfuseTrialRequest) -> None:
             ),
         },
         output={
-            "event_count": len(trial.compression_events),
-            "events": [
-                item.model_dump(mode="json", exclude={"schema_version"})
-                for item in trial.compression_events
-            ],
+            "event_count": (
+                len(trial.compression_events)
+                if trial.effective_subject_configuration.compression_events_observable
+                else None
+            ),
+            "events": (
+                [
+                    item.model_dump(mode="json", exclude={"schema_version"})
+                    for item in trial.compression_events
+                ]
+                if trial.effective_subject_configuration.compression_events_observable
+                else None
+            ),
             "context_diagnostics": [
                 item.model_dump(mode="json", exclude={"schema_version"})
                 for item in trial.context_diagnostics
@@ -416,8 +440,18 @@ def _publish_ablation(root: Any, request: LangfuseTrialRequest) -> None:
             ),
         },
         metadata={
-            "compression_observation_available": (
-                trial.effective_subject_configuration.compression_observation_available
+            "compression_threshold_control": (
+                trial.effective_subject_configuration.compression_threshold_control
+            ),
+            "emergency_overflow_compression_disable_supported": (
+                trial.effective_subject_configuration
+                .emergency_overflow_compression_disable_supported
+            ),
+            "emergency_overflow_compression_may_still_occur": (
+                trial.effective_subject_configuration.emergency_compression_possible
+            ),
+            "compression_events_observable": (
+                trial.effective_subject_configuration.compression_events_observable
             ),
             "post_hoc_publication": True,
             "content_uploaded": False,

@@ -98,6 +98,20 @@ class MyHermesConfigBuilder:
         overrides: Mapping[str, Any],
     ) -> PreparedMyHermesConfig:
         prepared = self.prepare(overrides)
+        self.write_prepared(destination, prepared)
+        return prepared
+
+    def write_prepared(
+        self,
+        destination: Path,
+        prepared: PreparedMyHermesConfig,
+    ) -> None:
+        """Publish the exact prepared document already used for identity resolution."""
+
+        if not isinstance(prepared, PreparedMyHermesConfig):
+            raise ConfigBuildError("prepared config has an invalid type")
+        _validate_plain_config_value(prepared.document, path="<root>")
+        _reject_literal_secrets(prepared.document, path="<root>")
         target = Path(destination)
         if target.is_symlink() or target.parent.is_symlink():
             raise ConfigBuildError("generated config path must not be a symlink")
@@ -126,7 +140,6 @@ class MyHermesConfigBuilder:
                 except OSError:
                     pass
             raise ConfigBuildError("cannot publish generated MyHermes config") from exc
-        return prepared
 
 
 def _validate_plain_config_value(value: object, *, path: str) -> None:

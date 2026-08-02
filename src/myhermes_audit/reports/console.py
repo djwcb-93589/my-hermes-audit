@@ -207,7 +207,12 @@ def _ablation_summary(result: AuditRunResult) -> list[str]:
         lines.append(
             f"Ablation {comparison.case_id}: reference="
             f"{comparison.reference_variant_id}, "
-            f"comparability={comparison.comparability.value}"
+            "comparability="
+            f"structural:{comparison.structural_comparability.status.value},"
+            f"token:{comparison.token_comparability.status.value},"
+            "answer_quality:"
+            f"{comparison.answer_quality_comparability.status.value},"
+            f"duration:{comparison.duration_comparability.status.value}"
         )
         for variant in comparison.variant_results:
             fact_loss = (
@@ -222,17 +227,29 @@ def _ablation_summary(result: AuditRunResult) -> list[str]:
             )
             lines.append(
                 f"- {variant.variant_id}: memory={variant.memory_mode.value}, "
-                f"compression={variant.compression_mode.value}, task="
+                "requested_compression_mode="
+                f"{variant.requested_compression_mode.value}, task="
                 f"{variant.task_success_rate * 100:.1f}%, "
                 f"fact_loss={fact_loss}, distortions="
                 f"{variant.distortion_count}, tokens={tokens}, "
-                f"duration={variant.duration_ms}ms"
+                "duration="
+                + (
+                    "not evaluated"
+                    if variant.duration_ms is None
+                    else f"{variant.duration_ms}ms"
+                )
             )
-        if comparison.comparability_reasons:
-            lines.append(
-                "  not comparable: "
-                + ", ".join(comparison.comparability_reasons)
-            )
+        for label, assessment in (
+            ("structural", comparison.structural_comparability),
+            ("token", comparison.token_comparability),
+            ("answer_quality", comparison.answer_quality_comparability),
+            ("duration", comparison.duration_comparability),
+        ):
+            if assessment.reasons:
+                lines.append(
+                    f"  {label} not comparable: "
+                    + ", ".join(item.value for item in assessment.reasons)
+                )
     return lines
 
 

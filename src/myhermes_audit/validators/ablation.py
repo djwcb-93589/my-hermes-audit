@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 from myhermes_audit.contracts import (
     CheckpointResult,
-    CompressionMode,
     DiagnosticStatus,
     DistortionResult,
     DistortionType,
@@ -146,13 +145,7 @@ def _evaluate_fact(
         elif observation.matched is None:
             matched = None
             error_type = observation.error_type or "fact_observation_error"
-        elif (
-            fact.must_survive_compression
-            and context.effective_subject_configuration is not None
-            and context.effective_subject_configuration.compression_mode
-            is CompressionMode.ENABLED
-            and observation.compression_applied is not True
-        ):
+        elif fact.must_survive_compression and observation.compression_applied is not True:
             matched = None
             error_type = "compression_observation_unavailable"
         elif (
@@ -171,9 +164,6 @@ def _evaluate_fact(
                 )
     elif (
         fact.must_survive_compression
-        and context.effective_subject_configuration is not None
-        and context.effective_subject_configuration.compression_mode
-        is CompressionMode.ENABLED
         and not any(
             item.compression_applied is True
             for item in context.context_diagnostics

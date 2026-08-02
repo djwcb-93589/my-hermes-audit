@@ -21,7 +21,6 @@ from myhermes_audit.artifacts import atomic_write_json, atomic_write_text
 from myhermes_audit.contracts import (
     AblationVariant,
     AuditCase,
-    CompressionMode,
     EffectiveSubjectConfiguration,
     MemoryMode,
     MemoryErrorType,
@@ -34,6 +33,7 @@ from myhermes_audit.contracts import (
     TrialWarning,
     RetrievalStrategy,
     ToolsetName,
+    ModelIdentifierSource,
 )
 from myhermes_audit.ablation import (
     applicable_checkpoints,
@@ -79,6 +79,11 @@ from myhermes_audit.integrations.myhermes.capability_runner import (
 )
 from myhermes_audit.integrations.myhermes.config_builder import (
     MyHermesConfigBuilder,
+)
+from myhermes_audit.integrations.myhermes.model_identifier import (
+    EffectiveModelIdentifier,
+    apply_effective_model_to_worker_environment,
+    resolve_effective_model_identifier,
 )
 from myhermes_audit.integrations.myhermes.contracts import (
     AblationArtifact,
@@ -181,28 +186,58 @@ class MyHermesTrialRunner:
     def capability_report(self) -> SubjectCapabilityReport | None:
         return self._capability_report
 
-    def p4_model_identifier(
+    def _effective_model_identifier(
         self,
         case: AuditCase,
-        configuration: EffectiveSubjectConfiguration,
-    ) -> str:
-        prepared = self._config_builder.prepare(
-            effective_config_overrides(case, configuration)
+        subject_configuration: dict,
+    ) -> EffectiveModelIdentifier:
+        return resolve_effective_model_identifier(
+            case_environment=case.execution.environment_overrides,
+            parent_environment=self._parent_environment,
+            subject_configuration=subject_configuration,
+            sensitive_values=self._sensitive_values,
         )
-        value = prepared.document.get("model")
-        if isinstance(value, str) and value.strip():
-            normalized = value.strip()
-            if normalized == "${MODEL}":
-                normalized = (
-                    case.execution.environment_overrides.get("MODEL")
-                    or self._parent_environment.get("MODEL")
-                    or normalized
-                )
-            return redact_text(
-                normalized,
-                self._sensitive_values,
-            )[:256]
-        return "subject-default"
+
+    def p4_effective_subject_configuration(
+        self,
+        case: AuditCase,
+        variant: AblationVariant,
+    ) -> EffectiveSubjectConfiguration:
+        report = self._capability_report
+        if report is None:
+            raise AblationCapabilityError(
+                "P4 capability report is unavailable",
+                case_id=case.case_id,
+                variant_id=variant.variant_id,
+            )
+        preliminary = effective_subject_configuration(
+            case,
+            variant,
+            compression_threshold_control=report.compression_threshold_control,
+            emergency_overflow_compression_disable_supported=(
+                report.emergency_overflow_compression_disable_supported
+            ),
+            compression_observation_supported=(
+                report.compression_observation_supported
+            ),
+        )
+        prepared = self._config_builder.prepare(
+            effective_config_overrides(case, preliminary)
+        )
+        resolution = self._effective_model_identifier(case, prepared.document)
+        return effective_subject_configuration(
+            case,
+            variant,
+            compression_threshold_control=report.compression_threshold_control,
+            emergency_overflow_compression_disable_supported=(
+                report.emergency_overflow_compression_disable_supported
+            ),
+            compression_observation_supported=(
+                report.compression_observation_supported
+            ),
+            model_identifier=resolution.model_identifier,
+            model_identifier_source=resolution.source,
+        )
 
     def preflight(self, cases: Sequence[AuditCase]) -> None:
         self._preflight_subject()
@@ -469,11 +504,27 @@ class MyHermesTrialRunner:
                 "Subject capability report is unavailable for P4",
                 case_id=case.case_id,
             )
-        observation_capability = report.capability("compression_observation")
-        observation_available = (
-            observation_capability is not None
-            and observation_capability.available
-        )
+        capability_summary = _compression_capability_summary(report)
+        observation_available = report.compression_observation_supported
+        if (
+            plan.require_emergency_compression_disable
+            and not report.emergency_overflow_compression_disable_supported
+        ):
+            raise CompressionCapabilityError(
+                "required emergency overflow Compression disable is unavailable",
+                case_id=case.case_id,
+                requested_capability="emergency_compression_disable",
+                missing_capability="emergency_compression_disable",
+                supported_capabilities=capability_summary,
+            )
+        if plan.minimum_compression_events and not observation_available:
+            raise CompressionObservationError(
+                "required Compression occurrence cannot be observed publicly",
+                case_id=case.case_id,
+                requested_capability="compression_observation",
+                missing_capability="compression_observation",
+                supported_capabilities=capability_summary,
+            )
         for variant in plan.variants:
             if variant.memory_mode not in report.supported_memory_modes:
                 raise AblationCapabilityError(
@@ -488,16 +539,17 @@ class MyHermesTrialRunner:
                     "Subject does not expose safe public Compression control",
                     case_id=case.case_id,
                     variant_id=variant.variant_id,
-                    compression_mode=variant.compression_mode.value,
-                    missing_capability="compression_toggle",
+                    requested_compression_mode=variant.compression_mode.value,
+                    requested_capability="compression_threshold_control",
+                    missing_capability="compression_threshold_control",
+                    supported_capabilities=capability_summary,
                 )
             variant_expectations = applicable_fact_expectations(
                 case,
                 variant.variant_id,
             )
             if (
-                variant.compression_mode is CompressionMode.ENABLED
-                and any(
+                any(
                     fact.must_survive_compression
                     for expectation in variant_expectations
                     for fact in expectation.facts
@@ -508,14 +560,15 @@ class MyHermesTrialRunner:
                     "required Compression survival cannot be observed publicly",
                     case_id=case.case_id,
                     variant_id=variant.variant_id,
+                    requested_capability="compression_observation",
                     missing_capability="compression_observation",
+                    supported_capabilities=capability_summary,
                 )
-            configuration = effective_subject_configuration(
-                case,
-                variant,
-                compression_observation_available=observation_available,
-            )
             try:
+                configuration = self.p4_effective_subject_configuration(
+                    case,
+                    variant,
+                )
                 self._config_builder.prepare(
                     effective_config_overrides(case, configuration)
                 )
@@ -561,14 +614,7 @@ class MyHermesTrialRunner:
                     case_id=case.case_id,
                     variant_id=variant.variant_id,
                 )
-            capability = report.capability("compression_observation")
-            configuration = effective_subject_configuration(
-                case,
-                variant,
-                compression_observation_available=(
-                    capability is not None and capability.available
-                ),
-            )
+            configuration = self.p4_effective_subject_configuration(case, variant)
         memory_case = (
             _is_memory_case(case)
             if configuration is None
@@ -649,27 +695,41 @@ class MyHermesTrialRunner:
                 artifact_paths=paths,
             )
             atomic_write_json(paths.worker_request, request)
-            prepared = self._config_builder.write(
-                sandbox.hermes_home / "config.yaml",
-                (
-                    case.execution.config_overrides
-                    if configuration is None
-                    else effective_config_overrides(case, configuration)
-                ),
-            )
-            subject_model = (
-                _safe_subject_model(
-                    prepared.document,
-                    sensitive_values,
-                )
+            prepared = self._config_builder.prepare(
+                case.execution.config_overrides
                 if configuration is None
-                else self.p4_model_identifier(case, configuration)
+                else effective_config_overrides(case, configuration)
             )
+            model_resolution = self._effective_model_identifier(
+                case,
+                prepared.document,
+            )
+            if (
+                model_resolution.source
+                is ModelIdentifierSource.SUBJECT_CONFIGURATION
+                and model_resolution.worker_model_value is not None
+            ):
+                prepared.document["model"] = model_resolution.worker_model_value
+            self._config_builder.write_prepared(
+                sandbox.hermes_home / "config.yaml",
+                prepared,
+            )
+            subject_model = model_resolution.model_identifier
+            if configuration is not None and (
+                configuration.model_identifier != model_resolution.model_identifier
+                or configuration.model_identifier_source is not model_resolution.source
+            ):
+                raise WorkerProtocolError(
+                    "effective model identity changed after P4 preflight",
+                    case_id=case.case_id,
+                    variant_id=variant.variant_id if variant is not None else None,
+                )
             environment = self._build_worker_environment(
                 case,
                 sandbox,
                 trial_id=trial_id,
                 config_references=prepared.environment_references,
+                model_resolution=model_resolution,
             )
             process, stdout_capture, stderr_capture = self._start_worker(
                 request,
@@ -935,6 +995,7 @@ class MyHermesTrialRunner:
         *,
         trial_id: str,
         config_references: tuple[str, ...],
+        model_resolution: EffectiveModelIdentifier,
     ) -> dict[str, str]:
         environment: dict[str, str] = {}
         inherited_names = (
@@ -947,6 +1008,7 @@ class MyHermesTrialRunner:
             if value is not None:
                 environment[name] = value
         environment.update(case.execution.environment_overrides)
+        apply_effective_model_to_worker_environment(environment, model_resolution)
         audit_import_root = Path(__file__).resolve().parents[2]
         environment.update(
             {
@@ -1441,16 +1503,6 @@ def _redact_json_value(value, sensitive_values: tuple[str, ...]):
     return value
 
 
-def _safe_subject_model(
-    document: dict,
-    sensitive_values: tuple[str, ...],
-) -> str | None:
-    value = document.get("model")
-    if not isinstance(value, str) or not value.strip():
-        return None
-    return redact_text(value.strip(), sensitive_values)[:256]
-
-
 def _case_turns(
     case: AuditCase,
     *,
@@ -1525,6 +1577,21 @@ def _is_memory_case(case: AuditCase) -> bool:
 def _capability_available(report: SubjectCapabilityReport, name: str) -> bool:
     capability = report.capability(name)
     return capability is not None and capability.available
+
+
+def _compression_capability_summary(
+    report: SubjectCapabilityReport,
+) -> dict[str, bool]:
+    return {
+        "compression_threshold_control": report.compression_threshold_control,
+        "compression_threshold_configuration": (
+            report.compression_threshold_configuration
+        ),
+        "emergency_compression_disable": (
+            report.emergency_overflow_compression_disable_supported
+        ),
+        "compression_observation": report.compression_observation_supported,
+    }
 
 
 def _worker_artifact_paths(

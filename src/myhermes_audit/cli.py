@@ -393,7 +393,12 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
     for label, capability_name in (
         ("Short-term context", "short_term_context"),
         ("Long-term memory", "long_term_memory"),
-        ("Compression toggle", "compression_toggle"),
+        ("Compression threshold control", "compression_threshold_control"),
+        (
+            "Compression threshold configuration",
+            "compression_threshold_configuration",
+        ),
+        ("Emergency Compression disable", "emergency_compression_disable"),
         ("Compression observation", "compression_observation"),
     ):
         capability = report.capability(capability_name)

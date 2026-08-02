@@ -1,0 +1,105 @@
+schema_version: "1.0"
+suite_id: memory-compression-capability-negative-v1
+name: P4 unsupported Compression capability declarations
+description: Cases that must fail preflight before Sandbox creation on the current Subject.
+tags: [memory, compression, ablation, p4, capability-negative, synthetic]
+defaults:
+  trials: 1
+  timeout_seconds: 120
+  preserve_sandbox: false
+  metadata:
+    data_classification: synthetic
+cases:
+  - case_id: compression-observation-required
+    name: Require an observed Compression event and post-Compression fact survival
+    description: Requires public event evidence; threshold configuration alone is insufficient.
+    tags: [capability-negative-compression-observation]
+    mode: scripted_multi_turn
+    input:
+      turns:
+        - role: user
+          session_id: compression-negative-a
+          message: Synthetic quota is 37 units. Reply ACK-1.
+        - role: user
+          session_id: compression-negative-a
+          message: Synthetic event ALPHA occurs before synthetic event BETA. Reply ACK-2.
+        - role: user
+          session_id: compression-negative-a
+          message: Add harmless synthetic filler about red, green, blue, and amber labels. Reply ACK-3.
+        - role: user
+          session_id: compression-negative-a
+          message: Add harmless synthetic filler about north, south, east, and west zones. Reply ACK-4.
+        - role: user
+          session_id: compression-negative-a
+          message: Report the quota and declared event order using only the earlier facts.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: disabled
+    expected:
+      required_facts:
+        - expectation_id: observed-compression-survival
+          required: true
+          distortion_hard_gate: true
+          applicable_variant_ids: [short-threshold-enabled]
+          facts:
+            - fact_id: observed-quota
+              canonical_value: 37 units
+              accepted_variants: [quota is 37]
+              match: contains
+              scope: subject_context
+              checkpoint_id: observed-compression-checkpoint
+              must_survive_compression: true
+              distortion_candidates:
+                - value: 73 units
+                  distortion_type: value_changed
+            - fact_id: observed-order
+              canonical_value: ALPHA occurs before synthetic event BETA
+              accepted_variants: [ALPHA before BETA]
+              match: contains
+              scope: subject_context
+              checkpoint_id: observed-compression-checkpoint
+              must_survive_compression: true
+              distortion_candidates:
+                - value: BETA before ALPHA
+                  distortion_type: temporal_order_changed
+    ablation:
+      reference_variant_id: short-threshold-enabled
+      maximum_turns: 5
+      minimum_compression_events: 1
+      maximum_compression_events: 8
+      variants:
+        - variant_id: short-threshold-enabled
+          memory_mode: short_term_only
+          compression_mode: threshold_enabled
+          config_overrides:
+            compression:
+              threshold: 64
+      checkpoints:
+        - checkpoint_id: observed-compression-checkpoint
+          after_turn: 5
+          required_fact_ids: [observed-quota, observed-order]
+          required: true
+    evaluators:
+      - evaluator_id: observed-compression-retention
+        kind: compression
+        required: true
+
+  - case_id: emergency-compression-disable-required
+    name: Require complete emergency overflow Compression disable
+    description: Requires a public capability that the current Subject does not expose.
+    tags: [capability-negative-emergency-compression-disable]
+    mode: single_turn
+    input:
+      message: Reply with exactly ACK.
+    execution:
+      enabled_toolsets: []
+    ablation:
+      reference_variant_id: no-memory-threshold-disabled
+      maximum_turns: 1
+      maximum_compression_events: 8
+      require_emergency_compression_disable: true
+      variants:
+        - variant_id: no-memory-threshold-disabled
+          memory_mode: no_memory
+          compression_mode: threshold_disabled
+          config_overrides: {}

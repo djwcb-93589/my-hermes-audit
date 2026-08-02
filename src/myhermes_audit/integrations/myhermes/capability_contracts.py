@@ -76,7 +76,10 @@ class SubjectCapabilityReport(ContractModel):
     compression_configuration_paths: list[NonEmptyText] = Field(
         default_factory=list
     )
-    compression_observation_available: StrictBool = False
+    compression_threshold_control: StrictBool = False
+    compression_threshold_configuration: StrictBool = False
+    emergency_overflow_compression_disable_supported: StrictBool = False
+    compression_observation_supported: StrictBool = False
     warnings: list[SubjectCapabilityWarning] = Field(default_factory=list)
     public_api_fingerprint: Sha256Digest
     error: SubjectCapabilityProbeError | None = None
@@ -123,20 +126,47 @@ class SubjectCapabilityReport(ContractModel):
             set(self.compression_configuration_paths)
         ):
             raise ValueError("compression configuration paths must not repeat")
-        compression_toggle = self.capability("compression_toggle")
-        toggle_available = (
-            compression_toggle is not None and compression_toggle.available
+        threshold_control = self.capability("compression_threshold_control")
+        threshold_control_available = (
+            threshold_control is not None and threshold_control.available
         )
-        if toggle_available != (
+        if self.compression_threshold_control != threshold_control_available:
+            raise ValueError(
+                "compression threshold control field must match its capability"
+            )
+        if threshold_control_available != (
             self.compression_control is not CompressionControl.UNAVAILABLE
         ):
-            raise ValueError("compression_control must match compression_toggle")
-        if toggle_available != bool(self.supported_compression_modes):
+            raise ValueError("compression_control must match threshold control")
+        if threshold_control_available != bool(self.supported_compression_modes):
             raise ValueError(
                 "supported compression modes must match compression control"
             )
+        threshold_configuration = self.capability(
+            "compression_threshold_configuration"
+        )
+        if self.compression_threshold_configuration != (
+            threshold_configuration is not None
+            and threshold_configuration.available
+        ):
+            raise ValueError(
+                "compression threshold configuration field must match its capability"
+            )
+        if self.compression_threshold_configuration != bool(
+            self.compression_configuration_paths
+        ):
+            raise ValueError(
+                "compression configuration paths must match threshold configuration"
+            )
+        emergency_disable = self.capability("emergency_compression_disable")
+        if self.emergency_overflow_compression_disable_supported != (
+            emergency_disable is not None and emergency_disable.available
+        ):
+            raise ValueError(
+                "emergency Compression disable field must match its capability"
+            )
         observation = self.capability("compression_observation")
-        if self.compression_observation_available != (
+        if self.compression_observation_supported != (
             observation is not None and observation.available
         ):
             raise ValueError(

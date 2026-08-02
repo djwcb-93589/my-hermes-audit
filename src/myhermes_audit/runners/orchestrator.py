@@ -124,16 +124,6 @@ class AuditOrchestrator:
 
         trials: list[TrialResult] = []
         preserved: list[Path] = []
-        capability_report = getattr(self.runner, "capability_report", None)
-        compression_observation = (
-            None
-            if capability_report is None
-            else capability_report.capability("compression_observation")
-        )
-        compression_observation_available = (
-            compression_observation is not None
-            and compression_observation.available
-        )
         for case in selected:
             variants: Sequence[AblationVariant | None] = (
                 [None]
@@ -144,12 +134,10 @@ class AuditOrchestrator:
                 configuration = (
                     None
                     if variant is None
-                    else effective_subject_configuration(
+                    else _p4_effective_subject_configuration(
+                        self.runner,
                         case,
                         variant,
-                        compression_observation_available=(
-                            compression_observation_available
-                        ),
                     )
                 )
                 basis_fingerprint = (
@@ -168,11 +156,6 @@ class AuditOrchestrator:
                             trial_ordinal=trial_number,
                             subject_fingerprint=subject_fingerprint,
                             configuration=configuration,
-                            model_identifier=_p4_model_identifier(
-                                self.runner,
-                                case,
-                                configuration,
-                            ),
                         )
                     )
                     trial, preserved_path = self._run_one(
@@ -468,6 +451,7 @@ class AuditOrchestrator:
             else token_diagnostics(
                 None if outcome is None else outcome.runtime,
                 () if outcome is None else outcome.compression_events,
+                None if outcome is None else outcome.observations,
             )
         )
         p4_duration_diagnostics = (
@@ -612,16 +596,30 @@ def _trial_status(
     }[outcome.status]
 
 
-def _p4_model_identifier(
+def _p4_effective_subject_configuration(
     runner: TrialRunnerPort,
     case: AuditCase,
-    configuration: EffectiveSubjectConfiguration,
-) -> str | None:
-    resolver = getattr(runner, "p4_model_identifier", None)
-    if not callable(resolver):
-        return None
-    value = resolver(case, configuration)
-    return value if isinstance(value, str) and value.strip() else None
+    variant: AblationVariant,
+) -> EffectiveSubjectConfiguration:
+    resolver = getattr(runner, "p4_effective_subject_configuration", None)
+    if callable(resolver):
+        value = resolver(case, variant)
+        if isinstance(value, EffectiveSubjectConfiguration):
+            return value
+        raise TypeError("P4 configuration resolver returned an invalid contract")
+    capability_report = getattr(runner, "capability_report", None)
+    observation = (
+        None
+        if capability_report is None
+        else capability_report.capability("compression_observation")
+    )
+    return effective_subject_configuration(
+        case,
+        variant,
+        compression_observation_supported=(
+            observation is not None and observation.available
+        ),
+    )
 
 
 def _trial_error(

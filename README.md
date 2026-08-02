@@ -2,14 +2,15 @@
 
 ## P4 长短期记忆与 Compression 消融
 
-当前生产边界支持 Suite 显式声明 `no_memory`、`short_term_only`、`long_term_only`、`short_and_long_term`，并分别组合 `compression_mode: disabled|enabled`。Runner 按 Case、Variant 声明顺序和 Trial ordinal 串行展开；每个 Variant 独占 Session 命名空间、Sandbox、SQLite、`HERMES_HOME`、Memory 文件和 Artifact 目录。没有 `ablation` 的 P1–P3 Suite 不产生隐含 Variant。
+当前生产边界支持 Suite 显式声明 `no_memory`、`short_term_only`、`long_term_only`、`short_and_long_term`，并分别组合 `compression_mode: threshold_disabled|threshold_enabled`。Runner 按 Case、Variant 声明顺序和 Trial ordinal 串行展开；每个 Variant 独占 Session 命名空间、Sandbox、SQLite、`HERMES_HOME`、Memory 文件和 Artifact 目录。没有 `ablation` 的 P0–P3 Suite 不产生隐含 Variant。
 
-Compression 只通过 MyHermes 公开 `compression.*` 配置和 `ConversationAgentLoop` 阈值控制，Audit 不实现摘要或消息裁剪。当前 Subject 可控制 enabled/disabled，但公开 ModelCall Observation 尚不能确认 Compression 事件；需要 `must_survive_compression` 的 Case 会在 Sandbox 前明确失败，不会猜测或静默降级。完整合同、当前能力、事实门禁、比较和 no-content 规则见 [`docs/p4-memory-compression-ablation.md`](docs/p4-memory-compression-ablation.md)。
+Compression 只通过 MyHermes 公开 `compression.*` 配置和 `ConversationAgentLoop` 阈值控制，Audit 不实现摘要或消息裁剪。`threshold_disabled` 仅关闭配置阈值触发，context-overflow 紧急 Compression 仍可能发生；当前公开 ModelCall Observation 不能确认事件。需要 survival/事件数量或完整紧急禁用的 Case 位于独立 capability-negative Suite，并会在 Sandbox 前明确失败。有效模型按 Case `MODEL`、父环境 `MODEL`、最终配置 `model`、`subject-default` 的顺序统一进入 Worker、Runtime、Trial identity 与比较。完整规则见 [`docs/p4-memory-compression-ablation.md`](docs/p4-memory-compression-ablation.md)。
 
 静态校验 synthetic P4 示例（不会启动 Trial）：
 
 ```bash
 myhermes-audit validate examples/memory_compression_ablation_v1.yaml
+myhermes-audit validate examples/memory_compression_capability_negative_v1.yaml
 ```
 
 `my-hermes-audit` 是独立于 MyHermes 运行时的本地评测工具。报告总是从调用方指定的 `--subject-repo` 读取实际 Git fingerprint；文档不再把某个历史 MyHermes commit 当作运行基线。核心合同、数据集、Validator 与报告层不导入 `hermes.*`，MyHermes 也不感知自己正在被评测。
@@ -151,7 +152,8 @@ Judge 只读取 `AUDIT_JUDGE_MODEL`、`AUDIT_JUDGE_API_KEY`、可选 `AUDIT_JUDG
 - [`examples/core_contract_v1.yaml`](examples/core_contract_v1.yaml)：单轮输入、文件 Fixture、文件与工具轨迹预期，以及 deterministic/llm_judge 声明；
 - [`examples/memory_contract_v1.yaml`](examples/memory_contract_v1.yaml)：provider-neutral、capability-negative 的 Memory 合同示例，不代表当前 `hybrid` 可运行；
 - [`examples/memory_retrieval_v1.yaml`](examples/memory_retrieval_v1.yaml)：十个 P3 synthetic Case，覆盖事实、偏好、时间、覆盖、冲突、干扰、跨 Session、no-write、隔离与 disabled 对照；
-- [`examples/memory_compression_ablation_v1.yaml`](examples/memory_compression_ablation_v1.yaml)：三个 P4 synthetic Case，覆盖四种 Memory Mode、Compression 事实保留和长短期联合；需要公开 Compression Observation 的 Case 已显式标记 capability-negative；
+- [`examples/memory_compression_ablation_v1.yaml`](examples/memory_compression_ablation_v1.yaml)：默认可运行的两个 P4 synthetic Case，覆盖四种 Memory Mode、两种阈值控制模式、Required Fact、Distortion、Token/duration 和 Variant comparison，但不声称 Compression 已发生；
+- [`examples/memory_compression_capability_negative_v1.yaml`](examples/memory_compression_capability_negative_v1.yaml)：独立 P4 capability-negative Case，要求可观察 Compression、压缩后事实 survival 或完整关闭紧急 Compression，当前预期在 Sandbox 前失败；
 - [`examples/background_review_contract_v1.yaml`](examples/background_review_contract_v1.yaml)：Memory no-op、Skill update、stale rejection，以及五类 Review 证据；
 - [`examples/core_run_v1.yaml`](examples/core_run_v1.yaml)：P1 可运行的六个合成 Case；本仓库开发阶段不执行该示例。
 - [`examples/core_judge_v1.yaml`](examples/core_judge_v1.yaml)：六个合成 P2 Case，将原有确定性门禁与单个 `answer_quality` Judge 组合；代码建设阶段不执行该示例。

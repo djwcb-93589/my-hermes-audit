@@ -569,18 +569,27 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         _compression_runtime_surface,
         required=False,
     )
-    compression_configuration = builder.check(
-        "compression_configuration",
+    compression_threshold_configuration = builder.check(
+        "compression_threshold_configuration",
         "hermes.config",
         "<module>",
         _compression_configuration_surface,
         required=False,
     )
-    compression_toggle = builder.check(
-        "compression_toggle",
+    compression_threshold_control = (
+        compression_available is not None
+        and compression_threshold_configuration is not None
+    )
+    builder.derived_check(
+        "compression_threshold_control",
+        available=compression_threshold_control,
+        public_object="ConversationAgentLoop threshold+public compression configuration",
+    )
+    emergency_compression_disable = builder.check(
+        "emergency_compression_disable",
         "hermes.config",
-        "<module>",
-        _compression_configuration_surface,
+        "EMERGENCY_OVERFLOW_COMPRESSION_DISABLE_SUPPORTED",
+        lambda value: value is True,
         required=False,
     )
     ranked_query = builder.check(
@@ -810,10 +819,11 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
     ):
         supported_memory_modes.append(MemoryMode.SHORT_AND_LONG_TERM)
     supported_compression_modes = (
-        [CompressionMode.DISABLED, CompressionMode.ENABLED]
-        if compression_available is not None
-        and compression_configuration is not None
-        and compression_toggle is not None
+        [
+            CompressionMode.THRESHOLD_DISABLED,
+            CompressionMode.THRESHOLD_ENABLED,
+        ]
+        if compression_threshold_control
         else []
     )
 
@@ -857,6 +867,13 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
                     if supported_compression_modes
                     else CompressionControl.UNAVAILABLE.value
                 ),
+                "compression_threshold_control": compression_threshold_control,
+                "compression_threshold_configuration": (
+                    compression_threshold_configuration is not None
+                ),
+                "emergency_compression_disable": (
+                    emergency_compression_disable is not None
+                ),
                 "compression_observation": compression_observation is not None,
             },
         }
@@ -894,7 +911,14 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
             if supported_compression_modes
             else []
         ),
-        compression_observation_available=compression_observation is not None,
+        compression_threshold_control=compression_threshold_control,
+        compression_threshold_configuration=(
+            compression_threshold_configuration is not None
+        ),
+        emergency_overflow_compression_disable_supported=(
+            emergency_compression_disable is not None
+        ),
+        compression_observation_supported=compression_observation is not None,
         warnings=builder.warnings,
         public_api_fingerprint=fingerprint,
         error=error,

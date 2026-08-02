@@ -31,6 +31,7 @@ from myhermes_audit.contracts.ablation import (
     AblationComparisonResult,
     CheckpointResult,
     CompressionEvent,
+    CompressionEventStatus,
     CompressionMode,
     ContextDiagnostic,
     DistortionResult,
@@ -359,20 +360,42 @@ class TrialResult(ContractModel):
                 or self.trial_identity.trial_ordinal != self.trial_number
                 or self.trial_identity.configuration_sha256
                 != self.configuration_fingerprint
+                or self.trial_identity.model_identifier
+                != self.effective_subject_configuration.model_identifier
             ):
                 raise ValueError("Trial identity must match its P4 Trial fields")
             if (
                 self.effective_subject_configuration.memory_mode
                 is not self.memory_mode
-                or self.effective_subject_configuration.compression_mode
+                or self.effective_subject_configuration.requested_compression_mode
                 is not self.compression_mode
             ):
                 raise ValueError("effective Subject configuration must match Variant")
+            if (
+                self.runtime is not None
+                and self.runtime.subject_model
+                != self.trial_identity.model_identifier
+            ):
+                raise ValueError(
+                    "runtime model identifier must match the P4 Trial identity"
+                )
             if (
                 len(self.compression_events)
                 > self.effective_subject_configuration.maximum_compression_events
             ):
                 raise ValueError("compression event count exceeds the declared limit")
+            if (
+                self.status is TrialStatus.COMPLETED
+                and self.effective_subject_configuration.compression_events_observable
+                and sum(
+                    item.status is CompressionEventStatus.COMPLETED
+                    for item in self.compression_events
+                )
+                < self.effective_subject_configuration.minimum_compression_events
+            ):
+                raise ValueError(
+                    "completed Trial did not observe the required Compression events"
+                )
         if (
             self.started_at is not None
             and self.finished_at is not None
