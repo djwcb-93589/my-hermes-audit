@@ -14,6 +14,12 @@ Suite 在 `defaults.metadata.data_classification` 声明 `synthetic`、`internal
 
 输入、输出、rubric 和结果内容都投影为 `content_omitted=true`、分类、canonical SHA-256 与序列化长度。状态、指标、稳定身份和不含内容的效率 metadata 可以上传。不会上传原始文本或所谓“摘要”来绕过分类。
 
+## P5 Background Review
+
+P5 Review evidence 使用比通用分类更严格的远端边界。无论 Suite 是 `synthetic`、`internal` 还是 `sensitive`，Langfuse projection 都只保留 Review/evidence 的稳定 ID、kind、SHA-256、长度、顺序、source relation、status、action、target type、revision hash、attempt、duration 和安全 metadata。
+
+不得上传 foreground user message、Assistant decision/report、Tool output/error 正文、Subject prepared Review message、Review Prompt、隐藏推理、Memory/Skill 正文、claim token、完整工具参数或凭据。`sensitive` 和 `--langfuse-no-content` 继续强制同一无正文边界；本地结构化 Artifact 仍保留既有数据分类和脱敏规则。
+
 ## 强制无内容
 
 `--langfuse-no-content` 对任意分类使用与 sensitive 相同的内容省略投影，但不改变本地报告。该开关同时作用于 Dataset Item 和 Trial/Judge Observation。

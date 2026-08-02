@@ -1,0 +1,69 @@
+schema_version: "1.0"
+suite_id: background-review-capability-negative-v1
+name: P5 stale Background Review capability-negative declaration
+description: >-
+  A single synthetic stale-governance scenario. It is intentionally separate
+  from the default P5 Suite because current public Subject APIs cannot prove
+  governance-bound stale claim validation.
+tags: [background-review, p5, synthetic, capability-negative, stale]
+defaults:
+  trials: 1
+  timeout_seconds: 180
+  preserve_sandbox: false
+  metadata:
+    data_classification: synthetic
+cases:
+  - case_id: skill-review-stale-governance
+    name: Reject an old Skill Review claim after governance revision changes
+    description: >-
+      The planned stale lifecycle requires public governance-bound claim
+      validation and must fail preflight when that public capability is absent.
+    mode: single_turn
+    input:
+      session_id: p5-stale-skill
+      message: >-
+        Use the verified synthetic deployment evidence to update the curated
+        Skill after its governance revision has changed.
+    execution:
+      enabled_toolsets: []
+    fixture:
+      files: []
+      skills:
+        - skill_id: p5-stale-skill-fixture
+          name: p5-stale-skill-fixture
+          content: Curated synthetic deployment method.
+          source: local
+          managed_by: curator
+          pinned: false
+          metadata: {}
+      background_review_plans:
+        - review_id: p5-stale-skill-review
+          kind: skill
+          foreground_session_id: p5-stale-skill
+          trigger_after_turn: 1
+          timeout_seconds: 90
+          lifecycle: stale_before_execute
+          repeat_count: 1
+          stale_target:
+            target_type: skill
+            target_id: p5-stale-skill-fixture
+    expected:
+      background_reviews:
+        - review_id: p5-stale-skill-review
+          expected_action: reject
+          must_change: []
+          must_not_change:
+            - target_type: skill
+              target_id: p5-stale-skill-fixture
+          required_evidence_kinds:
+            - user_message
+          forbidden_evidence_kinds: []
+          must_be_no_op: false
+          protected_targets:
+            - target_type: skill
+              target_id: p5-stale-skill-fixture
+          expected_stale_rejection: true
+    evaluators:
+      - evaluator_id: p5-stale-skill-gate
+        kind: background_review
+        required: true

@@ -19,10 +19,11 @@ from myhermes_audit.contracts.ablation import (
     MemoryMode,
 )
 from myhermes_audit.contracts.memory import MemoryKind, RetrievalStrategy
+from myhermes_audit.contracts.background_review import ReviewKind
 
 
-CAPABILITY_PROTOCOL_VERSION = "3.0"
-CapabilityProtocolVersion = Literal["3.0"]
+CAPABILITY_PROTOCOL_VERSION = "4.0"
+CapabilityProtocolVersion = Literal["4.0"]
 
 
 class SubjectCapabilityProbeRequest(ContractModel):
@@ -67,6 +68,7 @@ class SubjectCapabilityReport(ContractModel):
     supported_retrieval_strategies: list[RetrievalStrategy] = Field(
         default_factory=list
     )
+    supported_review_kinds: list[ReviewKind] = Field(default_factory=list)
     memory_provider: NonEmptyText | None = None
     supported_memory_modes: list[MemoryMode] = Field(default_factory=list)
     supported_compression_modes: list[CompressionMode] = Field(
@@ -108,6 +110,8 @@ class SubjectCapabilityReport(ContractModel):
             set(self.supported_retrieval_strategies)
         ):
             raise ValueError("supported_retrieval_strategies must not repeat")
+        if len(self.supported_review_kinds) != len(set(self.supported_review_kinds)):
+            raise ValueError("supported_review_kinds must not repeat")
         native_supported = (
             RetrievalStrategy.SUBJECT_NATIVE
             in self.supported_retrieval_strategies

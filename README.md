@@ -1,5 +1,11 @@
 # my-hermes-audit
 
+## P5 Background Review 评测
+
+P5 把 MyHermes 的公开 Memory/Skill Background Review 生命周期接入隔离 Trial Worker。仅声明 `fixture.background_review_plans` 的 Case 才创建 trial-local Driver Registry、Review Agent Loop 与受限 Review ToolPolicy；旧 P0–P4 Case 不初始化任何 Review 组件。P5 记录真实 foreground evidence、Subject `prepare_run()` 证据窗口、before/after live snapshot、独立的 `observed_changes`、重复 claim 事实和安全错误投影，并由六个确定性 Review 维度形成 required Review gate。它评测同步、可收口的单 Review 生命周期，不实现异步队列、并行调度或完整后台闭环；后者留给 P6。
+
+默认 synthetic Suite 是 [`examples/background_review_v1.yaml`](examples/background_review_v1.yaml)，包含六个非 stale 场景。当前 Subject 不能通过公开 API 证明治理 revision 绑定的 stale claim，因此 stale 只在 [`examples/background_review_capability_negative_v1.yaml`](examples/background_review_capability_negative_v1.yaml) 中声明，并预期在 Sandbox 前 capability preflight 拒绝。完整边界见 [`docs/p5-background-review.md`](docs/p5-background-review.md)。
+
 ## P4 长短期记忆与 Compression 消融
 
 当前生产边界支持 Suite 显式声明 `no_memory`、`short_term_only`、`long_term_only`、`short_and_long_term`，并分别组合 `compression_mode: threshold_disabled|threshold_enabled`。Runner 按 Case、Variant 声明顺序和 Trial ordinal 串行展开；每个 Variant 独占 Session 命名空间、Sandbox、SQLite、`HERMES_HOME`、Memory 文件和 Artifact 目录。没有 `ablation` 的 P0–P3 Suite 不产生隐含 Variant。
@@ -25,7 +31,7 @@ myhermes-audit validate examples/memory_compression_capability_negative_v1.yaml
 - 每 Trial 独立的 `HERMES_HOME`、workspace、SQLite 路径、artifact、fixture 与日志目录；
 - 带所有权标记的 Sandbox 默认清理，以及受根目录约束的 Fixture 复制和文本写入方法；
 - 只读 Git subject fingerprint 与结构化失败；
-- Memory 和 Background Review 的异步 `Protocol` 扩展端口；
+- Memory 与 P5 Background Review 的版本化 Worker/Port 合同；
 - 保留 `validate` 与 `schema` 静态 CLI，并新增隔离执行的 `run`；
 - 每 Trial 独立子进程运行真实 MyHermes `run_conversation`，并隔离 `HERMES_HOME`、SQLite、workspace、配置导入副作用和进程组；
 - `single_turn` 与固定用户消息的 `scripted_multi_turn`；
@@ -42,12 +48,15 @@ myhermes-audit validate examples/memory_compression_capability_negative_v1.yaml
 - P3 `subject_native` Memory Prompt 暴露与 `disabled` 对照、公共 API seed/read/render/clear Adapter、before/after snapshot、稳定状态 diff 和跨逻辑 Session；
 - required Memory evidence、Recall@K、MRR、Memory 状态门禁，以及与最终答案门禁分离的结构化 Trial 事实；
 - P3 Memory seed/query/snapshot/retrieval Langfuse Observation；no-content 或 sensitive 时只投影逐项哈希、长度、kind、rank 与安全 metadata。
+- P5 trial-local Background Review Adapter：公开 Driver/Registry/ReviewAgentLoop、真实 foreground/prepared evidence、Memory/Skill live snapshot、observed state diff、重复 claim 零副作用事实，以及 Worker cleanup 前的同步收口；
+- P5 `background_review` evaluator：decision、evidence、update、stale、side-effect 与 idempotency 六维硬门禁；required Review 失败会使 `task_success` 失败，但不新增第四个一级 Score；
+- P5 Langfuse 本地结果回放：Review 仅投影 ID、kind、hash、长度、状态、action、revision hash、duration 与安全 metadata，永不上传 Review evidence、Prompt、Memory、Skill 或工具正文。
 
-## P3 实现边界与仍未实现
+## P5 实现边界与仍未实现
 
 P3 已实现当前 MyHermes 公开能力对应的 `subject_native`（准确语义为 `prompt_context_injection`）和 `disabled`。当前 Subject 没有公开 ranked retrieval API，因此 Dense、BM25、Hybrid 只有严格枚举与 capability-negative 边界，`run` 会在创建 Sandbox 前明确拒绝，绝不由 Audit 自己实现或静默降级。
 
-仍未实现 LLM 模拟用户、Background Review 评测、Baseline Compare、并行调度、CI 或 Langfuse 自定义前端 Dashboard。
+仍未实现 LLM 模拟用户、真实 Background Review 异步队列/并行调度、完整任务→Review→后续回归闭环、Baseline Compare、CI 或 Langfuse 自定义前端 Dashboard。P5 不读取 MyHermes 私有 Review 持久化层，也不把 Audit 自己的决策逻辑替代 Subject Review。
 
 ## 安装
 
@@ -120,6 +129,17 @@ myhermes-audit run examples/memory_retrieval_v1.yaml \
 
 每个 P3 Trial 仍使用独立 Sandbox；示例只声明 `subject_native`/`disabled`，不会把 Dense/BM25/Hybrid 描述成当前可运行能力。
 
+P5 synthetic Background Review Suite 也使用同一 `run` 命令；它会在真实执行时使用当前 Subject 模型和公开 Review API：
+
+```bash
+myhermes-audit run examples/background_review_v1.yaml \
+  --subject-repo ../my-hermes \
+  --subject-config ./local-config.yaml \
+  --output reports/background-review.json
+```
+
+该默认 Suite 不含 stale。`background_review_capability_negative_v1.yaml` 只用于确认缺少公开 stale claim validation 时会在创建 Sandbox 前失败；示例文档不把它描述为已运行的 stale Review。
+
 可重复使用 `--case <case-id>` 选择 Case；`--preserve-on-failure` 只在终端打印被保留的本地 Sandbox 路径。模型凭据只能从启动 Audit 的环境继承，不能写入 Suite、生成配置、Artifact 或报告。未指定 `--output` 时写入当前目录的 `reports/`。
 
 规划 Dataset 同步且不导入或连接 Langfuse：
@@ -155,6 +175,8 @@ Judge 只读取 `AUDIT_JUDGE_MODEL`、`AUDIT_JUDGE_API_KEY`、可选 `AUDIT_JUDG
 - [`examples/memory_compression_ablation_v1.yaml`](examples/memory_compression_ablation_v1.yaml)：默认可运行的两个 P4 synthetic Case，覆盖四种 Memory Mode、两种阈值控制模式、Required Fact、Distortion、Token/duration 和 Variant comparison，但不声称 Compression 已发生；
 - [`examples/memory_compression_capability_negative_v1.yaml`](examples/memory_compression_capability_negative_v1.yaml)：独立 P4 capability-negative Case，要求可观察 Compression、压缩后事实 survival 或完整关闭紧急 Compression，当前预期在 Sandbox 前失败；
 - [`examples/background_review_contract_v1.yaml`](examples/background_review_contract_v1.yaml)：Memory no-op、Skill update、stale rejection，以及五类 Review 证据；
+- [`examples/background_review_v1.yaml`](examples/background_review_v1.yaml)：默认可运行的六个 P5 synthetic Case，覆盖 Memory no-op、Skill verified update、冲突证据、duplicate idempotency、user-managed/pinned 保护与无半写入；不含 stale；
+- [`examples/background_review_capability_negative_v1.yaml`](examples/background_review_capability_negative_v1.yaml)：仅含 stale-governance 负例；当前预期由 capability preflight 在 Sandbox 前拒绝；
 - [`examples/core_run_v1.yaml`](examples/core_run_v1.yaml)：P1 可运行的六个合成 Case；本仓库开发阶段不执行该示例。
 - [`examples/core_judge_v1.yaml`](examples/core_judge_v1.yaml)：六个合成 P2 Case，将原有确定性门禁与单个 `answer_quality` Judge 组合；代码建设阶段不执行该示例。
 
@@ -162,7 +184,7 @@ Judge 只读取 `AUDIT_JUDGE_MODEL`、`AUDIT_JUDGE_API_KEY`、可选 `AUDIT_JUDG
 
 ## 低耦合集成原则
 
-`myhermes_audit` 核心暴露合同、loader、Sandbox、fingerprint、Validator 与报告。`runners/myhermes.py` 负责父进程适配，`integrations/myhermes/worker.py` 与仅由它延迟加载的 `memory_adapter.py` 是导入 MyHermes 的子进程边界；依赖方向不能反转到核心层。
+`myhermes_audit` 核心暴露合同、loader、Sandbox、fingerprint、Validator 与报告。`runners/myhermes.py` 负责父进程适配，`integrations/myhermes/worker.py` 与仅由它延迟加载的 `memory_adapter.py`、`background_review_adapter.py` 是导入 MyHermes 的子进程边界；依赖方向不能反转到核心层。
 
 父进程通过 `subprocess` 的 `env` 参数传递专属环境，不修改自身 `os.environ`。只有 Worker 在隔离校验完成后导入 MyHermes，并通过公开初始化、会话、工具策略、Observation 读取和关闭接口完成生命周期。
 
@@ -170,6 +192,6 @@ Judge 与 Langfuse 仅在 Audit 父进程的 `integrations/` 适配层初始化�
 
 ## 开发与验证分离
 
-当前 P4 阶段只构建生产代码、合同、示例与文档。本仓库不创建或修改测试文件，也不在本阶段运行 pytest、unittest、真实 Trial、模型、Judge 或远端集成。后续独立 T4 应从公开合同和端口验证真实行为，不应给 MyHermes 增加评测专用分支。
+当前 P5 阶段只构建生产代码、合同、示例与文档。本仓库不创建或修改测试文件，也不在本阶段运行 pytest、unittest、真实 Trial、模型、Judge 或远端集成。后续独立 T5 应从公开合同和端口验证真实行为，不应给 MyHermes 增加评测专用分支。
 
-更多边界见 [`docs/architecture.md`](docs/architecture.md)、[`docs/p4-memory-compression-ablation.md`](docs/p4-memory-compression-ablation.md)、[`docs/p3-memory-retrieval.md`](docs/p3-memory-retrieval.md)、[`docs/p1-runner.md`](docs/p1-runner.md)、[`docs/worker-protocol.md`](docs/worker-protocol.md)、[`docs/validators.md`](docs/validators.md)、[`docs/security.md`](docs/security.md)、[`docs/p1-boundary.md`](docs/p1-boundary.md)、[`docs/p2-boundary.md`](docs/p2-boundary.md)、[`docs/langfuse.md`](docs/langfuse.md)、[`docs/langfuse-compatibility.md`](docs/langfuse-compatibility.md)、[`docs/publication-idempotency.md`](docs/publication-idempotency.md)、[`docs/llm-judge.md`](docs/llm-judge.md)、[`docs/score-model.md`](docs/score-model.md) 与 [`docs/data-classification.md`](docs/data-classification.md)。
+更多边界见 [`docs/architecture.md`](docs/architecture.md)、[`docs/p5-background-review.md`](docs/p5-background-review.md)、[`docs/p4-memory-compression-ablation.md`](docs/p4-memory-compression-ablation.md)、[`docs/p3-memory-retrieval.md`](docs/p3-memory-retrieval.md)、[`docs/p1-runner.md`](docs/p1-runner.md)、[`docs/worker-protocol.md`](docs/worker-protocol.md)、[`docs/validators.md`](docs/validators.md)、[`docs/security.md`](docs/security.md)、[`docs/p1-boundary.md`](docs/p1-boundary.md)、[`docs/p2-boundary.md`](docs/p2-boundary.md)、[`docs/langfuse.md`](docs/langfuse.md)、[`docs/langfuse-compatibility.md`](docs/langfuse-compatibility.md)、[`docs/publication-idempotency.md`](docs/publication-idempotency.md)、[`docs/llm-judge.md`](docs/llm-judge.md)、[`docs/score-model.md`](docs/score-model.md) 与 [`docs/data-classification.md`](docs/data-classification.md)。

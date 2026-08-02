@@ -143,6 +143,19 @@ def build_dataset_sync_plan(
                 "memory_fixture_uploaded": False,
                 "skill_content_uploaded": False,
                 "database_fixture_uploaded": False,
+                **(
+                    {}
+                    if not case.fixture.background_review_plans
+                    else {
+                        "background_review_plan_count": len(
+                            case.fixture.background_review_plans
+                        ),
+                        "background_review_expectation_count": len(
+                            case.expected.background_reviews
+                        ),
+                        "background_review_evidence_uploaded": False,
+                    }
+                ),
             }
             projection_sha256 = canonical_sha256(
                 {
@@ -220,6 +233,7 @@ def _case_input(case: AuditCase) -> dict:
                 if case.input.session_id is None
                 else {"session_id": case.input.session_id}
             ),
+            **_background_review_plan_projection(case),
         }
     if case.input.turns:
         return {
@@ -235,7 +249,8 @@ def _case_input(case: AuditCase) -> dict:
                     ),
                 }
                 for turn in case.input.turns
-            ]
+            ],
+            **_background_review_plan_projection(case),
         }
     simulated = case.input.simulated_user
     return {
@@ -244,7 +259,8 @@ def _case_input(case: AuditCase) -> dict:
             None
             if simulated is None
             else simulated.model_dump(mode="json", exclude={"schema_version"})
-        )
+        ),
+        **_background_review_plan_projection(case),
     }
 
 
@@ -300,7 +316,83 @@ def _case_expectations(
                 ],
             }
         ),
+        **(
+            {}
+            if not expected.background_reviews
+            else {
+                "background_reviews": [
+                    _background_review_expectation_projection(item)
+                    for item in expected.background_reviews
+                ]
+            }
+        ),
         "judges": [_without_schema(item) for item in expected.judges],
+    }
+
+
+def _background_review_plan_projection(case: AuditCase) -> dict:
+    if not case.fixture.background_review_plans:
+        return {}
+    return {
+        "background_review_plans": [
+            {
+                "review_id": plan.review_id,
+                "kind": plan.kind.value,
+                "trigger": plan.trigger.value,
+                "trigger_after_turn": plan.trigger_after_turn,
+                "timeout_seconds": plan.timeout_seconds,
+                "lifecycle": plan.lifecycle.value,
+                "repeat_count": plan.repeat_count,
+                "continue_after_failure": plan.continue_after_failure,
+                "stale_target": (
+                    None
+                    if plan.stale_target is None
+                    else {
+                        "target_type": plan.stale_target.target_type,
+                        "target_id": plan.stale_target.target_id,
+                    }
+                ),
+            }
+            for plan in case.fixture.background_review_plans
+        ]
+    }
+
+
+def _background_review_expectation_projection(expectation) -> dict:
+    def targets(values) -> list[dict]:
+        return [
+            {"target_type": item.target_type, "target_id": item.target_id}
+            for item in values
+        ]
+
+    return {
+        "review_id": expectation.review_id,
+        "expected_action": (
+            None
+            if expectation.expected_action is None
+            else expectation.expected_action.value
+        ),
+        "expected_target": (
+            None
+            if expectation.expected_target is None
+            else {
+                "target_type": expectation.expected_target.target_type,
+                "target_id": expectation.expected_target.target_id,
+            }
+        ),
+        "expected_target_revision": expectation.expected_target_revision,
+        "must_change": targets(expectation.must_change),
+        "must_not_change": targets(expectation.must_not_change),
+        "protected_targets": targets(expectation.protected_targets),
+        "required_evidence_kinds": [
+            item.value for item in expectation.required_evidence_kinds
+        ],
+        "forbidden_evidence_kinds": [
+            item.value for item in expectation.forbidden_evidence_kinds
+        ],
+        "must_be_no_op": expectation.must_be_no_op,
+        "expected_stale_rejection": expectation.expected_stale_rejection,
+        "allow_other_changes": expectation.allow_other_changes,
     }
 
 

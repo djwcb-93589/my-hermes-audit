@@ -21,6 +21,9 @@ from myhermes_audit.artifacts import atomic_write_json, atomic_write_text
 from myhermes_audit.contracts import (
     AblationVariant,
     AuditCase,
+    BackgroundReviewExecutionError,
+    BackgroundReviewExecutionResult,
+    BackgroundReviewPlan,
     EffectiveSubjectConfiguration,
     MemoryMode,
     MemoryErrorType,
@@ -34,6 +37,13 @@ from myhermes_audit.contracts import (
     RetrievalStrategy,
     ToolsetName,
     ModelIdentifierSource,
+    ReviewKind,
+    ReviewLifecycle,
+    ReviewAction,
+    ReviewAttempt,
+    ReviewError,
+    ReviewOutcome,
+    ReviewStatus,
 )
 from myhermes_audit.ablation import (
     applicable_checkpoints,
@@ -56,6 +66,7 @@ from myhermes_audit.environment import (
 from myhermes_audit.errors import (
     AblationCapabilityError,
     AblationVariantError,
+    BackgroundReviewCapabilityError,
     CompressionCapabilityError,
     CompressionConfigurationError,
     CompressionObservationError,
@@ -87,6 +98,9 @@ from myhermes_audit.integrations.myhermes.model_identifier import (
 )
 from myhermes_audit.integrations.myhermes.contracts import (
     AblationArtifact,
+    BackgroundReviewArtifact,
+    BackgroundReviewEvidenceArtifact,
+    BackgroundReviewSnapshotsArtifact,
     MemoryArtifact,
     MemoryQueryPlan,
     MyHermesWorkerRequest,
@@ -299,8 +313,16 @@ class MyHermesTrialRunner:
                 "P1 scripted turns must contain only user messages",
                 case_id=case.case_id,
             )
-        memory_case = _is_memory_case(case)
-        validate_runtime_fixture_support(case.fixture, allow_memory=memory_case)
+        review_case = _is_background_review_case(case)
+        memory_case = _is_memory_case(case) or any(
+            plan.kind is ReviewKind.MEMORY
+            for plan in case.fixture.background_review_plans
+        )
+        validate_runtime_fixture_support(
+            case.fixture,
+            allow_memory=memory_case,
+            allow_background_review=review_case,
+        )
         self._config_builder.prepare(case.execution.config_overrides)
 
         unsupported_evaluators = [
@@ -312,6 +334,7 @@ class MyHermesTrialRunner:
                 EvaluatorKind.LLM_JUDGE,
                 EvaluatorKind.RETRIEVAL,
                 EvaluatorKind.COMPRESSION,
+                EvaluatorKind.BACKGROUND_REVIEW,
             }
         ]
         if unsupported_evaluators:
@@ -320,15 +343,22 @@ class MyHermesTrialRunner:
                 case_id=case.case_id,
                 evaluator_kinds=unsupported_evaluators,
             )
-        if case.expected.background_reviews:
+        if case.expected.background_reviews and not review_case:
             raise UnsupportedCaseError(
-                "case declares Background Review expectations outside P3",
+                "Background Review expectations require an explicit P5 plan",
                 case_id=case.case_id,
             )
         if memory_case:
             self._preflight_memory_case(case)
         if case.ablation is not None:
             self._preflight_ablation_case(case)
+        if review_case:
+            if case.ablation is not None:
+                raise UnsupportedCaseError(
+                    "P5 Background Review plans cannot be combined with P4 ablations",
+                    case_id=case.case_id,
+                )
+            self._preflight_background_review_case(case)
         if any(
             item.target is not TextTarget.FINAL_OUTPUT
             for item in case.expected.texts
@@ -343,6 +373,100 @@ class MyHermesTrialRunner:
                 case_id=case.case_id,
             )
         preflight_evaluators(case)
+
+    def _preflight_background_review_case(self, case: AuditCase) -> None:
+        report = self._capability_report
+        if report is None:
+            raise BackgroundReviewCapabilityError(
+                "Subject Background Review capability report is unavailable",
+                case_id=case.case_id,
+            )
+        required = (
+            "background_review_runtime",
+            "background_review_runtime_config",
+            "review_claim_contract",
+            "review_driver_registry",
+            "review_agent_loop",
+            "review_loop_result_contract",
+            "review_hook_registry",
+            "review_observation_sink",
+            "review_foreground_event",
+            "review_tool_policy",
+            "review_tool_registry_resolution",
+            "review_tool_registration",
+            "review_claim_validation",
+            "review_claim_completion",
+            "review_claim_failure",
+            "review_evidence_window",
+            "review_foreground_evidence_window",
+            "review_outcome_observation",
+            "review_shutdown",
+        )
+        missing = [name for name in required if not _capability_available(report, name)]
+        if missing:
+            raise BackgroundReviewCapabilityError(
+                "Subject lacks required public Background Review capabilities",
+                case_id=case.case_id,
+                missing_capabilities=missing,
+            )
+        for plan in case.fixture.background_review_plans:
+            kind_capability = f"{plan.kind.value}_review_supported"
+            if (
+                plan.kind not in report.supported_review_kinds
+                or not _capability_available(report, kind_capability)
+            ):
+                raise BackgroundReviewCapabilityError(
+                    "Subject does not support the planned Background Review kind",
+                    case_id=case.case_id,
+                    review_id=plan.review_id,
+                    review_kind=plan.kind.value,
+                    missing_capability=kind_capability,
+                )
+            if plan.lifecycle is ReviewLifecycle.STALE_BEFORE_EXECUTE and not _capability_available(
+                report,
+                "stale_review_detection",
+            ):
+                raise BackgroundReviewCapabilityError(
+                    "Subject cannot publicly detect a governance-stale Review claim",
+                    case_id=case.case_id,
+                    review_id=plan.review_id,
+                    missing_capability="stale_review_detection",
+                )
+            if plan.kind is ReviewKind.SKILL and not _capability_available(
+                report,
+                "skill_governance_revision",
+            ):
+                raise BackgroundReviewCapabilityError(
+                    "Subject cannot snapshot the public Skill governance revision",
+                    case_id=case.case_id,
+                    review_id=plan.review_id,
+                    missing_capability="skill_governance_revision",
+                )
+        if case.fixture.skills and not _capability_available(
+            report,
+            "review_state_snapshot",
+        ):
+            raise BackgroundReviewCapabilityError(
+                "Subject cannot seed Skill fixtures through the public Skill API",
+                case_id=case.case_id,
+                missing_capability="review_state_snapshot",
+            )
+        if (
+            any(fixture.pinned for fixture in case.fixture.skills)
+            and not _capability_available(report, "skill_governance_revision")
+        ):
+            raise BackgroundReviewCapabilityError(
+                "Subject cannot pin Skill fixtures without public governance revisions",
+                case_id=case.case_id,
+                missing_capability="skill_governance_revision",
+            )
+        for fixture in case.fixture.skills:
+            if fixture.source.value != "local" or fixture.managed_by.value == "external":
+                raise BackgroundReviewCapabilityError(
+                    "Skill fixture cannot be seeded through the public Skill API",
+                    case_id=case.case_id,
+                    skill_id=fixture.skill_id,
+                )
 
     def _preflight_memory_case(self, case: AuditCase) -> None:
         report = self._capability_report
@@ -617,6 +741,10 @@ class MyHermesTrialRunner:
             configuration = self.p4_effective_subject_configuration(case, variant)
         memory_case = (
             _is_memory_case(case)
+            or any(
+                plan.kind is ReviewKind.MEMORY
+                for plan in case.fixture.background_review_plans
+            )
             if configuration is None
             else configuration.include_memory
         )
@@ -625,10 +753,12 @@ class MyHermesTrialRunner:
             if configuration is None
             else configuration.memory_strategy
         )
+        review_enabled = _is_background_review_case(case)
         paths = _worker_artifact_paths(
             sandbox,
             memory_enabled=memory_case,
             ablation_enabled=configuration is not None,
+            background_review_enabled=review_enabled,
         )
         started = time.perf_counter()
         captured_stdout = ""
@@ -691,6 +821,10 @@ class MyHermesTrialRunner:
                         variant.variant_id,
                     )
                 ),
+                background_review_plans=list(
+                    case.fixture.background_review_plans
+                ),
+                skill_fixtures=list(case.fixture.skills),
                 timeout_seconds=timeout_seconds,
                 artifact_paths=paths,
             )
@@ -783,6 +917,17 @@ class MyHermesTrialRunner:
                     variant_id=(None if variant is None else variant.variant_id),
                     configuration=configuration,
                 )
+                (
+                    recovered_background_review_results,
+                    recovered_background_review_errors,
+                ) = (
+                    _recover_parent_background_review_results(
+                        paths,
+                        trial_id=trial_id,
+                        case_id=case.case_id,
+                        plans=case.fixture.background_review_plans,
+                    )
+                )
                 result = _fallback_worker_result(
                     paths,
                     error_type="timeout",
@@ -794,6 +939,13 @@ class MyHermesTrialRunner:
                     variant_id=(None if variant is None else variant.variant_id),
                     configuration=configuration,
                     recovered_ablation=recovered_ablation,
+                    background_review_plans=case.fixture.background_review_plans,
+                    recovered_background_review_results=(
+                        recovered_background_review_results
+                    ),
+                    recovered_background_review_errors=(
+                        recovered_background_review_errors
+                    ),
                 )
                 result, recovered_memory = _redact_memory_facts(
                     result,
@@ -803,6 +955,10 @@ class MyHermesTrialRunner:
                 result, recovered_ablation = _redact_ablation_facts(
                     result,
                     recovered_ablation,
+                )
+                result = _redact_background_review_facts(
+                    result,
+                    sensitive_values,
                 )
                 atomic_write_json(paths.worker_result, result)
                 _ensure_empty_worker_artifacts(
@@ -815,6 +971,9 @@ class MyHermesTrialRunner:
                     variant_id=(None if variant is None else variant.variant_id),
                     configuration=configuration,
                     recovered_ablation=recovered_ablation,
+                    background_review_plans=case.fixture.background_review_plans,
+                    background_review_results=result.background_review_results,
+                    background_review_errors=result.background_review_errors,
                 )
                 return self._outcome_from_result(
                     result,
@@ -842,6 +1001,30 @@ class MyHermesTrialRunner:
                 if paths.ablation is None
                 else _read_protocol_model(paths.ablation, AblationArtifact)
             )
+            review_artifact = (
+                None
+                if paths.background_review_results is None
+                else _read_protocol_model(
+                    paths.background_review_results,
+                    BackgroundReviewArtifact,
+                )
+            )
+            review_evidence_artifact = (
+                None
+                if paths.background_review_evidence is None
+                else _read_protocol_model(
+                    paths.background_review_evidence,
+                    BackgroundReviewEvidenceArtifact,
+                )
+            )
+            review_snapshots_artifact = (
+                None
+                if paths.background_review_snapshots is None
+                else _read_protocol_model(
+                    paths.background_review_snapshots,
+                    BackgroundReviewSnapshotsArtifact,
+                )
+            )
             _validate_worker_artifacts(
                 request,
                 result,
@@ -849,6 +1032,9 @@ class MyHermesTrialRunner:
                 observations,
                 memory_artifact,
                 ablation_artifact,
+                review_artifact,
+                review_evidence_artifact,
+                review_snapshots_artifact,
                 returncode=process.returncode,
             )
             result, transcript = _redact_worker_content(
@@ -861,6 +1047,10 @@ class MyHermesTrialRunner:
                 memory_artifact,
                 sensitive_values,
             )
+            result = _redact_background_review_facts(
+                result,
+                sensitive_values,
+            )
             result, ablation_artifact = _redact_ablation_facts(
                 result,
                 ablation_artifact,
@@ -871,6 +1061,13 @@ class MyHermesTrialRunner:
                 atomic_write_json(paths.memory, memory_artifact)
             if paths.ablation is not None and ablation_artifact is not None:
                 atomic_write_json(paths.ablation, ablation_artifact)
+            _write_background_review_artifacts(
+                paths,
+                trial_id=trial_id,
+                case_id=case.case_id,
+                results=result.background_review_results,
+                errors=result.background_review_errors,
+            )
             status = (
                 RunnerStatus.COMPLETED
                 if result.worker_status is WorkerStatus.COMPLETED
@@ -931,6 +1128,17 @@ class MyHermesTrialRunner:
                 variant_id=(None if variant is None else variant.variant_id),
                 configuration=configuration,
             )
+            (
+                recovered_background_review_results,
+                recovered_background_review_errors,
+            ) = (
+                _recover_parent_background_review_results(
+                    paths,
+                    trial_id=trial_id,
+                    case_id=case.case_id,
+                    plans=case.fixture.background_review_plans,
+                )
+            )
             result = _fallback_worker_result(
                 paths,
                 error_type="environment_error",
@@ -942,6 +1150,13 @@ class MyHermesTrialRunner:
                 variant_id=(None if variant is None else variant.variant_id),
                 configuration=configuration,
                 recovered_ablation=recovered_ablation,
+                background_review_plans=case.fixture.background_review_plans,
+                recovered_background_review_results=(
+                    recovered_background_review_results
+                ),
+                recovered_background_review_errors=(
+                    recovered_background_review_errors
+                ),
             )
             result, recovered_memory = _redact_memory_facts(
                 result,
@@ -951,6 +1166,10 @@ class MyHermesTrialRunner:
             result, recovered_ablation = _redact_ablation_facts(
                 result,
                 recovered_ablation,
+            )
+            result = _redact_background_review_facts(
+                result,
+                sensitive_values,
             )
             try:
                 atomic_write_json(paths.worker_result, result)
@@ -964,6 +1183,9 @@ class MyHermesTrialRunner:
                     variant_id=(None if variant is None else variant.variant_id),
                     configuration=configuration,
                     recovered_ablation=recovered_ablation,
+                    background_review_plans=case.fixture.background_review_plans,
+                    background_review_results=result.background_review_results,
+                    background_review_errors=result.background_review_errors,
                 )
             except Exception as artifact_exc:
                 worker_warnings.append(
@@ -980,6 +1202,13 @@ class MyHermesTrialRunner:
                     variant_id=(None if variant is None else variant.variant_id),
                     configuration=configuration,
                     recovered_ablation=recovered_ablation,
+                    background_review_plans=case.fixture.background_review_plans,
+                    recovered_background_review_results=(
+                        recovered_background_review_results
+                    ),
+                    recovered_background_review_errors=(
+                        recovered_background_review_errors
+                    ),
                 )
             return self._outcome_from_result(
                 result,
@@ -1191,6 +1420,9 @@ class MyHermesTrialRunner:
             fact_context_observations=tuple(
                 result.fact_context_observations
             ),
+            background_review_results=tuple(result.background_review_results),
+            background_review_errors=tuple(result.background_review_errors),
+            review_gate_passed=result.review_gate_passed,
             tool_calls=tool_calls,
             tool_trace_complete=(
                 status is RunnerStatus.COMPLETED
@@ -1487,6 +1719,122 @@ def _redact_ablation_facts(
     return safe_result, safe_artifact
 
 
+def _redact_background_review_facts(
+    result: MyHermesWorkerResult,
+    _sensitive_values: tuple[str, ...],
+) -> MyHermesWorkerResult:
+    """Keep P5 result/artifact facts safe for local retention and replay.
+
+    Worker-produced P5 evidence and snapshots use dedicated content-free
+    contracts.  The parent therefore preserves their hashes, relationships,
+    and state revisions as-is, while replacing every remaining free-form
+    outcome or diagnostic string before it regenerates the three artifacts.
+    """
+    def safe_error(item):
+        return item.model_copy(
+            update={"message": "Background Review execution diagnostic"}
+        )
+
+    safe_results: list[BackgroundReviewExecutionResult] = []
+    for item in result.background_review_results:
+        outcome = item.outcome
+        if outcome is not None:
+            outcome_error = (
+                None
+                if outcome.error is None
+                else outcome.error.model_copy(
+                    update={
+                        "message": "Background Review execution diagnostic"
+                    }
+                )
+            )
+            outcome = outcome.model_copy(
+                update={
+                    "changes": [
+                        change.model_copy(
+                            update={"reason": "observed_live_state_change"}
+                        )
+                        for change in outcome.changes
+                    ],
+                    "no_op_reason": (
+                        None
+                        if outcome.no_op_reason is None
+                        else "review_no_op"
+                    ),
+                    "error": outcome_error,
+                    "metadata": {},
+                }
+            )
+        safe_results.append(
+            item.model_copy(
+                update={
+                    "outcome": outcome,
+                    "errors": [safe_error(value) for value in item.errors],
+                }
+            )
+        )
+    return result.model_copy(
+        update={
+            "background_review_results": safe_results,
+            "background_review_errors": [
+                safe_error(value) for value in result.background_review_errors
+            ],
+        }
+    )
+
+
+def _write_background_review_artifacts(
+    paths: WorkerArtifactPaths,
+    *,
+    trial_id: str,
+    case_id: str,
+    results: Sequence[BackgroundReviewExecutionResult],
+    errors: Sequence[BackgroundReviewExecutionError],
+) -> None:
+    """Rewrite all P5 projections from the same redacted parent fact set."""
+
+    artifact_paths = (
+        paths.background_review_results,
+        paths.background_review_evidence,
+        paths.background_review_snapshots,
+    )
+    if all(path is None for path in artifact_paths):
+        return
+    if any(path is None for path in artifact_paths):
+        raise WorkerProtocolError("P5 worker Artifact paths are incomplete")
+    results_path, evidence_path, snapshots_path = artifact_paths
+    assert results_path is not None
+    assert evidence_path is not None
+    assert snapshots_path is not None
+    result_values = list(results)
+    error_values = list(errors)
+    atomic_write_json(
+        results_path,
+        BackgroundReviewArtifact(
+            trial_id=trial_id,
+            case_id=case_id,
+            results=result_values,
+            errors=error_values,
+        ),
+    )
+    atomic_write_json(
+        evidence_path,
+        BackgroundReviewEvidenceArtifact(
+            trial_id=trial_id,
+            case_id=case_id,
+            results=result_values,
+        ),
+    )
+    atomic_write_json(
+        snapshots_path,
+        BackgroundReviewSnapshotsArtifact(
+            trial_id=trial_id,
+            case_id=case_id,
+            results=result_values,
+        ),
+    )
+
+
 def _redact_json_value(value, sensitive_values: tuple[str, ...]):
     if isinstance(value, str):
         return redact_text(value, sensitive_values)
@@ -1574,6 +1922,10 @@ def _is_memory_case(case: AuditCase) -> bool:
     )
 
 
+def _is_background_review_case(case: AuditCase) -> bool:
+    return bool(case.fixture.background_review_plans)
+
+
 def _capability_available(report: SubjectCapabilityReport, name: str) -> bool:
     capability = report.capability(name)
     return capability is not None and capability.available
@@ -1599,6 +1951,7 @@ def _worker_artifact_paths(
     *,
     memory_enabled: bool,
     ablation_enabled: bool,
+    background_review_enabled: bool,
 ) -> WorkerArtifactPaths:
     root = sandbox.artifacts_dir.resolve(strict=True)
     return WorkerArtifactPaths(
@@ -1611,6 +1964,21 @@ def _worker_artifact_paths(
         stderr_log=root / "worker.stderr.log",
         memory=(root / "memory.json" if memory_enabled else None),
         ablation=(root / "ablation.json" if ablation_enabled else None),
+        background_review_results=(
+            root / "background-review-results.json"
+            if background_review_enabled
+            else None
+        ),
+        background_review_evidence=(
+            root / "background-review-evidence.json"
+            if background_review_enabled
+            else None
+        ),
+        background_review_snapshots=(
+            root / "background-review-snapshots.json"
+            if background_review_enabled
+            else None
+        ),
     )
 
 
@@ -1706,6 +2074,9 @@ def _validate_worker_artifacts(
     observations: ObservationBundle,
     memory_artifact: MemoryArtifact | None,
     ablation_artifact: AblationArtifact | None,
+    review_artifact: BackgroundReviewArtifact | None,
+    review_evidence_artifact: BackgroundReviewEvidenceArtifact | None,
+    review_snapshots_artifact: BackgroundReviewSnapshotsArtifact | None,
     *,
     returncode: int,
 ) -> None:
@@ -1723,6 +2094,21 @@ def _validate_worker_artifacts(
             []
             if ablation_artifact is None
             else [ablation_artifact.protocol_version]
+        ),
+        *(
+            []
+            if review_artifact is None
+            else [review_artifact.protocol_version]
+        ),
+        *(
+            []
+            if review_evidence_artifact is None
+            else [review_evidence_artifact.protocol_version]
+        ),
+        *(
+            []
+            if review_snapshots_artifact is None
+            else [review_snapshots_artifact.protocol_version]
         ),
     }
     if len(protocol_versions) != 1:
@@ -1855,6 +2241,67 @@ def _validate_worker_artifacts(
             raise WorkerProtocolError(
                 "Ablation Artifact facts do not match worker result"
             )
+    if not request.background_review_plans:
+        if any(
+            item is not None
+            for item in (
+                review_artifact,
+                review_evidence_artifact,
+                review_snapshots_artifact,
+                result.background_review_results_artifact,
+                result.background_review_evidence_artifact,
+                result.background_review_snapshots_artifact,
+            )
+        ) or result.background_review_results or result.background_review_errors:
+            raise WorkerProtocolError("non-P5 worker returned Background Review facts")
+    else:
+        if any(
+            item is None
+            for item in (
+                review_artifact,
+                review_evidence_artifact,
+                review_snapshots_artifact,
+            )
+        ):
+            raise WorkerProtocolError("P5 worker did not return all Review Artifacts")
+        if (
+            result.background_review_results_artifact
+            != "artifacts/background-review-results.json"
+            or result.background_review_evidence_artifact
+            != "artifacts/background-review-evidence.json"
+            or result.background_review_snapshots_artifact
+            != "artifacts/background-review-snapshots.json"
+        ):
+            raise WorkerProtocolError("worker result names unexpected Review Artifacts")
+        assert review_artifact is not None
+        assert review_evidence_artifact is not None
+        assert review_snapshots_artifact is not None
+        if any(
+            artifact.trial_id != request.trial_id
+            or artifact.case_id != request.case_id
+            for artifact in (
+                review_artifact,
+                review_evidence_artifact,
+                review_snapshots_artifact,
+            )
+        ):
+            raise WorkerProtocolError("Background Review Artifact identity does not match request")
+        planned = {item.review_id: item for item in request.background_review_plans}
+        result_ids = {item.review_id for item in result.background_review_results}
+        if result_ids != set(planned):
+            raise WorkerProtocolError("Background Review result coverage does not match plans")
+        if review_artifact.results != result.background_review_results or (
+            review_artifact.errors != result.background_review_errors
+        ):
+            raise WorkerProtocolError("Background Review result Artifact facts do not match worker result")
+        if review_evidence_artifact.results != result.background_review_results or (
+            review_snapshots_artifact.results != result.background_review_results
+        ):
+            raise WorkerProtocolError("Background Review evidence/snapshot Artifacts do not match result")
+        for item in result.background_review_results:
+            plan = planned[item.review_id]
+            if item.kind is not plan.kind or item.lifecycle is not plan.lifecycle:
+                raise WorkerProtocolError("Background Review result does not match plan")
     if result.worker_status is WorkerStatus.COMPLETED and returncode != 0:
         raise WorkerProtocolError(
             "worker returned a completed envelope with non-zero exit status"
@@ -1881,6 +2328,118 @@ def _validate_worker_artifacts(
         raise WorkerProtocolError("worker tool names do not match Observations")
 
 
+def _fallback_background_review_results(
+    plans: Sequence[BackgroundReviewPlan],
+    *,
+    error_type: str,
+    message: str,
+) -> list[BackgroundReviewExecutionResult]:
+    """Produce complete, side-effect-free P5 facts for parent fallbacks.
+
+    A timeout or worker-envelope failure must not silently erase a declared
+    Review Plan.  These facts say only that no executable claim lifecycle was
+    completed; they never infer a Subject decision or mutate Subject state.
+    """
+
+    results: list[BackgroundReviewExecutionResult] = []
+    for plan in plans:
+        execution_error = BackgroundReviewExecutionError(
+            error_type=error_type,
+            stage="parent_fallback",
+            message=message,
+            retryable=False,
+        )
+        attempts = [
+            ReviewAttempt(
+                sequence=1,
+                claim_valid=False,
+                loop_executed=False,
+                model_call_count=0,
+                tool_call_count=0,
+                state_change_count=0,
+                error_type=error_type,
+            )
+        ]
+        if plan.lifecycle is ReviewLifecycle.DUPLICATE_EXECUTE:
+            attempts.append(
+                ReviewAttempt(
+                    sequence=2,
+                    claim_valid=False,
+                    loop_executed=False,
+                    model_call_count=0,
+                    tool_call_count=0,
+                    state_change_count=0,
+                    error_type=error_type,
+                )
+            )
+        results.append(
+            BackgroundReviewExecutionResult(
+                review_id=plan.review_id,
+                kind=plan.kind,
+                lifecycle=plan.lifecycle,
+                status=ReviewStatus.FAILED,
+                actual_action=ReviewAction.NO_OP,
+                outcome=ReviewOutcome(
+                    review_id=plan.review_id,
+                    kind=plan.kind,
+                    status=ReviewStatus.FAILED,
+                    error=ReviewError(error_type=error_type, message=message),
+                ),
+                attempts=attempts,
+                attempt_count=len(attempts),
+                duplicate_rejected=(
+                    plan.lifecycle is ReviewLifecycle.DUPLICATE_EXECUTE
+                ),
+                duration_ms=0,
+                errors=[execution_error],
+            )
+        )
+    return results
+
+
+def _merge_recovered_background_review_results(
+    plans: Sequence[BackgroundReviewPlan],
+    recovered: Sequence[BackgroundReviewExecutionResult],
+    *,
+    error_type: str,
+    message: str,
+) -> list[BackgroundReviewExecutionResult]:
+    """Retain verified checkpoint facts and fill only missing P5 plans."""
+
+    recovered_by_id = {item.review_id: item for item in recovered}
+    missing_plans = [plan for plan in plans if plan.review_id not in recovered_by_id]
+    fallback_by_id = {
+        item.review_id: item
+        for item in _fallback_background_review_results(
+            missing_plans,
+            error_type=error_type,
+            message=message,
+        )
+    }
+    return [
+        (
+            recovered_by_id[plan.review_id]
+            if plan.review_id in recovered_by_id
+            else fallback_by_id[plan.review_id]
+        )
+        for plan in plans
+    ]
+
+
+def _merge_recovered_background_review_errors(
+    recovered: Sequence[BackgroundReviewExecutionError],
+    results: Sequence[BackgroundReviewExecutionResult],
+) -> list[BackgroundReviewExecutionError]:
+    """Preserve checkpoint-level diagnostics alongside per-plan errors."""
+
+    merged = list(recovered)
+    for result in results:
+        for error in result.errors:
+            if error not in merged:
+                merged.append(error)
+    return merged
+
+
 def _fallback_worker_result(
     paths: WorkerArtifactPaths,
     *,
@@ -1893,6 +2452,13 @@ def _fallback_worker_result(
     variant_id: str | None = None,
     configuration: EffectiveSubjectConfiguration | None = None,
     recovered_ablation: AblationArtifact | None = None,
+    background_review_plans: Sequence[BackgroundReviewPlan] = (),
+    recovered_background_review_results: Sequence[
+        BackgroundReviewExecutionResult
+    ] = (),
+    recovered_background_review_errors: Sequence[
+        BackgroundReviewExecutionError
+    ] = (),
 ) -> MyHermesWorkerResult:
     protocol_errors = (
         []
@@ -1910,6 +2476,16 @@ def _fallback_worker_result(
         *([] if recovered_memory is None else recovered_memory.errors),
         *protocol_errors,
     ]
+    background_review_results = _merge_recovered_background_review_results(
+        background_review_plans,
+        recovered_background_review_results,
+        error_type="background_review_protocol_error",
+        message="Background Review pipeline did not return a complete Worker envelope",
+    )
+    background_review_errors = _merge_recovered_background_review_errors(
+        recovered_background_review_errors,
+        background_review_results,
+    )
     return MyHermesWorkerResult(
         worker_status=WorkerStatus.FAILED,
         runtime_status=error_type,
@@ -1956,6 +2532,23 @@ def _fallback_worker_result(
             if recovered_ablation is None
             else recovered_ablation.fact_context_observations
         ),
+        background_review_results_artifact=(
+            None
+            if not background_review_plans
+            else f"artifacts/{paths.background_review_results.name}"
+        ),
+        background_review_evidence_artifact=(
+            None
+            if not background_review_plans
+            else f"artifacts/{paths.background_review_evidence.name}"
+        ),
+        background_review_snapshots_artifact=(
+            None
+            if not background_review_plans
+            else f"artifacts/{paths.background_review_snapshots.name}"
+        ),
+        background_review_results=background_review_results,
+        background_review_errors=background_review_errors,
         warnings=list(warnings),
         error=WorkerError(error_type=error_type, message=message),
     )
@@ -1984,6 +2577,9 @@ def _ensure_empty_worker_artifacts(
     variant_id: str | None,
     configuration: EffectiveSubjectConfiguration | None,
     recovered_ablation: AblationArtifact | None,
+    background_review_plans: Sequence[BackgroundReviewPlan] = (),
+    background_review_results: Sequence[BackgroundReviewExecutionResult] = (),
+    background_review_errors: Sequence[BackgroundReviewExecutionError] = (),
 ) -> None:
     if not paths.observations.exists():
         atomic_write_json(paths.observations, ObservationBundle())
@@ -2014,6 +2610,46 @@ def _ensure_empty_worker_artifacts(
                 case_id=case_id,
                 variant_id=variant_id,
                 effective_subject_configuration=configuration,
+            ),
+        )
+    if background_review_plans:
+        if (
+            paths.background_review_results is None
+            or paths.background_review_evidence is None
+            or paths.background_review_snapshots is None
+        ):
+            raise WorkerProtocolError("P5 fallback paths are incomplete")
+        results = list(background_review_results) or _fallback_background_review_results(
+            background_review_plans,
+            error_type="background_review_protocol_error",
+            message="Background Review pipeline did not return a complete Worker envelope",
+        )
+        errors = list(background_review_errors) or [
+            error for item in results for error in item.errors
+        ]
+        atomic_write_json(
+            paths.background_review_results,
+            BackgroundReviewArtifact(
+                trial_id=trial_id,
+                case_id=case_id,
+                results=results,
+                errors=errors,
+            ),
+        )
+        atomic_write_json(
+            paths.background_review_evidence,
+            BackgroundReviewEvidenceArtifact(
+                trial_id=trial_id,
+                case_id=case_id,
+                results=results,
+            ),
+        )
+        atomic_write_json(
+            paths.background_review_snapshots,
+            BackgroundReviewSnapshotsArtifact(
+                trial_id=trial_id,
+                case_id=case_id,
+                results=results,
             ),
         )
 
@@ -2062,6 +2698,54 @@ def _recover_parent_ablation_artifact(
     ):
         return None
     return artifact
+
+
+def _recover_parent_background_review_results(
+    paths: WorkerArtifactPaths,
+    *,
+    trial_id: str,
+    case_id: str,
+    plans: Sequence[BackgroundReviewPlan],
+) -> tuple[
+    list[BackgroundReviewExecutionResult],
+    list[BackgroundReviewExecutionError],
+]:
+    """Recover a validated P5 result checkpoint after worker loss.
+
+    The result Artifact contains the content-free evidence and snapshots for
+    each plan.  It is sufficient for recovery even if termination interrupted
+    publication of either derived Artifact; the fallback path rewrites all
+    three projections from the recovered result set.
+    """
+
+    if not plans or paths.background_review_results is None:
+        return [], []
+    try:
+        artifact = _read_protocol_model(
+            paths.background_review_results,
+            BackgroundReviewArtifact,
+        )
+    except Exception:
+        return [], []
+    if artifact.trial_id != trial_id or artifact.case_id != case_id:
+        return [], []
+    planned_by_id = {plan.review_id: plan for plan in plans}
+    recovered_by_id = {item.review_id: item for item in artifact.results}
+    if any(
+        review_id not in planned_by_id
+        or item.kind is not planned_by_id[review_id].kind
+        or item.lifecycle is not planned_by_id[review_id].lifecycle
+        for review_id, item in recovered_by_id.items()
+    ):
+        return [], []
+    return (
+        [
+            recovered_by_id[plan.review_id]
+            for plan in plans
+            if plan.review_id in recovered_by_id
+        ],
+        list(artifact.errors),
+    )
 
 
 __all__ = ("MyHermesTrialRunner",)

@@ -27,6 +27,9 @@ from myhermes_audit.validators.base import (
     validator_error_metric,
 )
 from myhermes_audit.validators.ablation import evaluate_ablation
+from myhermes_audit.validators.background_review import (
+    evaluate_background_review_expectation,
+)
 from myhermes_audit.validators.file import FileValidator
 from myhermes_audit.validators.json_file import JsonFileValidator
 from myhermes_audit.validators.memory import (
@@ -161,6 +164,14 @@ class ValidatorResultsArtifact(ContractModel):
         )
 
     @property
+    def review_hard_gates_passed(self) -> bool | None:
+        """Aggregate only the required P5 Review hard gates."""
+
+        return self.required_gate_status(
+            evaluator_kind=EvaluatorKind.BACKGROUND_REVIEW,
+        )
+
+    @property
     def hard_gates_passed(self) -> bool:
         """Compatibility alias for task_hard_gates_passed."""
 
@@ -210,6 +221,7 @@ def preflight_evaluators(case: AuditCase) -> None:
     tool_trajectory_covered = False
     retrieval_covered = False
     compression_covered = False
+    background_review_covered = False
     covered_judges: set[int] = set()
     for evaluator in case.evaluators:
         if evaluator.kind is EvaluatorKind.DETERMINISTIC:
@@ -308,6 +320,27 @@ def preflight_evaluators(case: AuditCase) -> None:
                 )
             compression_covered = True
             continue
+        if evaluator.kind is EvaluatorKind.BACKGROUND_REVIEW:
+            if evaluator.config:
+                raise UnsupportedCaseError(
+                    "background_review evaluator config must be empty; use strict P5 contracts",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            if background_review_covered:
+                raise UnsupportedCaseError(
+                    "Background Review expectations cannot be evaluated more than once",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            if not case.fixture.background_review_plans or not case.expected.background_reviews:
+                raise UnsupportedCaseError(
+                    "background_review evaluator requires runtime plans and expectations",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            background_review_covered = True
+            continue
         raise UnsupportedCaseError(
             "evaluator kind is outside the P1 boundary",
             case_id=case.case_id,
@@ -333,6 +366,8 @@ def preflight_evaluators(case: AuditCase) -> None:
         orphan_groups.append("memories")
     if case.ablation is not None and not compression_covered:
         orphan_groups.append("ablation")
+    if case.expected.background_reviews and not background_review_covered:
+        orphan_groups.append("background_reviews")
     if orphan_groups:
         raise UnsupportedCaseError(
             "P1 expectations must be attached to an evaluator",
@@ -441,6 +476,32 @@ def _evaluate_one(
                     context,
                     metric_name=(
                         f"{evaluator.evaluator_id}.state.{expectation.state_id}"
+                    ),
+                )
+            )
+        return [
+            _attach_evaluator_metadata(result, evaluator)
+            for result in results
+        ]
+    elif evaluator.kind is EvaluatorKind.BACKGROUND_REVIEW:
+        if evaluator.config:
+            raise UnsupportedCaseError(
+                "background_review evaluator config must be empty",
+                evaluator_id=evaluator.evaluator_id,
+            )
+        results: list[MetricResult] = []
+        for expectation in case.expected.background_reviews:
+            if expectation.review_id is None:
+                raise UnsupportedCaseError(
+                    "runtime Background Review expectation requires review_id",
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            results.extend(
+                evaluate_background_review_expectation(
+                    expectation,
+                    context,
+                    metric_prefix=(
+                        f"{evaluator.evaluator_id}.review.{expectation.review_id}"
                     ),
                 )
             )

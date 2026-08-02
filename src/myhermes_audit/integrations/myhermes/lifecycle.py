@@ -14,10 +14,10 @@ def close_runtime_resources(
     session_ids: Sequence[str] = (),
     process_manager,
     model_client,
+    shutdown_background_review: bool = True,
 ) -> list[WorkerWarning]:
     # All imports are intentionally lazy; see worker.py's import boundary.
     from hermes.delegate_jobs import shutdown_delegate_jobs
-    from hermes.review.runtime import shutdown_background_review_runtime
     from hermes.session_resources import (
         cleanup_all_session_resources,
         cleanup_session_resources,
@@ -31,13 +31,16 @@ def close_runtime_resources(
             warnings.append(_warning("database_close_error"))
 
     background_complete = True
-    try:
-        background_complete = shutdown_background_review_runtime(2.0) == 0
-    except Exception:
-        background_complete = False
-        warnings.append(_warning("background_review_shutdown_error"))
-    if not background_complete:
-        warnings.append(_warning("background_review_shutdown_incomplete"))
+    if shutdown_background_review:
+        try:
+            from hermes.review.runtime import shutdown_background_review_runtime
+
+            background_complete = shutdown_background_review_runtime(2.0) == 0
+        except Exception:
+            background_complete = False
+            warnings.append(_warning("background_review_shutdown_error"))
+        if not background_complete:
+            warnings.append(_warning("background_review_shutdown_incomplete"))
 
     delegate_complete = True
     try:

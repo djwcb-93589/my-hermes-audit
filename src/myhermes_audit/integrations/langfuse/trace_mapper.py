@@ -26,6 +26,14 @@ CHECKPOINT_NAME = "myhermes.audit.checkpoint"
 FACT_RETENTION_NAME = "myhermes.audit.fact_retention"
 DISTORTION_NAME = "myhermes.audit.distortion"
 ABLATION_COMPARISON_NAME = "myhermes.audit.ablation.comparison"
+BACKGROUND_REVIEW_NAME = "myhermes.audit.background_review"
+BACKGROUND_REVIEW_FOREGROUND_EVIDENCE_NAME = "myhermes.audit.background_review.foreground_evidence"
+BACKGROUND_REVIEW_PREPARED_EVIDENCE_NAME = "myhermes.audit.background_review.prepared_evidence"
+BACKGROUND_REVIEW_TOOL_NAME = "myhermes.audit.background_review.tool"
+BACKGROUND_REVIEW_SNAPSHOT_NAME = "myhermes.audit.background_review.snapshot"
+BACKGROUND_REVIEW_CHANGE_NAME = "myhermes.audit.background_review.observed_change"
+BACKGROUND_REVIEW_LIFECYCLE_NAME = "myhermes.audit.background_review.lifecycle"
+BACKGROUND_REVIEW_EVALUATOR_NAME = "myhermes.audit.background_review.evaluator"
 
 
 def publish_replay_observations(
@@ -39,6 +47,7 @@ def publish_replay_observations(
     runtime = trial.runtime
     memory_enabled = _has_memory_facts(request)
     p4_enabled = trial.variant_id is not None
+    p5_enabled = _has_background_review_facts(request)
     metadata = {
         "suite_id": request.suite_id,
         "suite_sha256": request.suite_sha256,
@@ -127,6 +136,22 @@ def publish_replay_observations(
             if p4_enabled
             else {}
         ),
+        **(
+            {
+                "background_review_plan_count": len(
+                    request.case.fixture.background_review_plans
+                ),
+                "background_review_result_count": len(
+                    trial.background_review_results
+                ),
+                "background_review_error_count": len(
+                    trial.background_review_errors
+                ),
+                "review_gate_passed": trial.review_gate_passed,
+            }
+            if p5_enabled
+            else {}
+        ),
         "post_hoc_publication": True,
         "runtime_timestamps_not_replayed": True,
         "experiment_runner_replay": True,
@@ -144,7 +169,11 @@ def publish_replay_observations(
         sensitive_values=sensitive_values,
     )
     session_id = f"audit:{request.experiment.audit_run_id}:{trial.trial_id}"
-    version = "p4" if p4_enabled else ("p3" if memory_enabled else "p2")
+    version = (
+        "p5"
+        if p5_enabled
+        else ("p4" if p4_enabled else ("p3" if memory_enabled else "p2"))
+    )
     with propagate_attributes(
         session_id=session_id[:200],
         metadata={
@@ -165,6 +194,7 @@ def publish_replay_observations(
         ) as root:
             _publish_turns(root, request, sensitive_values=sensitive_values)
             _publish_memory(root, request, sensitive_values=sensitive_values)
+            _publish_background_reviews(root, request)
             _publish_evaluators(root, request, sensitive_values=sensitive_values)
             _publish_ablation(root, request)
 
@@ -341,29 +371,38 @@ def _publish_evaluators(
             JUDGE_NAME
             if metric.source is MetricSource.JUDGE
             else (
-                MEMORY_EVALUATOR_NAME
-                if metric.source is MetricSource.RETRIEVAL
+                BACKGROUND_REVIEW_EVALUATOR_NAME
+                if metric.source is MetricSource.BACKGROUND_REVIEW
                 else (
-                    FACT_RETENTION_NAME
-                    if metric.source is MetricSource.COMPRESSION
-                    else VALIDATOR_NAME
+                    MEMORY_EVALUATOR_NAME
+                    if metric.source is MetricSource.RETRIEVAL
+                    else (
+                        FACT_RETENTION_NAME
+                        if metric.source is MetricSource.COMPRESSION
+                        else VALIDATOR_NAME
+                    )
                 )
             )
         )
+        is_background_review_metric = metric.source is MetricSource.BACKGROUND_REVIEW
         evaluator = root.start_observation(
             name=name,
             as_type="evaluator",
             input={"metric_name": metric.metric_name},
-            output=project_remote_content(
-                {
-                    "status": metric.status.value,
-                    "value": metric.value,
-                    "passed": metric.passed,
-                    "reason": metric.reason,
-                },
-                classification=request.data_classification,
-                no_content=request.no_content,
-                sensitive_values=sensitive_values,
+            output=(
+                _safe_background_review_metric(metric)
+                if is_background_review_metric
+                else project_remote_content(
+                    {
+                        "status": metric.status.value,
+                        "value": metric.value,
+                        "passed": metric.passed,
+                        "reason": metric.reason,
+                    },
+                    classification=request.data_classification,
+                    no_content=request.no_content,
+                    sensitive_values=sensitive_values,
+                )
             ),
             metadata={
                 "metric_source": metric.source.value,
@@ -371,14 +410,126 @@ def _publish_evaluators(
                 "post_hoc_publication": True,
             },
             version=(
-                "p4"
-                if metric.source is MetricSource.COMPRESSION
+                "p5"
+                if is_background_review_metric
                 else (
-                    "p3" if metric.source is MetricSource.RETRIEVAL else "p2"
+                    "p4"
+                    if metric.source is MetricSource.COMPRESSION
+                    else ("p3" if metric.source is MetricSource.RETRIEVAL else "p2")
                 )
             ),
         )
         evaluator.end()
+
+
+def _safe_background_review_metric(metric) -> dict:
+    """Project a fixed P5 metric allow-list, never arbitrary validator data."""
+
+    value = metric.value if isinstance(metric.value, dict) else {}
+    metric_type = metric.metadata.get("metric_type")
+    safe_value: dict[str, object] = {}
+    if metric_type == "decision_correctness":
+        checks = value.get("checks")
+        safe_value = {
+            "status": value.get("status"),
+            "actual_action": value.get("actual_action"),
+            "has_actual_target": value.get("has_actual_target"),
+            "checks": (
+                {
+                    str(key): bool(item)
+                    for key, item in checks.items()
+                    if isinstance(key, str) and isinstance(item, bool)
+                }
+                if isinstance(checks, dict)
+                else {}
+            ),
+        }
+    elif metric_type == "evidence_completeness":
+        safe_value = {
+            "prepared_evidence_count": value.get("prepared_evidence_count"),
+            "missing_required_kinds": _safe_review_evidence_kinds(
+                value.get("missing_required_kinds")
+            ),
+            "present_forbidden_kinds": _safe_review_evidence_kinds(
+                value.get("present_forbidden_kinds")
+            ),
+            "unlinked_prepared_evidence_count": value.get(
+                "unlinked_prepared_evidence_count"
+            ),
+            "outside_foreground_window_count": value.get(
+                "outside_foreground_window_count"
+            ),
+            "prepared_order_valid": value.get("prepared_order_valid"),
+        }
+    elif metric_type == "update_correctness":
+        safe_value = {
+            "changed_target_count": value.get("changed_target_count"),
+            "missing_required_change_count": _safe_list_count(
+                value.get("missing_required_changes")
+            ),
+            "forbidden_change_count": _safe_list_count(
+                value.get("forbidden_changes")
+            ),
+            "unexpected_change_count": _safe_list_count(
+                value.get("unexpected_changes")
+            ),
+            "expected_target_revision_matched": value.get(
+                "expected_target_revision_matched"
+            ),
+        }
+    elif metric_type == "stale_rejection":
+        safe_value = {
+            "status": value.get("status"),
+            "stale_rejected": value.get("stale_rejected"),
+            "changed_after_stale": value.get("changed_after_stale"),
+        }
+    elif metric_type == "side_effect_safety":
+        safe_value = {
+            "protected_changed_count": _safe_list_count(
+                value.get("protected_changed")
+            ),
+            "unexpected_change_count": _safe_list_count(
+                value.get("unexpected_changes")
+            ),
+            "half_write_detected": value.get("half_write_detected"),
+            "status": value.get("status"),
+        }
+    elif metric_type == "idempotency":
+        safe_value = {
+            "attempt_count": value.get("attempt_count"),
+            "duplicate_rejected": value.get("duplicate_rejected"),
+            "first_attempt_executed": value.get("first_attempt_executed"),
+            "second_attempt_zero_side_effects": value.get(
+                "second_attempt_zero_side_effects"
+            ),
+        }
+    return {
+        "status": metric.status.value,
+        "passed": metric.passed,
+        "metric_type": metric_type,
+        "review_id": metric.metadata.get("review_id"),
+        "value": safe_value,
+        "content_omitted": True,
+    }
+
+
+def _safe_review_evidence_kinds(value: object) -> list[str]:
+    """Keep only the closed public evidence-kind vocabulary in a metric."""
+
+    allowed = {
+        "user_message",
+        "tool_observation",
+        "tool_error",
+        "assistant_decision_unverified",
+        "assistant_report_unverified",
+    }
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item in allowed]
+
+
+def _safe_list_count(value: object) -> int:
+    return len(value) if isinstance(value, list) else 0
 
 
 def _publish_ablation(root: Any, request: LangfuseTrialRequest) -> None:
@@ -739,6 +890,211 @@ def _memory_item_projection(
     }
 
 
+def _publish_background_reviews(root: Any, request: LangfuseTrialRequest) -> None:
+    """Replay only safe P5 facts; never publish evidence or state bodies."""
+
+    trial = request.trial
+    if not _has_background_review_facts(request):
+        return
+    for result in trial.background_review_results:
+        review = root.start_observation(
+            name=BACKGROUND_REVIEW_NAME,
+            as_type="span",
+            input={
+                "review_id": result.review_id,
+                "kind": result.kind.value,
+                "lifecycle": result.lifecycle.value,
+            },
+            output={
+                "status": result.status.value,
+                "actual_action": result.actual_action.value,
+                "has_actual_target": result.actual_target is not None,
+                "attempt_count": result.attempt_count,
+                "duplicate_rejected": result.duplicate_rejected,
+                "stale_rejected": result.stale_rejected,
+                "duration_ms": result.duration_ms,
+                "error_types": [item.error_type for item in result.errors],
+            },
+            metadata={
+                "post_hoc_publication": True,
+                "content_uploaded": False,
+                "foreground_evidence_count": len(result.foreground_evidence),
+                "prepared_evidence_count": len(result.subject_review_evidence),
+                "tool_observation_count": len(result.tool_observations),
+                "observed_change_count": len(result.observed_changes),
+            },
+            version="p5",
+        )
+        try:
+            _publish_review_evidence(
+                review,
+                result.review_id,
+                result.foreground_evidence,
+                name=BACKGROUND_REVIEW_FOREGROUND_EVIDENCE_NAME,
+                source="foreground",
+            )
+            _publish_review_evidence(
+                review,
+                result.review_id,
+                result.subject_review_evidence,
+                name=BACKGROUND_REVIEW_PREPARED_EVIDENCE_NAME,
+                source="subject_prepared",
+            )
+            for item in result.tool_observations:
+                observation = review.start_observation(
+                    name=BACKGROUND_REVIEW_TOOL_NAME,
+                    as_type="tool",
+                    input={"content_omitted": True},
+                    output={
+                        "success": item.success,
+                        "status": item.status,
+                        "error_type": item.error_type,
+                    },
+                    metadata={
+                        "review_id": result.review_id,
+                        "tool_name": item.tool_name,
+                        "duration_ms": item.duration_ms,
+                        "post_hoc_publication": True,
+                        "content_uploaded": False,
+                    },
+                    version="p5",
+                )
+                observation.end()
+            for phase, snapshot in (
+                ("before", result.before_snapshot),
+                ("after", result.after_snapshot),
+            ):
+                if snapshot is not None:
+                    _publish_review_snapshot(
+                        review,
+                        review_id=result.review_id,
+                        phase=phase,
+                        snapshot=snapshot,
+                    )
+            for change in result.observed_changes:
+                observation = review.start_observation(
+                    name=BACKGROUND_REVIEW_CHANGE_NAME,
+                    as_type="span",
+                    input={
+                        "target_type": change.target_type,
+                        "target_id_sha256": _identifier_sha256(change.target_id),
+                    },
+                    output={
+                        "action": change.action.value,
+                        "before_hash": change.before_hash,
+                        "after_hash": change.after_hash,
+                        "before_governance_revision": change.before_governance_revision,
+                        "after_governance_revision": change.after_governance_revision,
+                    },
+                    metadata={
+                        "review_id": result.review_id,
+                        "post_hoc_publication": True,
+                        "content_uploaded": False,
+                    },
+                    version="p5",
+                )
+                observation.end()
+            lifecycle = review.start_observation(
+                name=BACKGROUND_REVIEW_LIFECYCLE_NAME,
+                as_type="span",
+                input={
+                    "review_id": result.review_id,
+                    "lifecycle": result.lifecycle.value,
+                },
+                output={
+                    "attempts": [
+                        {
+                            "sequence": item.sequence,
+                            "claim_valid": item.claim_valid,
+                            "loop_executed": item.loop_executed,
+                            "model_call_count": item.model_call_count,
+                            "tool_call_count": item.tool_call_count,
+                            "state_change_count": item.state_change_count,
+                            "error_type": item.error_type,
+                        }
+                        for item in result.attempts
+                    ],
+                    "duplicate_rejected": result.duplicate_rejected,
+                    "stale_rejected": result.stale_rejected,
+                },
+                metadata={"post_hoc_publication": True, "content_uploaded": False},
+                version="p5",
+            )
+            lifecycle.end()
+        finally:
+            review.end()
+
+
+def _publish_review_evidence(
+    parent: Any,
+    review_id: str,
+    items: list,
+    *,
+    name: str,
+    source: str,
+) -> None:
+    for item in items:
+        observation = parent.start_observation(
+            name=name,
+            as_type="span",
+            input={
+                "review_id": review_id,
+                "kind": item.kind.value,
+                "sequence": item.sequence,
+            },
+            output={
+                "content_sha256": item.content_sha256,
+                "content_length": item.content_length,
+                "source_turn_number": item.source_turn_number,
+                "source_tool_call_id": item.source_tool_call_id,
+                "source_evidence_id": item.source_evidence_id,
+                "content_omitted": True,
+            },
+            metadata={
+                "source": source,
+                "post_hoc_publication": True,
+                "content_uploaded": False,
+            },
+            version="p5",
+        )
+        observation.end()
+
+
+def _publish_review_snapshot(
+    parent: Any,
+    *,
+    review_id: str,
+    phase: str,
+    snapshot,
+) -> None:
+    observation = parent.start_observation(
+        name=BACKGROUND_REVIEW_SNAPSHOT_NAME,
+        as_type="span",
+        input={"review_id": review_id, "phase": phase},
+        output={
+            "snapshot_id": snapshot.snapshot_id,
+            "memory_item_count": (
+                None if snapshot.memory is None else len(snapshot.memory.items)
+            ),
+            "skill_count": len(snapshot.skills),
+            "skill_revisions": [
+                {
+                    "revision": item.revision,
+                    "governance_revision": item.governance_revision,
+                    "source": item.source.value,
+                    "managed_by": item.managed_by.value,
+                    "pinned": item.pinned,
+                }
+                for item in snapshot.skills
+            ],
+            "content_omitted": True,
+        },
+        metadata={"post_hoc_publication": True, "content_uploaded": False},
+        version="p5",
+    )
+    observation.end()
+
+
 def _text_projection(
     value: str,
     *,
@@ -782,6 +1138,19 @@ def _has_memory_facts(request: LangfuseTrialRequest) -> bool:
             bool(trial.memory_errors),
         )
     )
+
+
+def _has_background_review_facts(request: LangfuseTrialRequest) -> bool:
+    trial = request.trial
+    return bool(
+        request.case.fixture.background_review_plans
+        or trial.background_review_results
+        or trial.background_review_errors
+    )
+
+
+def _identifier_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _publish_judge_generation(
@@ -879,6 +1248,14 @@ def _case_input(request: LangfuseTrialRequest) -> dict:
 
 __all__ = (
     "ABLATION_COMPARISON_NAME",
+    "BACKGROUND_REVIEW_CHANGE_NAME",
+    "BACKGROUND_REVIEW_EVALUATOR_NAME",
+    "BACKGROUND_REVIEW_FOREGROUND_EVIDENCE_NAME",
+    "BACKGROUND_REVIEW_LIFECYCLE_NAME",
+    "BACKGROUND_REVIEW_NAME",
+    "BACKGROUND_REVIEW_PREPARED_EVIDENCE_NAME",
+    "BACKGROUND_REVIEW_SNAPSHOT_NAME",
+    "BACKGROUND_REVIEW_TOOL_NAME",
     "CHECKPOINT_NAME",
     "COMPRESSION_NAME",
     "DISTORTION_NAME",

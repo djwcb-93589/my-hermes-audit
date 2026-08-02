@@ -255,7 +255,13 @@ class AuditOrchestrator:
         try:
             sandbox.create()
             sandbox_created = True
-            _, fixture_manifest_path = materialize_fixtures(case.fixture, sandbox)
+            _, fixture_manifest_path = materialize_fixtures(
+                case.fixture,
+                sandbox,
+                allow_background_review=bool(
+                    case.fixture.background_review_plans
+                ),
+            )
             if variant is None:
                 outcome = self.runner.run_trial(
                     case,
@@ -287,6 +293,8 @@ class AuditOrchestrator:
                 context_diagnostics=outcome.context_diagnostics,
                 fact_context_observations=outcome.fact_context_observations,
                 variant_id=(None if variant is None else variant.variant_id),
+                background_review_results=outcome.background_review_results,
+                background_review_errors=outcome.background_review_errors,
             )
             validator_result = evaluate_case(
                 case,
@@ -332,6 +340,16 @@ class AuditOrchestrator:
                         ),
                         variant_id=(
                             None if variant is None else variant.variant_id
+                        ),
+                        background_review_results=(
+                            ()
+                            if outcome is None
+                            else outcome.background_review_results
+                        ),
+                        background_review_errors=(
+                            ()
+                            if outcome is None
+                            else outcome.background_review_errors
                         ),
                     )
                     validator_result = evaluate_case(
@@ -393,7 +411,14 @@ class AuditOrchestrator:
             and validator_result is not None
             and validator_result.task_hard_gates_passed
         )
-        task_passed = local_required_gates_passed
+        review_gate_passed = (
+            None
+            if validator_result is None
+            else validator_result.review_hard_gates_passed
+        )
+        task_passed = (
+            local_required_gates_passed and review_gate_passed is not False
+        )
         judge_gate_passed = (
             judge_evaluation is None
             or not judge_evaluation.required
@@ -402,7 +427,7 @@ class AuditOrchestrator:
                 and judge_evaluation.metric.passed is True
             )
         )
-        passed = local_required_gates_passed and judge_gate_passed
+        passed = task_passed and judge_gate_passed
         should_preserve = preserve_all or (preserve and not passed)
         if sandbox_created:
             if should_preserve:
@@ -570,6 +595,17 @@ class AuditOrchestrator:
                     if validator_result is None
                     else validator_result.required_fact_hard_gates_passed
                 ),
+                background_review_results=(
+                    []
+                    if outcome is None
+                    else list(outcome.background_review_results)
+                ),
+                background_review_errors=(
+                    []
+                    if outcome is None
+                    else list(outcome.background_review_errors)
+                ),
+                review_gate_passed=review_gate_passed,
                 metrics=metrics,
                 judge_result=(
                     None if judge_evaluation is None else judge_evaluation.result

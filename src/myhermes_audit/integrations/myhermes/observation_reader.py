@@ -39,6 +39,7 @@ def read_observations(
     sqlite_path: Path,
     *,
     run_durations: dict[str, int],
+    include_run_ids: frozenset[str] | None = None,
 ) -> ObservationBundle:
     from hermes.observability import (
         ModelCallObservationView,
@@ -74,6 +75,8 @@ def read_observations(
     model_calls: list[ModelObservationRecord] = []
     tool_calls: list[ToolObservationRecord] = []
     for item in collected:
+        if include_run_ids is not None and item.run_id not in include_run_ids:
+            continue
         if isinstance(item, RunObservationView):
             runs.append(
                 RunObservationRecord(

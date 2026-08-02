@@ -2,6 +2,9 @@
 
 from myhermes_audit.validators.file import FileValidator
 from myhermes_audit.validators.ablation import AblationEvaluation, evaluate_ablation
+from myhermes_audit.validators.background_review import (
+    evaluate_background_review_expectation,
+)
 from myhermes_audit.validators.base import ValidationContext
 from myhermes_audit.validators.engine import (
     EvaluatorValidationResult,
@@ -25,6 +28,7 @@ __all__ = (
     "ValidatorResultsArtifact",
     "evaluate_case",
     "evaluate_ablation",
+    "evaluate_background_review_expectation",
     "preflight_evaluators",
     "resolve_judge_expectation",
 )

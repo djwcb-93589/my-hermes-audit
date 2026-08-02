@@ -59,6 +59,10 @@ from myhermes_audit.contracts.memory import (
     MemoryStateChange,
     MemoryStateSnapshot,
 )
+from myhermes_audit.contracts.background_review import (
+    BackgroundReviewExecutionError,
+    BackgroundReviewExecutionResult,
+)
 from myhermes_audit.serialization import canonical_sha256
 
 
@@ -309,6 +313,13 @@ class TrialResult(ContractModel):
     final_answer_gate_passed: StrictBool | None = None
     memory_state_gate_passed: StrictBool | None = None
     required_fact_gate_passed: StrictBool | None = None
+    background_review_results: list[BackgroundReviewExecutionResult] = Field(
+        default_factory=list
+    )
+    background_review_errors: list[BackgroundReviewExecutionError] = Field(
+        default_factory=list
+    )
+    review_gate_passed: StrictBool | None = None
     metrics: list[MetricResult] = Field(default_factory=list)
     judge_result: JudgeResult | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
@@ -431,6 +442,8 @@ class TrialResult(ContractModel):
             raise ValueError("failed final-answer gate cannot have task_passed=true")
         if self.required_fact_gate_passed is False and self.task_passed is True:
             raise ValueError("failed required-fact gate cannot have task_passed=true")
+        if self.review_gate_passed is False and self.task_passed is True:
+            raise ValueError("failed Review gate cannot have task_passed=true")
         if self.task_passed is False and self.passed is True:
             raise ValueError("failed task cannot have passed=true")
         if self.status is TrialStatus.TIMEOUT:
@@ -456,6 +469,26 @@ class TrialResult(ContractModel):
         metric_names = [metric.metric_name for metric in self.metrics]
         if len(metric_names) != len(set(metric_names)):
             raise ValueError("metric names must be unique within a TrialResult")
+        review_ids = [item.review_id for item in self.background_review_results]
+        if len(review_ids) != len(set(review_ids)):
+            raise ValueError("Background Review result IDs must be unique")
+        review_snapshot_ids = [
+            snapshot.snapshot_id
+            for item in self.background_review_results
+            for snapshot in (item.before_snapshot, item.after_snapshot)
+            if snapshot is not None
+        ]
+        if len(review_snapshot_ids) != len(set(review_snapshot_ids)):
+            raise ValueError("Background Review snapshot IDs must be unique")
+        observed_review_targets = [
+            (item.review_id, change.target_type, change.target_id)
+            for item in self.background_review_results
+            for change in item.observed_changes
+        ]
+        if len(observed_review_targets) != len(set(observed_review_targets)):
+            raise ValueError(
+                "Background Review observed targets must be unique within a Review"
+            )
         turn_numbers = [turn.turn_number for turn in self.turns]
         if turn_numbers != list(range(1, len(turn_numbers) + 1)):
             raise ValueError("turn numbers must be contiguous from 1")

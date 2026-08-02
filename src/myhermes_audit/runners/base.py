@@ -22,6 +22,8 @@ from myhermes_audit.contracts import (
     TrialRuntimeSummary,
     TrialWarning,
     TurnResult,
+    BackgroundReviewExecutionError,
+    BackgroundReviewExecutionResult,
 )
 from myhermes_audit.sandbox import AuditSandbox
 from myhermes_audit.validators.base import ToolTraceEntry
@@ -59,6 +61,9 @@ class TrialRunnerOutcome:
     compression_events: tuple[CompressionEvent, ...] = ()
     context_diagnostics: tuple[ContextDiagnostic, ...] = ()
     fact_context_observations: tuple[FactContextObservation, ...] = ()
+    background_review_results: tuple[BackgroundReviewExecutionResult, ...] = ()
+    background_review_errors: tuple[BackgroundReviewExecutionError, ...] = ()
+    review_gate_passed: bool | None = None
 
 
 class TrialRunnerPort(Protocol):

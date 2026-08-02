@@ -1,30 +1,40 @@
-"""未来 Background Review 适配器必须满足的异步端口。"""
+"""Subject-neutral, synchronous Background Review port."""
 
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
 from myhermes_audit.contracts.background_review import (
+    BackgroundReviewExecutionResult,
+    BackgroundReviewPlan,
+    BackgroundReviewStateSnapshot,
     ReviewKind,
     ReviewOutcome,
-    ReviewRequest,
-    ReviewStateSnapshot,
 )
 from myhermes_audit.contracts.common import Identifier
 
 
 @runtime_checkable
 class BackgroundReviewEvaluationPort(Protocol):
-    """只定义评测交互形状，不执行 MyHermes Review。"""
+    """Trial-local Background Review execution without a queue or daemon.
 
-    async def snapshot(self, kind: ReviewKind) -> ReviewStateSnapshot:
-        """获取 Review 前后的算法无关状态。"""
+    P5 Review work must be complete before its isolated worker exits.  An
+    implementation caches by the stable plan ``review_id``: collecting a result
+    is read-only and must never invoke a model, tool, or state write again.
+    """
+
+    def snapshot(self, kind: ReviewKind) -> BackgroundReviewStateSnapshot:
+        """Capture an algorithm-neutral live state projection."""
         ...
 
-    async def execute(self, request: ReviewRequest) -> Identifier:
-        """提交 Review 请求并返回可关联的 review_id。"""
+    def execute(self, plan: BackgroundReviewPlan) -> Identifier:
+        """Synchronously execute and cache one planned Review."""
         ...
 
-    async def collect_outcome(self, review_id: Identifier) -> ReviewOutcome:
-        """收集结构化 Review 结果。"""
+    def collect_outcome(self, review_id: Identifier) -> ReviewOutcome:
+        """Return the cached normalized outcome for a completed Review."""
+        ...
+
+    def collect_result(self, review_id: Identifier) -> BackgroundReviewExecutionResult:
+        """Return the full cached execution fact without rerunning it."""
         ...

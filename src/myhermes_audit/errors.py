@@ -222,6 +222,23 @@ class MemoryProtocolError(MemoryEvaluationError):
         super().__init__(message, code="memory_protocol_error", **details)
 
 
+class BackgroundReviewError(RunnerError):
+    """Safe P5 Review failure without evidence, prompts, or claim tokens."""
+
+    def __init__(self, message: str, *, code: str, **details: Any) -> None:
+        super().__init__(message, code=code, **details)
+
+
+class BackgroundReviewCapabilityError(BackgroundReviewError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="background_review_capability_error", **details)
+
+
+class BackgroundReviewProtocolError(BackgroundReviewError):
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message, code="background_review_protocol_error", **details)
+
+
 class AblationError(RunnerError):
     """Safe P4 ablation failure without conversation or fact content."""
 

@@ -19,6 +19,14 @@ from pydantic import ValidationError
 
 from myhermes_audit.artifacts import atomic_write_json
 from myhermes_audit.contracts import (
+    BackgroundReviewExecutionError,
+    BackgroundReviewExecutionResult,
+    ReviewAction,
+    ReviewAttempt,
+    ReviewError,
+    ReviewLifecycle,
+    ReviewOutcome,
+    ReviewStatus,
     CompressionEvent,
     CompressionEventStatus,
     ContextDiagnostic,
@@ -43,6 +51,9 @@ from myhermes_audit.fact_matching import (
 )
 from myhermes_audit.integrations.myhermes.contracts import (
     AblationArtifact,
+    BackgroundReviewArtifact,
+    BackgroundReviewEvidenceArtifact,
+    BackgroundReviewSnapshotsArtifact,
     MemoryArtifact,
     MemoryQueryPlan,
     MyHermesWorkerRequest,
@@ -70,6 +81,20 @@ _IDENTIFIER_CHARACTER = re.compile(r"[^A-Za-z0-9._:-]+")
 
 class WorkerTerminationRequested(Exception):
     """Raised by cooperative process-group termination signals."""
+
+
+class _NoopBackgroundReviewCoordinator:
+    """Prevent the Subject's foreground entry point from creating a singleton.
+
+    P0--P4 deliberately have no P5 Review runtime.  MyHermes otherwise treats
+    ``None`` as a request for its process-global coordinator, so the worker
+    always supplies this tiny inert collaborator unless a P5 trial replaces it
+    with the public, trial-local disabled coordinator.
+    """
+
+    @staticmethod
+    def after_foreground_result(_connection, _session_id, _result) -> None:
+        return None
 
 
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -232,6 +257,12 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
     compression_events = []
     context_diagnostics: list[ContextDiagnostic] = []
     fact_context_observations: list[FactContextObservation] = []
+    background_review_adapter = None
+    background_review_executor = None
+    background_review_coordinator = _NoopBackgroundReviewCoordinator()
+    background_review_results: list[BackgroundReviewExecutionResult] = []
+    background_review_errors: list[BackgroundReviewExecutionError] = []
+    review_failure_stops_foreground = False
     previous_session_id: str | None = None
     estimate_context_tokens = None
     fact_by_id = {
@@ -254,6 +285,8 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
             TAIL_TOKEN_BUDGET,
             DB_PATH,
             HERMES_HOME,
+            MODEL,
+            MODEL_MAX_OUTPUT_TOKENS,
             client,
         )
         from hermes.conversation import run_conversation
@@ -266,6 +299,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         from hermes.tools import (
             ExecutionEnvironment,
             ToolPolicy,
+            ToolRegistry,
             register_all,
             registry,
         )
@@ -383,6 +417,49 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                         errors=memory_errors,
                     )
 
+        if request.background_review_plans:
+            try:
+                from myhermes_audit.integrations.myhermes.background_review_adapter import (
+                    MyHermesBackgroundReviewAdapter,
+                )
+
+                review_tool_registry = ToolRegistry()
+                register_all(
+                    review_tool_registry,
+                    process_manager=process_manager,
+                )
+                background_review_adapter = MyHermesBackgroundReviewAdapter(
+                    connection=connection,
+                    sqlite_path=request.sqlite_path,
+                    model=MODEL,
+                    model_client=model_client,
+                    tool_registry=review_tool_registry,
+                    model_max_output_tokens=MODEL_MAX_OUTPUT_TOKENS,
+                    memory_adapter=memory_adapter,
+                    sensitive_values=sensitive_values,
+                    plans=request.background_review_plans,
+                )
+                background_review_adapter.seed_skills(request.skill_fixtures)
+                (
+                    background_review_coordinator,
+                    background_review_executor,
+                ) = background_review_adapter.make_disabled_foreground_coordinator(
+                    process_manager=process_manager,
+                )
+            except Exception as exc:
+                failed_status = "background_review_error"
+                failed_error_type = "background_review_capability_error"
+                failed_fatal = True
+                failed_retryable = False
+                background_review_errors.append(
+                    _background_review_error(
+                        "background_review_capability_error",
+                        "initialize",
+                        "Background Review runtime could not be initialized",
+                        exc,
+                    )
+                )
+
         if memory_blocked:
             first_error = memory_errors[0]
             failed_status = "memory_error"
@@ -401,7 +478,10 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         )
 
         for turn_number, requested_turn in enumerate(request.turns, start=1):
-            if memory_blocked:
+            if memory_blocked or (
+                bool(request.background_review_plans)
+                and background_review_adapter is None
+            ):
                 break
             user_message = requested_turn.message
             logical_session_id = requested_turn.session_id or "__trial_default__"
@@ -427,6 +507,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                 tool_context={"interactive_approval": False},
                 tool_policy=tool_policy,
                 hook_registry=hook_registry,
+                background_review_coordinator=background_review_coordinator,
             )
             duration_ms = max(0, round((time.perf_counter() - turn_clock) * 1000))
             turn_finished = datetime.now(timezone.utc)
@@ -455,6 +536,60 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                     run_id=run_id,
                 )
             )
+            if background_review_adapter is not None:
+                for plan in request.background_review_plans:
+                    if (
+                        plan.trigger_after_turn != turn_number
+                        or plan.foreground_session_id != logical_session_id
+                    ):
+                        continue
+                    try:
+                        review_result = (
+                            background_review_adapter.record_foreground_and_execute(
+                                plan,
+                                logical_session_id=logical_session_id,
+                                session_id=session_id,
+                                completed=ok,
+                                tool_batches=_nonnegative_int(
+                                    response.get("tool_batches")
+                                ),
+                            )
+                        )
+                        _append_background_review_result(
+                            request,
+                            background_review_results,
+                            background_review_errors,
+                            lifecycle_warnings,
+                            review_result,
+                        )
+                        if (
+                            review_result.status.value in {"failed", "stale"}
+                            and not plan.continue_after_failure
+                        ):
+                            failed_status = failed_status or "background_review_error"
+                            failed_error_type = failed_error_type or "background_review_error"
+                            failed_fatal = True
+                            review_failure_stops_foreground = True
+                    except Exception:
+                        review_result = _background_review_failure_result(
+                            plan,
+                            "background_review_execution_error",
+                            "Background Review trigger execution failed",
+                        )
+                        _append_background_review_result(
+                            request,
+                            background_review_results,
+                            background_review_errors,
+                            lifecycle_warnings,
+                            review_result,
+                        )
+                        if not plan.continue_after_failure:
+                            failed_status = failed_status or "background_review_error"
+                            failed_error_type = (
+                                failed_error_type or "background_review_error"
+                            )
+                            failed_fatal = True
+                            review_failure_stops_foreground = True
             if request.effective_subject_configuration is not None:
                 diagnostic, fact_observations = _observe_p4_turn(
                     request,
@@ -480,6 +615,38 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                 failed_fatal = failed_fatal or current_fatal
                 if current_fatal:
                     break
+            if review_failure_stops_foreground:
+                break
+
+        if background_review_adapter is not None:
+            completed_review_ids = {
+                item.review_id for item in background_review_results
+            }
+            for plan in request.background_review_plans:
+                if plan.review_id in completed_review_ids:
+                    continue
+                review_result = background_review_adapter.mark_not_triggered(plan)
+                _append_background_review_result(
+                    request,
+                    background_review_results,
+                    background_review_errors,
+                    lifecycle_warnings,
+                    review_result,
+                )
+        elif request.background_review_plans:
+            for plan in request.background_review_plans:
+                review_result = _background_review_failure_result(
+                    plan,
+                    "background_review_capability_error",
+                    "Background Review runtime was unavailable before the trigger",
+                )
+                _append_background_review_result(
+                    request,
+                    background_review_results,
+                    background_review_errors,
+                    lifecycle_warnings,
+                    review_result,
+                )
 
         if request.memory_strategy is not None and memory_adapter is not None:
             if not memory_blocked:
@@ -546,6 +713,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
             observations = read_observations(
                 request.sqlite_path,
                 run_durations=run_durations,
+                include_run_ids=frozenset(run_durations),
             )
         if request.effective_subject_configuration is not None:
             compression_events, compression_by_turn = (
@@ -581,6 +749,25 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
             failed_fatal = True
             failed_retryable = False
     finally:
+        if request.background_review_plans:
+            existing_review_ids = {
+                item.review_id for item in background_review_results
+            }
+            for plan in request.background_review_plans:
+                if plan.review_id in existing_review_ids:
+                    continue
+                review_result = _background_review_failure_result(
+                    plan,
+                    "background_review_trigger_error",
+                    "Background Review did not reach its declared foreground trigger",
+                )
+                _append_background_review_result(
+                    request,
+                    background_review_results,
+                    background_review_errors,
+                    lifecycle_warnings,
+                    review_result,
+                )
         if request.effective_subject_configuration is not None:
             ablation_path = request.artifact_paths.ablation
             if ablation_path is None:
@@ -642,6 +829,51 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                         message="MyHermes managed Memory cleanup failed",
                     )
                 )
+        if background_review_executor is not None:
+            try:
+                if background_review_executor.shutdown(2.0):
+                    background_review_errors.append(
+                        _background_review_error(
+                            "background_review_cleanup_error",
+                            "shutdown",
+                            "trial-local Background Review executor did not stop",
+                        )
+                    )
+                    lifecycle_warnings.append(
+                        WorkerWarning(
+                            warning_type="background_review_shutdown_incomplete",
+                            message="trial-local Background Review executor did not stop",
+                        )
+                    )
+                    failed_status = failed_status or "background_review_error"
+                    failed_error_type = (
+                        failed_error_type or "background_review_cleanup_error"
+                    )
+                    failed_fatal = True
+            except Exception as exc:
+                background_review_errors.append(
+                    _background_review_error(
+                        "background_review_cleanup_error",
+                        "shutdown",
+                        "trial-local Background Review executor shutdown failed",
+                        exc,
+                    )
+                )
+                lifecycle_warnings.append(
+                    _worker_warning("background_review_shutdown_error", exc)
+                )
+                failed_status = failed_status or "background_review_error"
+                failed_error_type = (
+                    failed_error_type or "background_review_cleanup_error"
+                )
+                failed_fatal = True
+        if request.background_review_plans:
+            _checkpoint_background_review_artifacts(
+                request,
+                background_review_results,
+                background_review_errors,
+                lifecycle_warnings,
+            )
         if process_manager is not None:
             try:
                 lifecycle_warnings.extend(
@@ -650,6 +882,9 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                         session_ids=session_ids,
                         process_manager=process_manager,
                         model_client=model_client,
+                        shutdown_background_review=not bool(
+                            request.background_review_plans
+                        ),
                     )
                 )
             except Exception as exc:
@@ -795,6 +1030,24 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         compression_events=compression_events,
         context_diagnostics=context_diagnostics,
         fact_context_observations=fact_context_observations,
+        background_review_results_artifact=(
+            None
+            if not request.background_review_plans
+            else _artifact_relative(request.artifact_paths.background_review_results)
+        ),
+        background_review_evidence_artifact=(
+            None
+            if not request.background_review_plans
+            else _artifact_relative(request.artifact_paths.background_review_evidence)
+        ),
+        background_review_snapshots_artifact=(
+            None
+            if not request.background_review_plans
+            else _artifact_relative(request.artifact_paths.background_review_snapshots)
+        ),
+        background_review_results=background_review_results,
+        background_review_errors=background_review_errors,
+        review_gate_passed=None,
     )
 
 
@@ -1162,10 +1415,247 @@ def _worker_warning(warning_type: str, error: Exception) -> WorkerWarning:
     )
 
 
+def _background_review_error(
+    error_type: str,
+    stage: str,
+    message: str,
+    error: Exception | None = None,
+) -> BackgroundReviewExecutionError:
+    return BackgroundReviewExecutionError(
+        error_type=_safe_identifier(error_type),
+        stage=_safe_identifier(stage),
+        message=message,
+        retryable=False,
+        exception_type=(
+            None if error is None else _safe_identifier(type(error).__name__)
+        ),
+    )
+
+
+def _background_review_failure_result(
+    plan,
+    error_type: str,
+    message: str,
+) -> BackgroundReviewExecutionResult:
+    execution_error = _background_review_error(
+        error_type,
+        "worker_fallback",
+        message,
+    )
+    attempts = [
+        ReviewAttempt(
+            sequence=1,
+            claim_valid=False,
+            loop_executed=False,
+            model_call_count=0,
+            tool_call_count=0,
+            state_change_count=0,
+            error_type=execution_error.error_type,
+        )
+    ]
+    if plan.lifecycle is ReviewLifecycle.DUPLICATE_EXECUTE:
+        attempts.append(
+            ReviewAttempt(
+                sequence=2,
+                claim_valid=False,
+                loop_executed=False,
+                model_call_count=0,
+                tool_call_count=0,
+                state_change_count=0,
+                error_type=execution_error.error_type,
+            )
+        )
+    return BackgroundReviewExecutionResult(
+        review_id=plan.review_id,
+        kind=plan.kind,
+        lifecycle=plan.lifecycle,
+        status=ReviewStatus.FAILED,
+        actual_action=ReviewAction.NO_OP,
+        outcome=ReviewOutcome(
+            review_id=plan.review_id,
+            kind=plan.kind,
+            status=ReviewStatus.FAILED,
+            error=ReviewError(error_type=execution_error.error_type, message=message),
+        ),
+        attempts=attempts,
+        attempt_count=len(attempts),
+        duplicate_rejected=(plan.lifecycle is ReviewLifecycle.DUPLICATE_EXECUTE),
+        duration_ms=0,
+        errors=[execution_error],
+    )
+
+
+def _write_background_review_artifacts(
+    request: MyHermesWorkerRequest,
+    results: list[BackgroundReviewExecutionResult],
+    errors: list[BackgroundReviewExecutionError],
+) -> None:
+    if not request.background_review_plans:
+        return
+    paths = request.artifact_paths
+    if (
+        paths.background_review_results is None
+        or paths.background_review_evidence is None
+        or paths.background_review_snapshots is None
+    ):
+        raise RuntimeError("P5 worker request has incomplete Review Artifact paths")
+    atomic_write_json(
+        paths.background_review_results,
+        BackgroundReviewArtifact(
+            trial_id=request.trial_id,
+            case_id=request.case_id,
+            results=results,
+            errors=errors,
+        ),
+    )
+    atomic_write_json(
+        paths.background_review_evidence,
+        BackgroundReviewEvidenceArtifact(
+            trial_id=request.trial_id,
+            case_id=request.case_id,
+            results=results,
+        ),
+    )
+    atomic_write_json(
+        paths.background_review_snapshots,
+        BackgroundReviewSnapshotsArtifact(
+            trial_id=request.trial_id,
+            case_id=request.case_id,
+            results=results,
+        ),
+    )
+
+
+def _checkpoint_background_review_artifacts(
+    request: MyHermesWorkerRequest,
+    results: list[BackgroundReviewExecutionResult],
+    errors: list[BackgroundReviewExecutionError],
+    warnings: list[WorkerWarning],
+) -> None:
+    """Best-effort checkpoint after each finished Review plan.
+
+    Each Artifact write is atomic.  The parent can recover the self-contained
+    result projection if process termination happens between the three files,
+    then regenerate a consistent Artifact set without discarding completed
+    Review facts.
+    """
+
+    try:
+        _write_background_review_artifacts(request, results, errors)
+    except Exception as exc:
+        if not any(
+            warning.warning_type == "background_review_artifact_checkpoint_error"
+            for warning in warnings
+        ):
+            warnings.append(
+                _worker_warning("background_review_artifact_checkpoint_error", exc)
+            )
+
+
+def _append_background_review_result(
+    request: MyHermesWorkerRequest,
+    results: list[BackgroundReviewExecutionResult],
+    errors: list[BackgroundReviewExecutionError],
+    warnings: list[WorkerWarning],
+    review_result: BackgroundReviewExecutionResult,
+) -> None:
+    """Record one plan fact and immediately publish a recoverable checkpoint."""
+
+    results.append(review_result)
+    errors.extend(review_result.errors)
+    _checkpoint_background_review_artifacts(request, results, errors, warnings)
+
+
 def _artifact_relative(path: Path | None) -> str:
     if path is None:
         raise RuntimeError("worker Artifact path is unavailable")
     return f"artifacts/{path.name}"
+
+
+def _recover_background_review_results(
+    request: MyHermesWorkerRequest,
+) -> tuple[
+    list[BackgroundReviewExecutionResult],
+    list[BackgroundReviewExecutionError],
+]:
+    """Recover only verified, already-published P5 plan facts after a crash."""
+
+    if (
+        not request.background_review_plans
+        or request.artifact_paths.background_review_results is None
+    ):
+        return [], []
+    path = request.artifact_paths.background_review_results
+    try:
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > 8 * 1024 * 1024:
+            return [], []
+        artifact = BackgroundReviewArtifact.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValueError, ValidationError):
+        return [], []
+    if artifact.trial_id != request.trial_id or artifact.case_id != request.case_id:
+        return [], []
+    planned = {plan.review_id: plan for plan in request.background_review_plans}
+    recovered_by_id = {item.review_id: item for item in artifact.results}
+    if any(
+        review_id not in planned
+        or item.kind is not planned[review_id].kind
+        or item.lifecycle is not planned[review_id].lifecycle
+        for review_id, item in recovered_by_id.items()
+    ):
+        return [], []
+    return (
+        [
+            recovered_by_id[plan.review_id]
+            for plan in request.background_review_plans
+            if plan.review_id in recovered_by_id
+        ],
+        list(artifact.errors),
+    )
+
+
+def _merge_background_review_results(
+    plans: Sequence,
+    recovered: Sequence[BackgroundReviewExecutionResult],
+    *,
+    error_type: str,
+    message: str,
+) -> list[BackgroundReviewExecutionResult]:
+    """Preserve recovered facts and add fallback facts only for missing plans."""
+
+    recovered_by_id = {item.review_id: item for item in recovered}
+    missing_plans = [plan for plan in plans if plan.review_id not in recovered_by_id]
+    fallback_by_id = {
+        item.review_id: item
+        for item in _fallback_background_review_results(
+            missing_plans,
+            error_type=error_type,
+            message=message,
+        )
+    }
+    return [
+        (
+            recovered_by_id[plan.review_id]
+            if plan.review_id in recovered_by_id
+            else fallback_by_id[plan.review_id]
+        )
+        for plan in plans
+    ]
+
+
+def _merge_background_review_errors(
+    recovered: Sequence[BackgroundReviewExecutionError],
+    results: Sequence[BackgroundReviewExecutionResult],
+) -> list[BackgroundReviewExecutionError]:
+    """Keep global checkpoint diagnostics as well as per-plan diagnostics."""
+
+    merged = list(recovered)
+    for result in results:
+        for error in result.errors:
+            if error not in merged:
+                merged.append(error)
+    return merged
 
 
 def _failure_result(
@@ -1174,6 +1664,8 @@ def _failure_result(
     error_type: str,
     exception_type: str,
     duration_ms: int,
+    recovered_background_review_results: Sequence[BackgroundReviewExecutionResult] = (),
+    recovered_background_review_errors: Sequence[BackgroundReviewExecutionError] = (),
 ) -> MyHermesWorkerResult:
     memory_errors = (
         []
@@ -1186,6 +1678,16 @@ def _failure_result(
                 details={"exception_type": exception_type},
             )
         ]
+    )
+    background_results = _merge_background_review_results(
+        request.background_review_plans,
+        recovered_background_review_results,
+        error_type="background_review_protocol_error",
+        message="Background Review pipeline ended during Worker failure",
+    )
+    background_errors = _merge_background_review_errors(
+        recovered_background_review_errors,
+        background_results,
     )
     return MyHermesWorkerResult(
         worker_status=WorkerStatus.FAILED,
@@ -1214,6 +1716,23 @@ def _failure_result(
             if request.effective_subject_configuration is None
             else _artifact_relative(request.artifact_paths.ablation)
         ),
+        background_review_results_artifact=(
+            None
+            if not request.background_review_plans
+            else _artifact_relative(request.artifact_paths.background_review_results)
+        ),
+        background_review_evidence_artifact=(
+            None
+            if not request.background_review_plans
+            else _artifact_relative(request.artifact_paths.background_review_evidence)
+        ),
+        background_review_snapshots_artifact=(
+            None
+            if not request.background_review_plans
+            else _artifact_relative(request.artifact_paths.background_review_snapshots)
+        ),
+        background_review_results=background_results,
+        background_review_errors=background_errors,
         error=WorkerError(
             error_type=error_type,
             message=f"MyHermes worker failed: {exception_type}",
@@ -1321,11 +1840,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             if isinstance(exc, WorkerTerminationRequested)
             else (exc.code if isinstance(exc, AuditError) else "worker_exception")
         )
+        (
+            recovered_background_review_results,
+            recovered_background_review_errors,
+        ) = _recover_background_review_results(request)
         result = _failure_result(
             request,
             error_type=error_type,
             exception_type=type(exc).__name__,
             duration_ms=duration_ms,
+            recovered_background_review_results=recovered_background_review_results,
+            recovered_background_review_errors=recovered_background_review_errors,
         )
         try:
             memory_artifact = _recover_memory_artifact(
@@ -1356,6 +1881,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ablation_artifact.fact_context_observations
                     ),
                 }
+            )
+        try:
+            _write_background_review_artifacts(
+                request,
+                result.background_review_results,
+                result.background_review_errors,
+            )
+        except Exception as artifact_exc:
+            print(
+                "worker Background Review fallback artifact publication failed: "
+                f"{type(artifact_exc).__name__}",
+                file=sys.stderr,
             )
         empty_observations = ObservationBundle()
         empty_transcript = WorkerTranscript(

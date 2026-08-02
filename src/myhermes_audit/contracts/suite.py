@@ -19,6 +19,7 @@ from pydantic import (
 )
 
 from myhermes_audit.contracts.background_review import (
+    BackgroundReviewPlan,
     BackgroundReviewExpectation,
     ReviewRequest,
     SkillManagedBy,
@@ -224,6 +225,9 @@ class FixtureSpec(ContractModel):
     memory: MemoryFixture | None = None
     skills: list[SkillFixture] = Field(default_factory=list)
     database: DatabaseFixtureReference | None = None
+    background_review_plans: list[BackgroundReviewPlan] = Field(
+        default_factory=list
+    )
     review_requests: list[ReviewRequest] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -237,6 +241,21 @@ class FixtureSpec(ContractModel):
         review_ids = [request.review_id for request in self.review_requests]
         if len(review_ids) != len(set(review_ids)):
             raise ValueError("review_id must be unique within a FixtureSpec")
+        plan_ids = [plan.review_id for plan in self.background_review_plans]
+        if len(plan_ids) != len(set(plan_ids)):
+            raise ValueError("background review plan IDs must be unique")
+        if set(plan_ids) & set(review_ids):
+            raise ValueError(
+                "contract-only review_requests cannot share runtime plan IDs"
+            )
+        plan_triggers = [
+            (plan.kind, plan.foreground_session_id, plan.trigger_after_turn)
+            for plan in self.background_review_plans
+        ]
+        if len(plan_triggers) != len(set(plan_triggers)):
+            raise ValueError(
+                "Background Review plans cannot share kind, logical session, and trigger turn"
+            )
         return self
 
 
@@ -705,6 +724,59 @@ class AuditCase(ContractModel):
                 "Memory expectation IDs must reference fixture or explicitly "
                 "runtime-generated IDs: " + ", ".join(unknown_ids)
             )
+        plans = self.fixture.background_review_plans
+        if plans:
+            if self.fixture.review_requests:
+                raise ValueError(
+                    "runtime Background Review plans cannot use contract-only "
+                    "review_requests"
+                )
+            declared_sessions = (
+                [(1, self.input.session_id)]
+                if self.input.message is not None
+                else [
+                    (index, turn.session_id)
+                    for index, turn in enumerate(self.input.turns, start=1)
+                ]
+            )
+            for plan in plans:
+                if plan.trigger_after_turn > len(declared_sessions):
+                    raise ValueError(
+                        "Background Review trigger_after_turn exceeds case turns"
+                    )
+                _turn_number, session_id = declared_sessions[
+                    plan.trigger_after_turn - 1
+                ]
+                if session_id != plan.foreground_session_id:
+                    raise ValueError(
+                        "Background Review plan must reference the explicit "
+                        "logical session at trigger_after_turn"
+                    )
+            plan_ids = {plan.review_id for plan in plans}
+            expectation_ids = [
+                expectation.review_id
+                for expectation in self.expected.background_reviews
+            ]
+            if any(review_id is None for review_id in expectation_ids):
+                raise ValueError(
+                    "runtime Background Review expectations require review_id"
+                )
+            if len(expectation_ids) != len(set(expectation_ids)):
+                raise ValueError("Background Review expectation IDs must be unique")
+            if set(expectation_ids) != plan_ids:
+                raise ValueError(
+                    "Background Review plans and expectations must have identical IDs"
+                )
+            review_evaluators = [
+                evaluator
+                for evaluator in self.evaluators
+                if evaluator.kind is EvaluatorKind.BACKGROUND_REVIEW
+            ]
+            if len(review_evaluators) != 1 or review_evaluators[0].config:
+                raise ValueError(
+                    "runtime Background Review plans require one empty-config "
+                    "background_review evaluator"
+                )
         return self
 
 

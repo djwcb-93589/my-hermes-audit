@@ -8,6 +8,8 @@ from pathlib import Path
 
 from myhermes_audit.contracts import (
     AblationPlan,
+    BackgroundReviewExecutionError,
+    BackgroundReviewExecutionResult,
     ContextDiagnostic,
     EffectiveSubjectConfiguration,
     FactContextObservation,
@@ -56,6 +58,8 @@ class ValidationContext:
     context_diagnostics: tuple[ContextDiagnostic, ...] = ()
     fact_context_observations: tuple[FactContextObservation, ...] = ()
     variant_id: str | None = None
+    background_review_results: tuple[BackgroundReviewExecutionResult, ...] = ()
+    background_review_errors: tuple[BackgroundReviewExecutionError, ...] = ()
 
 
 def resolve_validation_path(context: ValidationContext, declared: str) -> Path:

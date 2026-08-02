@@ -43,27 +43,34 @@ class FixtureManifest(ContractModel):
 
 
 def validate_p1_fixture_support(fixture: FixtureSpec) -> None:
-    validate_runtime_fixture_support(fixture, allow_memory=False)
+    validate_runtime_fixture_support(
+        fixture,
+        allow_memory=False,
+        allow_background_review=False,
+    )
 
 
 def validate_runtime_fixture_support(
     fixture: FixtureSpec,
     *,
     allow_memory: bool,
+    allow_background_review: bool = False,
 ) -> None:
     unsupported: list[str] = []
     if fixture.memory is not None and not allow_memory:
         unsupported.append("memory")
-    if fixture.skills:
+    if fixture.skills and not allow_background_review:
         unsupported.append("skills")
     if fixture.database is not None:
         unsupported.append("database")
     if fixture.review_requests:
         unsupported.append("review_requests")
+    if fixture.background_review_plans and not allow_background_review:
+        unsupported.append("background_review_plans")
     if unsupported:
         raise UnsupportedCaseError(
             (
-                "runner supports only declared file and Memory fixtures"
+                "runner supports only declared file, Memory, and explicit P5 Review fixtures"
                 if allow_memory
                 else "P1 supports only file fixtures"
             ),
@@ -101,8 +108,14 @@ def validate_runtime_fixture_support(
 def materialize_fixtures(
     fixture: FixtureSpec,
     sandbox: AuditSandbox,
+    *,
+    allow_background_review: bool = False,
 ) -> tuple[FixtureManifest, Path]:
-    validate_runtime_fixture_support(fixture, allow_memory=True)
+    validate_runtime_fixture_support(
+        fixture,
+        allow_memory=True,
+        allow_background_review=allow_background_review,
+    )
     entries: list[FixtureManifestEntry] = []
     for item in fixture.files:
         try:

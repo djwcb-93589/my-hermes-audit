@@ -28,6 +28,7 @@ from myhermes_audit.contracts.ablation import (
     MemoryMode,
 )
 from myhermes_audit.contracts.memory import MemoryKind, RetrievalStrategy
+from myhermes_audit.contracts.background_review import ReviewKind
 from myhermes_audit.serialization import canonical_sha256
 
 
@@ -40,6 +41,7 @@ _RUN_CONVERSATION_KEYWORDS = (
     "tool_context",
     "tool_policy",
     "hook_registry",
+    "background_review_coordinator",
 )
 
 
@@ -148,6 +150,359 @@ def _bind_prompt_memory_toggle(signature: inspect.Signature) -> None:
     )
 
 
+def _bind_review_agent_loop(signature: inspect.Signature) -> None:
+    signature.bind(
+        review_messages=_BIND_PLACEHOLDER,
+        review_instruction=_BIND_PLACEHOLDER,
+        allowed_tool_names=_BIND_PLACEHOLDER,
+        model=_BIND_PLACEHOLDER,
+        max_iterations=_BIND_PLACEHOLDER,
+        tools=_BIND_PLACEHOLDER,
+        system_prompt=_BIND_PLACEHOLDER,
+        registry=_BIND_PLACEHOLDER,
+        client=_BIND_PLACEHOLDER,
+        session_key=_BIND_PLACEHOLDER,
+        model_kwargs=_BIND_PLACEHOLDER,
+        cancel_checker=_BIND_PLACEHOLDER,
+        tool_context=_BIND_PLACEHOLDER,
+        hook_registry=_BIND_PLACEHOLDER,
+    )
+
+
+def _bind_review_observation_sink(signature: inspect.Signature) -> None:
+    signature.bind(
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        hook_id_prefix="audit-review",
+    )
+
+
+def _bind_foreground_review_event(signature: inspect.Signature) -> None:
+    signature.bind(
+        session_id=_BIND_PLACEHOLDER,
+        completed=True,
+        tool_batches=0,
+    )
+
+
+def _bind_review_tool_registration(signature: inspect.Signature) -> None:
+    signature.bind(
+        _BIND_PLACEHOLDER,
+        process_manager=_BIND_PLACEHOLDER,
+    )
+
+
+def _bind_background_review_executor(signature: inspect.Signature) -> None:
+    signature.bind(
+        driver_registry=_BIND_PLACEHOLDER,
+        config=_BIND_PLACEHOLDER,
+        model=_BIND_PLACEHOLDER,
+        client=_BIND_PLACEHOLDER,
+        db_path=_BIND_PLACEHOLDER,
+        tool_registry=_BIND_PLACEHOLDER,
+    )
+
+
+def _bind_background_review_config(signature: inspect.Signature) -> None:
+    signature.bind(
+        max_iterations=1,
+        retry_cooldown_seconds=0,
+        max_concurrent_jobs=1,
+        max_pending_jobs=0,
+    )
+
+
+def _bind_background_review_coordinator(signature: inspect.Signature) -> None:
+    signature.bind(
+        driver_registry=_BIND_PLACEHOLDER,
+        executor=_BIND_PLACEHOLDER,
+        enabled=False,
+    )
+
+
+def _bind_session_message_range(signature: inspect.Signature) -> None:
+    signature.bind(
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        after_message_id=_BIND_PLACEHOLDER,
+        upto_message_id=_BIND_PLACEHOLDER,
+    )
+
+
+def _bind_no_arguments(signature: inspect.Signature) -> None:
+    signature.bind()
+
+
+def _bind_memory_review_driver(signature: inspect.Signature) -> None:
+    signature.bind(
+        store=_BIND_PLACEHOLDER,
+        memory_interval=1,
+        claim_ttl_seconds=1.0,
+        retry_cooldown_seconds=0.0,
+        max_iterations=1,
+    )
+
+
+def _bind_skill_review_driver(signature: inspect.Signature) -> None:
+    signature.bind(
+        store=_BIND_PLACEHOLDER,
+        skill_tool_batch_interval=1,
+        claim_ttl_seconds=1.0,
+        retry_cooldown_seconds=0.0,
+        max_iterations=1,
+    )
+
+
+def _bind_instance_method(
+    value: object,
+    name: str,
+    *args: object,
+    **kwargs: object,
+) -> None:
+    method = getattr(value, name, None)
+    if not callable(method):
+        raise TypeError(f"required public method is unavailable: {name}")
+    inspect.signature(method).bind(_BIND_PLACEHOLDER, *args, **kwargs)
+
+
+def _review_driver_surface(value: object) -> bool:
+    if getattr(value, "kind", None) is None:
+        return False
+    _bind_instance_method(value, "record_progress", _BIND_PLACEHOLDER, _BIND_PLACEHOLDER)
+    _bind_instance_method(value, "claim_due", _BIND_PLACEHOLDER, _BIND_PLACEHOLDER)
+    _bind_instance_method(value, "validate_claim", _BIND_PLACEHOLDER)
+    _bind_instance_method(
+        value,
+        "claim_is_valid",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+    )
+    _bind_instance_method(
+        value,
+        "prepare_run",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+    )
+    _bind_instance_method(value, "complete", _BIND_PLACEHOLDER, _BIND_PLACEHOLDER)
+    _bind_instance_method(
+        value,
+        "fail",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        "audit_review_failure",
+    )
+    return True
+
+
+def _memory_review_store_surface(value: object) -> bool:
+    _bind_instance_method(
+        value,
+        "record_progress",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        completed_turns=1,
+        message_upto=1,
+    )
+    _bind_instance_method(
+        value,
+        "claim_due",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        memory_interval=1,
+        claim_ttl_seconds=1.0,
+    )
+    _bind_instance_method(
+        value,
+        "load_message_window",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        after_message_id=0,
+        upto_message_id=1,
+    )
+    _bind_instance_method(value, "get_last_message_id", _BIND_PLACEHOLDER, _BIND_PLACEHOLDER)
+    _bind_instance_method(
+        value,
+        "claim_is_valid",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+    )
+    _bind_instance_method(
+        value,
+        "complete",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+    )
+    _bind_instance_method(
+        value,
+        "fail",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        error="audit_review_failure",
+        retry_cooldown_seconds=0.0,
+    )
+    return True
+
+
+def _skill_review_store_surface(value: object) -> bool:
+    _bind_instance_method(
+        value,
+        "record_progress",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        tool_batches=1,
+        message_upto=1,
+    )
+    _bind_instance_method(
+        value,
+        "claim_due",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        skill_tool_batch_interval=1,
+        claim_ttl_seconds=1.0,
+    )
+    _bind_instance_method(
+        value,
+        "load_message_window",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        after_message_id=0,
+        upto_message_id=1,
+    )
+    _bind_instance_method(value, "get_last_message_id", _BIND_PLACEHOLDER, _BIND_PLACEHOLDER)
+    _bind_instance_method(
+        value,
+        "claim_is_valid",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+    )
+    _bind_instance_method(
+        value,
+        "complete",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+    )
+    _bind_instance_method(
+        value,
+        "fail",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        error="audit_review_failure",
+        retry_cooldown_seconds=0.0,
+    )
+    return True
+
+
+def _review_driver_registry_surface(value: object) -> bool:
+    _bind_instance_method(value, "register", _BIND_PLACEHOLDER)
+    _bind_instance_method(value, "get", _BIND_PLACEHOLDER)
+    _bind_instance_method(value, "enabled_drivers")
+    return True
+
+
+def _review_agent_loop_surface(value: object) -> bool:
+    _bind_instance_method(value, "run", "")
+    return True
+
+
+def _background_review_coordinator_surface(value: object) -> bool:
+    _bind_instance_method(
+        value,
+        "after_foreground_result",
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+        _BIND_PLACEHOLDER,
+    )
+    return True
+
+
+def _background_review_executor_surface(value: object) -> bool:
+    _bind_instance_method(value, "shutdown", 2.0)
+    return True
+
+
+def _review_tool_registry_surface(value: object) -> bool:
+    _bind_instance_method(value, "resolve", _BIND_PLACEHOLDER)
+    _bind_instance_method(value, "get_entry", "audit_review_tool")
+    _bind_instance_method(
+        value,
+        "register",
+        "audit_review_tool",
+        "audit_review_toolset",
+        {},
+        _BIND_PLACEHOLDER,
+        execution_environments=_BIND_PLACEHOLDER,
+        unattended_allowed=True,
+        required_trusted_context=_BIND_PLACEHOLDER,
+        approval_mode=_BIND_PLACEHOLDER,
+        risk_level=_BIND_PLACEHOLDER,
+        default_enabled_environments=_BIND_PLACEHOLDER,
+        retry_safe=False,
+        unknown_on_crash=True,
+        status_check=None,
+        supports_cancellation=False,
+    )
+    module = importlib.import_module("hermes.tools")
+    entry = getattr(module, "ToolEntry", None)
+    resolution = getattr(module, "ToolResolution", None)
+    return (
+        entry is not None
+        and _dataclass_fields_surface(
+            "name",
+            "toolset",
+            "schema",
+            "handler",
+            "execution_environments",
+            "unattended_allowed",
+            "required_trusted_context",
+            "approval_mode",
+            "risk_level",
+            "default_enabled_environments",
+            "retry_safe",
+            "unknown_on_crash",
+            "status_check",
+            "supports_cancellation",
+        )(entry)
+        and resolution is not None
+        and _dataclass_fields_surface(
+            "definitions",
+            "allowed_tool_names",
+            "toolsets",
+        )(resolution)
+    )
+
+
+def _skill_service_surface(value: object) -> bool:
+    _bind_instance_method(value, "list_skills")
+    _bind_instance_method(
+        value,
+        "create_skill",
+        "audit-review-skill",
+        actor=_BIND_PLACEHOLDER,
+        body="audit fixture body",
+        description="audit fixture",
+    )
+    _bind_instance_method(
+        value,
+        "pin_skill",
+        "audit-review-skill",
+        actor=_BIND_PLACEHOLDER,
+        expected_revision=_BIND_PLACEHOLDER,
+        expected_governance_revision=_BIND_PLACEHOLDER,
+    )
+    module = importlib.import_module("hermes.skills")
+    actor = getattr(module, "SkillActor", None)
+    return all(
+        getattr(actor, name, None) is not None
+        for name in ("FOREGROUND", "BACKGROUND_REVIEW", "SYSTEM")
+    )
+
+
 class _ProbeBuilder:
     def __init__(self) -> None:
         self.checks: list[SubjectCapabilityCheck] = []
@@ -209,8 +564,19 @@ class _ProbeBuilder:
                     except Exception:
                         failure_type = "signature_validation_failed"
                     else:
-                        available = True
-                        failure_type = None
+                        try:
+                            available = (
+                                True if predicate is None else bool(predicate(value))
+                            )
+                        except Exception:
+                            available = False
+                            failure_type = "capability_check_failed"
+                        else:
+                            failure_type = (
+                                None
+                                if available
+                                else "capability_incompatible"
+                            )
             else:
                 try:
                     available = True if predicate is None else bool(predicate(value))
@@ -320,6 +686,31 @@ def _tool_registry_surface(value: object) -> bool:
         callable(getattr(value, name, None))
         for name in ("register", "register_declaration", "resolve")
     )
+
+
+def _review_tool_policy_surface(value: object) -> bool:
+    return (
+        callable(getattr(value, "ToolPolicy", None))
+        and callable(getattr(value, "ToolRegistry", None))
+        and callable(getattr(getattr(value, "ToolRegistry", None), "resolve", None))
+        and getattr(getattr(value, "ExecutionEnvironment", None), "BACKGROUND_REVIEW", None)
+        is not None
+    )
+
+
+def _methods_surface(*names: str) -> Callable[[object], bool]:
+    def predicate(value: object) -> bool:
+        return all(callable(getattr(value, name, None)) for name in names)
+
+    return predicate
+
+
+def _dataclass_fields_surface(*names: str) -> Callable[[object], bool]:
+    def predicate(value: object) -> bool:
+        fields = getattr(value, "__dataclass_fields__", {})
+        return all(name in fields for name in names)
+
+    return predicate
 
 
 def _observation_repository_surface(value: object) -> bool:
@@ -727,6 +1118,279 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         _terminal_declaration_surface,
     )
 
+    # P5 is deliberately optional at probe level so a Subject without Review
+    # support remains compatible with P0-P4.  These checks only inspect public
+    # symbols/signatures; they never instantiate stores, create a database, or
+    # obtain a Review claim/token.
+    review_runtime = builder.check(
+        "background_review_runtime",
+        "hermes.review.runtime",
+        "BackgroundReviewCoordinator",
+        _background_review_coordinator_surface,
+        signature_validator=_bind_background_review_coordinator,
+        required=False,
+    )
+    review_runtime_config = builder.check(
+        "background_review_runtime_config",
+        "hermes.review.runtime",
+        "BackgroundReviewConfig",
+        signature_validator=_bind_background_review_config,
+        required=False,
+    )
+    review_claim = builder.check(
+        "review_claim_contract",
+        "hermes.review.contracts",
+        "ReviewClaim",
+        _dataclass_fields_surface("kind", "session_id", "token", "payload"),
+        required=False,
+    )
+    review_registry = builder.check(
+        "review_driver_registry",
+        "hermes.review.registry",
+        "ReviewDriverRegistry",
+        _review_driver_registry_surface,
+        signature_validator=_bind_no_arguments,
+        required=False,
+    )
+    review_loop = builder.check(
+        "review_agent_loop",
+        "hermes.review.loop",
+        "ReviewAgentLoop",
+        _review_agent_loop_surface,
+        signature_validator=_bind_review_agent_loop,
+        required=False,
+    )
+    review_loop_result = builder.check(
+        "review_loop_result_contract",
+        "hermes.agent_loop",
+        "AgentLoopResult",
+        _dataclass_fields_surface("ok", "status", "error_type"),
+        required=False,
+    )
+    review_hook_registry = builder.check(
+        "review_hook_registry",
+        "hermes.hooks",
+        "SyncHookRegistry",
+        signature_validator=_bind_no_arguments,
+        required=False,
+    )
+    review_observation_sink = builder.check(
+        "review_observation_sink",
+        "hermes.persistence.observation",
+        "configure_sqlite_observation_sink",
+        signature_validator=_bind_review_observation_sink,
+        required=False,
+    )
+    review_policy = builder.check(
+        "review_tool_policy",
+        "hermes.tools",
+        "<module>",
+        _review_tool_policy_surface,
+        required=False,
+    )
+    review_tool_resolution = builder.check(
+        "review_tool_registry_resolution",
+        "hermes.tools",
+        "ToolRegistry",
+        _review_tool_registry_surface,
+        signature_validator=_bind_no_arguments,
+        required=False,
+    )
+    review_tool_registration = builder.check(
+        "review_tool_registration",
+        "hermes.tools",
+        "register_all",
+        signature_validator=_bind_review_tool_registration,
+        required=False,
+    )
+    memory_review_driver = builder.check(
+        "memory_review_driver",
+        "hermes.review.memory",
+        "MemoryReviewDriver",
+        _review_driver_surface,
+        signature_validator=_bind_memory_review_driver,
+        required=False,
+    )
+    skill_review_driver = builder.check(
+        "skill_review_driver",
+        "hermes.review.skill",
+        "SkillReviewDriver",
+        _review_driver_surface,
+        signature_validator=_bind_skill_review_driver,
+        required=False,
+    )
+    memory_review_store = builder.check(
+        "memory_review_store",
+        "hermes.review.memory_store",
+        "MemoryReviewStore",
+        _memory_review_store_surface,
+        signature_validator=_bind_no_arguments,
+        required=False,
+    )
+    skill_review_store = builder.check(
+        "skill_review_store",
+        "hermes.review.skill_store",
+        "SkillReviewStore",
+        _skill_review_store_surface,
+        signature_validator=_bind_no_arguments,
+        required=False,
+    )
+    review_run_spec = builder.check(
+        "review_evidence_window",
+        "hermes.review.contracts",
+        "ReviewRunSpec",
+        _dataclass_fields_surface(
+            "messages",
+            "system_prompt",
+            "instruction",
+            "tool_policy",
+            "max_iterations",
+            "tool_context",
+        ),
+        required=False,
+    )
+    foreground_review_event = builder.check(
+        "review_foreground_event",
+        "hermes.review.contracts",
+        "ForegroundReviewEvent",
+        _dataclass_fields_surface("session_id", "completed", "tool_batches"),
+        signature_validator=_bind_foreground_review_event,
+        required=False,
+    )
+    foreground_review_window = builder.check(
+        "review_foreground_evidence_window",
+        "hermes.persistence.core",
+        "get_session_messages_in_id_range",
+        signature_validator=_bind_session_message_range,
+        required=False,
+    )
+    skill_service = builder.check(
+        "review_state_snapshot",
+        "hermes.skills",
+        "SkillService",
+        _skill_service_surface,
+        signature_validator=_bind_no_arguments,
+        required=False,
+    )
+    governance_revision = builder.check(
+        "skill_governance_revision",
+        "hermes.skills.governance",
+        "SkillDescriptor",
+        _dataclass_fields_surface(
+            "skill_id",
+            "name",
+            "source",
+            "managed_by",
+            "pinned",
+            "revision",
+            "governance_revision",
+        ),
+        required=False,
+    )
+    review_executor = builder.check(
+        "review_shutdown",
+        "hermes.review.runtime",
+        "BackgroundReviewExecutor",
+        _background_review_executor_surface,
+        signature_validator=_bind_background_review_executor,
+        required=False,
+    )
+    any_review_driver = any(
+        item is not None for item in (memory_review_driver, skill_review_driver)
+    )
+    builder.derived_check(
+        "review_claim_validation",
+        available=any_review_driver,
+        public_object="public ReviewDriver claim validation",
+    )
+    builder.derived_check(
+        "review_claim_completion",
+        available=any_review_driver,
+        public_object="public ReviewDriver completion",
+    )
+    builder.derived_check(
+        "review_claim_failure",
+        available=any_review_driver,
+        public_object="public ReviewDriver failure release",
+    )
+    builder.derived_check(
+        "memory_review_supported",
+        available=all(
+            item is not None
+            for item in (memory_review_driver, memory_review_store, memory_read, memory_write)
+        ),
+        public_object="Memory Review Driver+Store+public Memory API",
+    )
+    builder.derived_check(
+        "skill_review_supported",
+        available=all(
+            item is not None
+            for item in (
+                skill_review_driver,
+                skill_review_store,
+                skill_service,
+                governance_revision,
+            )
+        ),
+        public_object="Skill Review Driver+Store+public SkillService governance revision",
+    )
+    builder.derived_check(
+        "duplicate_claim_rejection",
+        available=any_review_driver,
+        public_object="public ReviewDriver claim_is_valid lifecycle",
+    )
+    builder.derived_check(
+        "review_outcome_observation",
+        available=review_loop is not None,
+        public_object="ReviewAgentLoop execution outcome",
+    )
+    # Current public claim validation does not bind a Skill governance revision.
+    # Do not infer stale from a no-op or an unchanged snapshot.
+    builder.derived_check(
+        "stale_review_detection",
+        available=False,
+        public_object="governance-bound public ReviewClaim validation",
+    )
+    _ = (
+        review_runtime,
+        review_runtime_config,
+        review_claim,
+        review_registry,
+        review_loop_result,
+        review_hook_registry,
+        review_observation_sink,
+        review_policy,
+        review_tool_resolution,
+        review_tool_registration,
+        governance_revision,
+        review_executor,
+        review_run_spec,
+        foreground_review_event,
+        foreground_review_window,
+    )
+
+    supported_review_kinds: list[ReviewKind] = []
+    if all(
+        item is not None
+        for item in (memory_review_driver, memory_review_store, memory_read, memory_write)
+    ):
+        supported_review_kinds.append(ReviewKind.MEMORY)
+    if all(
+        item is not None
+        for item in (
+            skill_review_driver,
+            skill_review_store,
+            skill_service,
+            governance_revision,
+        )
+    ):
+        supported_review_kinds.append(ReviewKind.SKILL)
+    builder.derived_check(
+        "supported_review_kinds",
+        available=bool(supported_review_kinds),
+        public_object="complete public Review Driver/Store surfaces",
+    )
+
     supported_memory_kinds: list[MemoryKind] = []
     if memory_read is not None and memory_write is not None:
         supported_memory_kinds.append(MemoryKind.LONG_TERM)
@@ -857,6 +1521,10 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
                     "prompt_context_injection" if native_supported else None
                 ),
             },
+            "background_review_projection": {
+                "supported_kinds": [item.value for item in supported_review_kinds],
+                "stale_review_detection": False,
+            },
             "ablation_projection": {
                 "memory_modes": [item.value for item in supported_memory_modes],
                 "compression_modes": [
@@ -893,6 +1561,7 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         missing_capabilities=missing,
         supported_memory_kinds=supported_memory_kinds,
         supported_retrieval_strategies=supported_strategies,
+        supported_review_kinds=supported_review_kinds,
         memory_provider=("prompt_context_injection" if native_supported else None),
         supported_memory_modes=supported_memory_modes,
         supported_compression_modes=supported_compression_modes,

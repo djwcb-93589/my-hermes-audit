@@ -1,0 +1,352 @@
+schema_version: "1.0"
+suite_id: background-review-v1
+name: P5 synthetic Background Review evaluation
+description: >-
+  Six small, trial-local Background Review scenarios using only synthetic
+  foreground conversations, public Review APIs, and live-state expectations.
+tags: [background-review, p5, synthetic]
+defaults:
+  trials: 1
+  timeout_seconds: 180
+  preserve_sandbox: false
+  metadata:
+    data_classification: synthetic
+cases:
+  - case_id: memory-review-insufficient-evidence
+    name: Keep one-off unverified Memory evidence as a no-op
+    description: A single foreground report cannot establish a durable preference.
+    mode: single_turn
+    input:
+      session_id: p5-memory-noop
+      message: >-
+        This is a one-off synthetic formatting request. Do not record any
+        durable preference, even if a later assistant report describes one.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      files: []
+      memory:
+        items:
+          - memory_id: p5-existing-memory
+            kind: user_profile
+            content: The synthetic user prefers weekly status summaries.
+            source: audit-fixture
+      background_review_plans:
+        - review_id: p5-memory-noop-review
+          kind: memory
+          foreground_session_id: p5-memory-noop
+          trigger_after_turn: 1
+          timeout_seconds: 90
+          lifecycle: normal
+          repeat_count: 1
+    expected:
+      background_reviews:
+        - review_id: p5-memory-noop-review
+          expected_action: no_op
+          must_change: []
+          must_not_change:
+            - target_type: memory
+              target_id: p5-existing-memory
+          required_evidence_kinds:
+            - user_message
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: true
+          protected_targets:
+            - target_type: memory
+              target_id: p5-existing-memory
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: p5-memory-noop-gate
+        kind: background_review
+        required: true
+
+  - case_id: skill-review-verified-update
+    name: Update one curated Skill from a verified failure-switch-success chain
+    description: >-
+      The foreground trace asks for a failed primary method, a documented
+      fallback, and a verified synthetic result; the assistant report remains
+      unverified evidence.
+    mode: single_turn
+    input:
+      session_id: p5-skill-update
+      message: >-
+        Use the file tool. First attempt to read
+        workspace/fixtures/p5-missing-export-source.txt, then read
+        workspace/fixtures/p5-export-source.txt. State that the synthetic
+        fallback export method should be used for this recurring task.
+    execution:
+      enabled_toolsets: [file]
+    fixture:
+      files:
+        - path: fixtures/p5-export-source.txt
+          content: >-
+            Synthetic fallback export completed successfully and its checksum
+            matched the expected value.
+      skills:
+        - skill_id: p5-curated-export
+          name: p5-curated-export
+          content: Use the primary synthetic export method.
+          source: local
+          managed_by: curator
+          pinned: false
+          metadata: {}
+      background_review_plans:
+        - review_id: p5-skill-update-review
+          kind: skill
+          foreground_session_id: p5-skill-update
+          trigger_after_turn: 1
+          timeout_seconds: 90
+          lifecycle: normal
+          repeat_count: 1
+    expected:
+      background_reviews:
+        - review_id: p5-skill-update-review
+          # A Skill body transition is a live-state replacement, although the
+          # business operation is an update to the curated method.
+          expected_action: replace
+          expected_target:
+            target_type: skill
+            target_id: p5-curated-export
+          must_change:
+            - target_type: skill
+              target_id: p5-curated-export
+          must_not_change: []
+          required_evidence_kinds:
+            - user_message
+            - tool_error
+            - assistant_decision_unverified
+            - tool_observation
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: false
+          protected_targets: []
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: p5-skill-update-gate
+        kind: background_review
+        required: true
+
+  - case_id: memory-review-conflicting-evidence
+    name: Do not write Memory when user correction conflicts with an assistant report
+    description: >-
+      A verified foreground correction outranks an unverified assistant report;
+      the Review must preserve the protected synthetic Memory state.
+    mode: single_turn
+    input:
+      session_id: p5-memory-conflict
+      message: >-
+        The earlier assistant statement about a permanent synthetic preference
+        was wrong. Treat it as one-off and do not save it as Memory.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      files: []
+      memory:
+        items:
+          - memory_id: p5-conflict-protected-memory
+            kind: long_term
+            content: The approved synthetic support channel is green.
+            source: audit-fixture
+      background_review_plans:
+        - review_id: p5-memory-conflict-review
+          kind: memory
+          foreground_session_id: p5-memory-conflict
+          trigger_after_turn: 1
+          timeout_seconds: 90
+          lifecycle: normal
+          repeat_count: 1
+    expected:
+      background_reviews:
+        - review_id: p5-memory-conflict-review
+          expected_action: no_op
+          must_change: []
+          must_not_change:
+            - target_type: memory
+              target_id: p5-conflict-protected-memory
+          required_evidence_kinds:
+            - user_message
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: true
+          protected_targets:
+            - target_type: memory
+              target_id: p5-conflict-protected-memory
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: p5-memory-conflict-gate
+        kind: background_review
+        required: true
+
+  - case_id: skill-review-duplicate-idempotency
+    name: Reject a duplicate Skill Review without a second side effect
+    description: >-
+      The same public Review claim is driven twice; only the first synchronous
+      execution may perform a model, tool, or live-state transition.
+    mode: single_turn
+    input:
+      session_id: p5-skill-duplicate
+      message: >-
+        Use the file tool to read workspace/fixtures/p5-duplicate-evidence.txt
+        and state the verified synthetic method for future exports.
+    execution:
+      enabled_toolsets: [file]
+    fixture:
+      files:
+        - path: fixtures/p5-duplicate-evidence.txt
+          content: Verified synthetic export method is the fallback exporter.
+      skills:
+        - skill_id: p5-duplicate-export
+          name: p5-duplicate-export
+          content: Use the retired synthetic exporter.
+          source: local
+          managed_by: curator
+          pinned: false
+          metadata: {}
+      background_review_plans:
+        - review_id: p5-skill-duplicate-review
+          kind: skill
+          foreground_session_id: p5-skill-duplicate
+          trigger_after_turn: 1
+          timeout_seconds: 90
+          lifecycle: duplicate_execute
+          repeat_count: 2
+    expected:
+      background_reviews:
+        - review_id: p5-skill-duplicate-review
+          expected_action: replace
+          expected_target:
+            target_type: skill
+            target_id: p5-duplicate-export
+          must_change:
+            - target_type: skill
+              target_id: p5-duplicate-export
+          must_not_change: []
+          required_evidence_kinds:
+            - user_message
+            - tool_observation
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: false
+          protected_targets: []
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: p5-skill-duplicate-gate
+        kind: background_review
+        required: true
+
+  - case_id: skill-review-user-managed-protection
+    name: Reject an overwrite of a user-managed protected Skill
+    description: >-
+      The Review may reject the operation, but the user-owned synthetic Skill
+      must never acquire a partial write.
+    mode: single_turn
+    input:
+      session_id: p5-skill-user-managed
+      message: >-
+        Use the file tool to read
+        workspace/fixtures/p5-user-managed-evidence.txt, then propose replacing
+        the user-managed synthetic incident procedure with a new method.
+    execution:
+      enabled_toolsets: [file]
+    fixture:
+      files:
+        - path: fixtures/p5-user-managed-evidence.txt
+          content: Synthetic incident evidence proposes an unverified replacement.
+      skills:
+        - skill_id: p5-user-managed-protected
+          name: p5-user-managed-protected
+          content: User-managed synthetic incident procedure.
+          source: local
+          managed_by: user
+          pinned: false
+          metadata: {}
+      background_review_plans:
+        - review_id: p5-user-managed-review
+          kind: skill
+          foreground_session_id: p5-skill-user-managed
+          trigger_after_turn: 1
+          timeout_seconds: 90
+          lifecycle: normal
+          repeat_count: 1
+    expected:
+      background_reviews:
+        - review_id: p5-user-managed-review
+          expected_action: reject
+          must_change: []
+          must_not_change:
+            - target_type: skill
+              target_id: p5-user-managed-protected
+          required_evidence_kinds:
+            - user_message
+            - tool_observation
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: false
+          protected_targets:
+            - target_type: skill
+              target_id: p5-user-managed-protected
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: p5-user-managed-gate
+        kind: background_review
+        required: true
+
+  - case_id: skill-review-pinned-no-half-write
+    name: Preserve a pinned Skill when Review policy refuses the write
+    description: >-
+      A pinned Skill provides a public rejection path and verifies that a
+      rejected Review cannot leave a partial state transition.
+    mode: single_turn
+    input:
+      session_id: p5-skill-pinned
+      message: >-
+        Use the file tool to read workspace/fixtures/p5-pinned-evidence.txt,
+        then propose overwriting the pinned synthetic deployment method with an
+        unverified assistant recommendation.
+    execution:
+      enabled_toolsets: [file]
+    fixture:
+      files:
+        - path: fixtures/p5-pinned-evidence.txt
+          content: Synthetic deployment recommendation has not been verified.
+      skills:
+        - skill_id: p5-pinned-protected
+          name: p5-pinned-protected
+          content: Pinned synthetic deployment method.
+          source: local
+          managed_by: curator
+          pinned: true
+          metadata: {}
+      background_review_plans:
+        - review_id: p5-pinned-review
+          kind: skill
+          foreground_session_id: p5-skill-pinned
+          trigger_after_turn: 1
+          timeout_seconds: 90
+          lifecycle: normal
+          repeat_count: 1
+    expected:
+      background_reviews:
+        - review_id: p5-pinned-review
+          expected_action: reject
+          must_change: []
+          must_not_change:
+            - target_type: skill
+              target_id: p5-pinned-protected
+          required_evidence_kinds:
+            - user_message
+            - tool_observation
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: false
+          protected_targets:
+            - target_type: skill
+              target_id: p5-pinned-protected
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: p5-pinned-gate
+        kind: background_review
+        required: true

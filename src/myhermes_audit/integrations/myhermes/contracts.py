@@ -9,6 +9,9 @@ from typing import Literal
 from pydantic import Field, StrictBool, StrictStr, model_validator
 
 from myhermes_audit.contracts import (
+    BackgroundReviewExecutionError,
+    BackgroundReviewExecutionResult,
+    BackgroundReviewPlan,
     CompressionEvent,
     ContextDiagnostic,
     EffectiveSubjectConfiguration,
@@ -27,6 +30,7 @@ from myhermes_audit.contracts import (
     ToolsetName,
     TurnResult,
 )
+from myhermes_audit.contracts.suite import SkillFixture
 from myhermes_audit.contracts.common import (
     ContractModel,
     Identifier,
@@ -37,12 +41,9 @@ from myhermes_audit.contracts.common import (
 )
 
 
-WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v3"
-LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v2"
-WorkerProtocolVersion = Literal[
-    "myhermes-audit-worker-v2",
-    "myhermes-audit-worker-v3",
-]
+WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v4"
+LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v3"
+WorkerProtocolVersion = Literal["myhermes-audit-worker-v4"]
 
 
 class WorkerMode(str, Enum):
@@ -76,6 +77,9 @@ class WorkerArtifactPaths(ContractModel):
     stderr_log: Path
     memory: Path | None = None
     ablation: Path | None = None
+    background_review_results: Path | None = None
+    background_review_evidence: Path | None = None
+    background_review_snapshots: Path | None = None
 
     @model_validator(mode="after")
     def validate_artifact_paths(self) -> "WorkerArtifactPaths":
@@ -114,11 +118,17 @@ class MyHermesWorkerRequest(ContractModel):
         default_factory=list
     )
     checkpoints: list[LongConversationCheckpoint] = Field(default_factory=list)
+    background_review_plans: list[BackgroundReviewPlan] = Field(
+        default_factory=list
+    )
+    skill_fixtures: list[SkillFixture] = Field(default_factory=list)
     timeout_seconds: PositiveInt
     artifact_paths: WorkerArtifactPaths
 
     @model_validator(mode="after")
     def validate_request(self) -> "MyHermesWorkerRequest":
+        if self.protocol_version != WORKER_PROTOCOL_VERSION:
+            raise ValueError("worker request protocol version is incompatible")
         runtime_paths = (self.workspace, self.hermes_home, self.sqlite_path)
         if any(not path.is_absolute() for path in runtime_paths):
             raise ValueError("worker runtime paths must be absolute")
@@ -150,7 +160,7 @@ class MyHermesWorkerRequest(ContractModel):
             raise ValueError("disabled strategy cannot enable the memory toolset")
         p4_enabled = self.effective_subject_configuration is not None
         if p4_enabled and self.protocol_version != WORKER_PROTOCOL_VERSION:
-            raise ValueError("P4 requests require Worker protocol v3")
+            raise ValueError("P4 requests require the current Worker protocol")
         if p4_enabled != (self.variant_id is not None):
             raise ValueError("P4 request requires Variant and effective configuration")
         if p4_enabled != (self.artifact_paths.ablation is not None):
@@ -180,6 +190,21 @@ class MyHermesWorkerRequest(ContractModel):
                 self.memory_fixture is not None or self.memory_queries
             ):
                 raise ValueError("non-long-term P4 modes cannot expose Memory facts")
+        p5_enabled = bool(self.background_review_plans)
+        p5_paths = (
+            self.artifact_paths.background_review_results,
+            self.artifact_paths.background_review_evidence,
+            self.artifact_paths.background_review_snapshots,
+        )
+        if p5_enabled != all(path is not None for path in p5_paths):
+            raise ValueError("P5 Review requests require all Review Artifact paths")
+        if not p5_enabled and any(path is not None for path in p5_paths):
+            raise ValueError("non-P5 requests cannot name Review Artifact paths")
+        if self.skill_fixtures and not p5_enabled:
+            raise ValueError("Skill fixtures require a P5 Background Review plan")
+        plan_ids = [plan.review_id for plan in self.background_review_plans]
+        if len(plan_ids) != len(set(plan_ids)):
+            raise ValueError("P5 Review plan IDs must not repeat")
         return self
 
 
@@ -348,7 +373,7 @@ class AblationArtifact(ContractModel):
     @model_validator(mode="after")
     def validate_ablation_artifact(self) -> "AblationArtifact":
         if self.protocol_version != WORKER_PROTOCOL_VERSION:
-            raise ValueError("Ablation Artifacts require Worker protocol v3")
+            raise ValueError("Ablation Artifacts require the current Worker protocol")
         event_ids = [item.event_id for item in self.compression_events]
         if len(event_ids) != len(set(event_ids)):
             raise ValueError("Ablation Artifact event IDs must not repeat")
@@ -368,6 +393,55 @@ class AblationArtifact(ContractModel):
         ]
         if len(fact_keys) != len(set(fact_keys)):
             raise ValueError("Ablation fact observations must be unique")
+        return self
+
+
+class BackgroundReviewArtifact(ContractModel):
+    """Worker-owned P5 result artifact; prompt and claim material are absent."""
+
+    protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
+    trial_id: Identifier
+    case_id: Identifier
+    results: list[BackgroundReviewExecutionResult] = Field(default_factory=list)
+    errors: list[BackgroundReviewExecutionError] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_review_artifact(self) -> "BackgroundReviewArtifact":
+        if self.protocol_version != WORKER_PROTOCOL_VERSION:
+            raise ValueError("Background Review Artifacts require Worker protocol v4")
+        review_ids = [item.review_id for item in self.results]
+        if len(review_ids) != len(set(review_ids)):
+            raise ValueError("Background Review Artifact result IDs must be unique")
+        return self
+
+
+class BackgroundReviewEvidenceArtifact(ContractModel):
+    """Dedicated evidence artifact kept separate from result and snapshot data."""
+
+    protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
+    trial_id: Identifier
+    case_id: Identifier
+    results: list[BackgroundReviewExecutionResult] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_evidence_artifact(self) -> "BackgroundReviewEvidenceArtifact":
+        if self.protocol_version != WORKER_PROTOCOL_VERSION:
+            raise ValueError("Background Review Evidence requires Worker protocol v4")
+        return self
+
+
+class BackgroundReviewSnapshotsArtifact(ContractModel):
+    """Dedicated before/after state artifact for deterministic Review diffs."""
+
+    protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
+    trial_id: Identifier
+    case_id: Identifier
+    results: list[BackgroundReviewExecutionResult] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_snapshots_artifact(self) -> "BackgroundReviewSnapshotsArtifact":
+        if self.protocol_version != WORKER_PROTOCOL_VERSION:
+            raise ValueError("Background Review Snapshots require Worker protocol v4")
         return self
 
 
@@ -404,11 +478,23 @@ class MyHermesWorkerResult(ContractModel):
     fact_context_observations: list[FactContextObservation] = Field(
         default_factory=list
     )
+    background_review_results_artifact: SafeRelativePath | None = None
+    background_review_evidence_artifact: SafeRelativePath | None = None
+    background_review_snapshots_artifact: SafeRelativePath | None = None
+    background_review_results: list[BackgroundReviewExecutionResult] = Field(
+        default_factory=list
+    )
+    background_review_errors: list[BackgroundReviewExecutionError] = Field(
+        default_factory=list
+    )
+    review_gate_passed: StrictBool | None = None
     warnings: list[WorkerWarning] = Field(default_factory=list)
     error: WorkerError | None = None
 
     @model_validator(mode="after")
     def validate_result(self) -> "MyHermesWorkerResult":
+        if self.protocol_version != WORKER_PROTOCOL_VERSION:
+            raise ValueError("worker result protocol version is incompatible")
         if self.runtime_status is None or not self.runtime_status.strip():
             raise ValueError("worker results require runtime_status")
         if self.worker_status is WorkerStatus.COMPLETED:
@@ -472,7 +558,7 @@ class MyHermesWorkerResult(ContractModel):
             raise ValueError("worker Memory state change IDs must not repeat")
         p4_enabled = self.effective_subject_configuration is not None
         if p4_enabled and self.protocol_version != WORKER_PROTOCOL_VERSION:
-            raise ValueError("P4 results require Worker protocol v3")
+            raise ValueError("P4 results require the current Worker protocol")
         if p4_enabled != (self.variant_id is not None):
             raise ValueError("worker P4 result requires Variant and configuration")
         if p4_enabled != (self.ablation_artifact is not None):
@@ -489,11 +575,31 @@ class MyHermesWorkerResult(ContractModel):
             self.effective_subject_configuration.maximum_compression_events
         ):
             raise ValueError("worker compression events exceed the declared limit")
+        review_artifacts = (
+            self.background_review_results_artifact,
+            self.background_review_evidence_artifact,
+            self.background_review_snapshots_artifact,
+        )
+        review_present = bool(self.background_review_results) or bool(
+            self.background_review_errors
+        ) or any(item is not None for item in review_artifacts)
+        if review_present and not all(item is not None for item in review_artifacts):
+            raise ValueError("P5 worker results require all Review Artifact refs")
+        review_ids = [item.review_id for item in self.background_review_results]
+        if len(review_ids) != len(set(review_ids)):
+            raise ValueError("worker Background Review result IDs must be unique")
+        # The parent-side deterministic validator owns the Review gate.  A
+        # Worker only reports execution facts and must not pre-judge them.
+        if self.review_gate_passed is not None:
+            raise ValueError("worker must not calculate the Background Review gate")
         return self
 
 
 __all__ = (
     "AblationArtifact",
+    "BackgroundReviewArtifact",
+    "BackgroundReviewEvidenceArtifact",
+    "BackgroundReviewSnapshotsArtifact",
     "MyHermesWorkerRequest",
     "MyHermesWorkerResult",
     "MemoryArtifact",

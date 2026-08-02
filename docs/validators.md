@@ -1,5 +1,20 @@
 # Deterministic Validator
 
+## P5 Background Review
+
+`background_review` evaluator 只消费 Worker 已持久化的 `BackgroundReviewExecutionResult`、安全 evidence projection、live snapshot 和 observed state diff；它不导入 MyHermes、不重新运行 Review、模型或工具，也不根据 Assistant 文本猜测状态变化。
+
+每个 `BackgroundReviewExpectation` 生成六个独立的结构化 Metric：
+
+1. `decision_correctness`：terminal status、expected action、no-op、目标和声明的 stale 语义；
+2. `evidence_completeness`：required/forbidden kind 是否实际进入 `prepare_run()` 的 Subject prepared window，以及顺序和前台来源关联；
+3. `update_correctness`：live `observed_changes` 是否满足 `must_change`、`must_not_change`、目标与 revision；
+4. `stale_rejection`：仅在声明 stale 时，公开事实是否表明 stale、零写入和 reject；
+5. `side_effect_safety`：protected/non-target 状态、failed/rejected/stale/no-op 的意外半写入；
+6. `idempotency`：duplicate lifecycle 的第二次 attempt 没有 loop、模型、工具或状态副作用。
+
+缺少执行结果或结构化 execution error 时，required 维度为 `ERROR`/`value=null`，不伪造成零分。所有 required Review evaluator 通过才令 `review_gate_passed=true`；任一失败或 error 令它为 `false`，并使 `task_success`/`task_passed` 为 false。没有 required Review evaluator 时 gate 为 `null`。Review 指标仅用于诊断与硬门禁；一级 Score 仍只有 `task_success`、`tool_correctness`、`answer_quality`。
+
 ## P4 required facts
 
 `compression` evaluator 消费声明性 `RequiredFactExpectation`，按 Variant 的 `applicable_variant_ids` 选择事实，并从 Subject context Observation、P3 after snapshot 或 final answer 中做 exact/normalized/contains 匹配。它同时产生结构化 checkpoint、fact retention、required-fact loss 和 distortion；证据只含 fact ID、SHA-256、长度和状态。

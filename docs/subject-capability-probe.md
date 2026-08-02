@@ -1,5 +1,19 @@
 # Subject Capability Probe
 
+## P5 Background Review capability projection
+
+Capability protocol `4.0` adds optional P5 public-surface checks without turning a Probe into a Review run. It binds only public module exports and safe call signatures for:
+
+- Background Review coordinator/runtime, `ReviewClaim`, Driver Registry, Driver lifecycle, `ReviewAgentLoop`, executor shutdown and ReviewRunSpec evidence window;
+- `ToolPolicy`/`ToolRegistry` policy resolution, including the public Background Review execution environment;
+- Memory and Skill Review drivers/stores, public Memory read/write surface, public Skill inventory/governance surface, supported review kinds and safe outcome observation;
+- public foreground message-range access needed to relate the actual triggering turn to the prepared Review window;
+- public claim validation, completion and failure call shapes.
+
+The Probe does not create a database or Session, claim a Review, call `record_progress`, create a Tool Registry, run a model, mutate Memory/Skill state, read evidence content, inspect claim tokens, or call a private `hermes.persistence.background_review` object. Its public API fingerprint contains only module/symbol names, availability and safe signatures.
+
+`stale_review_detection` is deliberately independent. It is true only when the public Subject surface can demonstrate that claim validity is bound to the target governance revision. The current Subject does not expose that binding, so the Probe reports it unavailable and any `stale_before_execute` P5 Case fails before Sandbox creation. Audit must not infer stale from an unchanged snapshot or manufacture it by editing a database.
+
 ## P4 capability projection
 
 Capability protocol `3.0` 在既有 P3 检查上增加 short-term context、Session isolation、long-term Memory、User Profile、Memory Prompt/tool、Compression threshold control/configuration、emergency disable、observation、token usage 和 context size。Probe 仅导入公开模块、读取公开符号并用 `inspect.signature()` 绑定调用形状；它不运行会话、创建 Session/数据库、执行 Compression、读取真实 Memory 或联网。
@@ -38,9 +52,9 @@ Background Review.
 
 `SubjectCapabilityReport` records the protocol version, Subject commit,
 individual checks, missing capabilities, bounded warnings, and a public API
-fingerprint. Capability protocol `3.0` distinguishes baseline-required checks
-from optional P3 capabilities, so a Subject without Memory support can still run
-an old non-Memory Suite. The fingerprint uses only module names, public object
+fingerprint. Capability protocol `4.0` distinguishes baseline-required checks
+from optional P3/P5 capabilities, so a Subject without Memory or Background
+Review support can still run an old non-Memory/non-Review Suite. The fingerprint uses only module names, public object
 names, availability, safe call signatures, the stable Memory
 kind/strategy/provider projection, and the probe protocol version; it never
 hashes MyHermes source text or function `repr`. If a Case requests an optional
