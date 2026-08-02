@@ -29,6 +29,10 @@ from myhermes_audit.validators.tool_trajectory import ToolTrajectoryValidator
 
 
 _DETERMINISTIC_GROUPS = frozenset({"all", "files", "texts", "json_values"})
+_RETRIEVAL_GATE_METRIC_TYPES = frozenset(
+    {"required_evidence", "recall_at_k", "mrr"}
+)
+_MEMORY_STATE_GATE_METRIC_TYPES = frozenset({"memory_state_gate"})
 
 
 class EvaluatorValidationResult(ContractModel):
@@ -69,8 +73,46 @@ class ValidatorResultsArtifact(ContractModel):
         return self
 
     @property
+    def task_hard_gates_passed(self) -> bool:
+        """Return whether every required, local non-Judge evaluator passed."""
+
+        return all(
+            item.passed
+            for item in self.evaluator_results
+            if item.required and item.evaluator_kind is not EvaluatorKind.LLM_JUDGE
+        )
+
+    @property
+    def retrieval_hard_gates_passed(self) -> bool | None:
+        """Aggregate required retrieval-evidence gates independently."""
+
+        return self.required_gate_status(
+            evaluator_kind=EvaluatorKind.RETRIEVAL,
+            metric_types=_RETRIEVAL_GATE_METRIC_TYPES,
+        )
+
+    @property
+    def memory_state_hard_gates_passed(self) -> bool | None:
+        """Aggregate required Memory-state gates independently."""
+
+        return self.required_gate_status(
+            evaluator_kind=EvaluatorKind.RETRIEVAL,
+            metric_types=_MEMORY_STATE_GATE_METRIC_TYPES,
+        )
+
+    @property
+    def final_answer_hard_gates_passed(self) -> bool | None:
+        """Aggregate required deterministic final-answer gates independently."""
+
+        return self.required_gate_status(
+            evaluator_kind=EvaluatorKind.DETERMINISTIC,
+        )
+
+    @property
     def hard_gates_passed(self) -> bool:
-        return all(item.passed for item in self.evaluator_results if item.required)
+        """Compatibility alias for task_hard_gates_passed."""
+
+        return self.task_hard_gates_passed
 
     @property
     def deterministic_hard_gates_passed(self) -> bool:

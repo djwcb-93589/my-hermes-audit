@@ -15,7 +15,6 @@ from myhermes_audit.contracts import (
     AuditCase,
     AuditRunResult,
     AuditSuite,
-    EvaluatorKind,
     MetricStatus,
     TrialError,
     TrialResult,
@@ -297,20 +296,14 @@ class AuditOrchestrator:
                     failure = failure or exc
 
         status = _trial_status(outcome, failure)
-        task_passed = (
-            failure is None
-            and outcome is not None
-            and outcome.status is RunnerStatus.COMPLETED
-            and validator_result is not None
-            and validator_result.hard_gates_passed
-        )
         local_required_gates_passed = (
             failure is None
             and outcome is not None
             and outcome.status is RunnerStatus.COMPLETED
             and validator_result is not None
-            and validator_result.hard_gates_passed
+            and validator_result.task_hard_gates_passed
         )
+        task_passed = local_required_gates_passed
         judge_gate_passed = (
             judge_evaluation is None
             or not judge_evaluation.required
@@ -397,27 +390,17 @@ class AuditOrchestrator:
                 retrieval_gate_passed=(
                     None
                     if validator_result is None
-                    else validator_result.required_gate_status(
-                        evaluator_kind=EvaluatorKind.RETRIEVAL,
-                        metric_types=frozenset(
-                            {"required_evidence", "recall_at_k", "mrr"}
-                        ),
-                    )
+                    else validator_result.retrieval_hard_gates_passed
                 ),
                 final_answer_gate_passed=(
                     None
                     if validator_result is None
-                    else validator_result.required_gate_status(
-                        evaluator_kind=EvaluatorKind.DETERMINISTIC,
-                    )
+                    else validator_result.final_answer_hard_gates_passed
                 ),
                 memory_state_gate_passed=(
                     None
                     if validator_result is None
-                    else validator_result.required_gate_status(
-                        evaluator_kind=EvaluatorKind.RETRIEVAL,
-                        metric_types=frozenset({"memory_state_gate"}),
-                    )
+                    else validator_result.memory_state_hard_gates_passed
                 ),
                 metrics=metrics,
                 judge_result=(

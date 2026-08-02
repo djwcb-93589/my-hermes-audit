@@ -309,6 +309,14 @@ class TrialResult(ContractModel):
             raise ValueError("only completed trials can pass")
         if self.status is not TrialStatus.COMPLETED and self.task_passed is True:
             raise ValueError("only completed trials can have task_passed=true")
+        if self.retrieval_gate_passed is False and self.task_passed is True:
+            raise ValueError("failed retrieval gate cannot have task_passed=true")
+        if self.memory_state_gate_passed is False and self.task_passed is True:
+            raise ValueError("failed Memory state gate cannot have task_passed=true")
+        if self.final_answer_gate_passed is False and self.task_passed is True:
+            raise ValueError("failed final-answer gate cannot have task_passed=true")
+        if self.task_passed is False and self.passed is True:
+            raise ValueError("failed task cannot have passed=true")
         if self.status is TrialStatus.TIMEOUT:
             if self.error is None or self.error.error_type != "timeout":
                 raise ValueError("timeout trials require a stable timeout error")
