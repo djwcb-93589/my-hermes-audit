@@ -365,7 +365,7 @@ def _background_review_expectation_projection(expectation) -> dict:
             for item in values
         ]
 
-    return {
+    projection = {
         "review_id": expectation.review_id,
         "expected_action": (
             None
@@ -394,6 +394,11 @@ def _background_review_expectation_projection(expectation) -> dict:
         "expected_stale_rejection": expectation.expected_stale_rejection,
         "allow_other_changes": expectation.allow_other_changes,
     }
+    if expectation.allowed_actions is not None:
+        projection["allowed_actions"] = [
+            action.value for action in expectation.allowed_actions
+        ]
+    return projection
 
 
 def _fixture_manifest_summary(

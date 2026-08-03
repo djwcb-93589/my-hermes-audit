@@ -431,19 +431,21 @@ def _safe_background_review_metric(metric) -> dict:
     if metric_type == "decision_correctness":
         checks = value.get("checks")
         safe_value = {
-            "status": value.get("status"),
-            "actual_action": value.get("actual_action"),
-            "has_actual_target": value.get("has_actual_target"),
-            "checks": (
-                {
-                    str(key): bool(item)
-                    for key, item in checks.items()
-                    if isinstance(key, str) and isinstance(item, bool)
-                }
-                if isinstance(checks, dict)
-                else {}
-            ),
+            "status": _safe_review_status(value.get("status")),
+            "actual_action": _safe_review_action(value.get("actual_action")),
+            "has_actual_target": _safe_bool(value.get("has_actual_target")),
+            "checks": _safe_review_decision_checks(checks),
         }
+        if "expected_action" in value:
+            safe_value["expected_action"] = _safe_review_action(
+                value.get("expected_action")
+            )
+        if "allowed_actions" in value:
+            safe_value["allowed_actions"] = _safe_review_actions(
+                value.get("allowed_actions")
+            )
+        if "action_matched" in value:
+            safe_value["action_matched"] = _safe_bool(value.get("action_matched"))
     elif metric_type == "evidence_completeness":
         safe_value = {
             "prepared_evidence_count": value.get("prepared_evidence_count"),
@@ -526,6 +528,49 @@ def _safe_review_evidence_kinds(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, str) and item in allowed]
+
+
+def _safe_review_action(value: object) -> str | None:
+    allowed = {"no_op", "create", "update", "replace", "remove", "reject"}
+    return value if isinstance(value, str) and value in allowed else None
+
+
+def _safe_review_actions(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        item
+        for item in value
+        if isinstance(item, str) and _safe_review_action(item) is not None
+    ]
+
+
+def _safe_review_status(value: object) -> str | None:
+    allowed = {"pending", "running", "completed", "failed", "rejected", "stale"}
+    return value if isinstance(value, str) and value in allowed else None
+
+
+def _safe_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _safe_review_decision_checks(value: object) -> dict[str, bool]:
+    allowed = {
+        "terminal_status",
+        "expected_action",
+        "allowed_actions",
+        "must_be_no_op",
+        "expected_target",
+        "expected_stale",
+        "execution_not_failed",
+    }
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: item
+        for key, item in value.items()
+        if isinstance(key, str) and key in allowed and isinstance(item, bool)
+    }
 
 
 def _safe_list_count(value: object) -> int:

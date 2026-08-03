@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import Field, StrictBool, StrictStr, field_validator, model_validator
+from pydantic import (
+    Field,
+    StrictBool,
+    StrictStr,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from myhermes_audit.contracts.common import (
     ContractModel,
@@ -568,6 +575,7 @@ class ReviewOutcome(ContractModel):
 class BackgroundReviewExpectation(ContractModel):
     review_id: Identifier | None = None
     expected_action: ReviewAction | None = None
+    allowed_actions: list[ReviewAction] | None = Field(default=None, min_length=1)
     expected_target: ReviewTarget | None = None
     expected_target_revision: Sha256Digest | None = None
     must_change: list[ReviewTarget] = Field(default_factory=list)
@@ -579,8 +587,33 @@ class BackgroundReviewExpectation(ContractModel):
     expected_stale_rejection: StrictBool = False
     allow_other_changes: StrictBool = False
 
+    @field_validator("allowed_actions", mode="before")
+    @classmethod
+    def validate_allowed_action_container(cls, value: object) -> object:
+        if value is not None and not isinstance(value, (list, tuple)):
+            raise ValueError("allowed_actions must be a list or tuple")
+        return value
+
+    @field_validator("allowed_actions")
+    @classmethod
+    def normalize_allowed_actions(
+        cls,
+        value: list[ReviewAction] | None,
+    ) -> list[ReviewAction] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("allowed_actions must not be empty")
+        if len(value) != len(set(value)):
+            raise ValueError("allowed_actions must not repeat")
+        return sorted(value, key=lambda action: action.value)
+
     @model_validator(mode="after")
     def validate_expectation(self) -> "BackgroundReviewExpectation":
+        if (self.expected_action is None) == (self.allowed_actions is None):
+            raise ValueError(
+                "exactly one of expected_action or allowed_actions must be declared"
+            )
         required = set(self.required_evidence_kinds)
         forbidden = set(self.forbidden_evidence_kinds)
         if len(required) != len(self.required_evidence_kinds):
@@ -613,6 +646,11 @@ class BackgroundReviewExpectation(ContractModel):
             ReviewAction.NO_OP,
         }:
             raise ValueError("must_be_no_op conflicts with expected_action")
+        if self.must_be_no_op and self.allowed_actions not in (
+            None,
+            [ReviewAction.NO_OP],
+        ):
+            raise ValueError("must_be_no_op requires only the no_op action")
         if self.must_be_no_op and self.expected_stale_rejection:
             raise ValueError("no-op and stale rejection are distinct expectations")
         if self.expected_stale_rejection and self.expected_action not in {
@@ -620,8 +658,34 @@ class BackgroundReviewExpectation(ContractModel):
             ReviewAction.REJECT,
         }:
             raise ValueError("expected_stale_rejection requires reject action")
+        if self.expected_stale_rejection and self.allowed_actions not in (
+            None,
+            [ReviewAction.REJECT],
+        ):
+            raise ValueError("expected_stale_rejection requires only reject action")
+        if (
+            self.allowed_actions is not None
+            and {
+                ReviewAction.NO_OP,
+                ReviewAction.REJECT,
+            }
+            & set(self.allowed_actions)
+            and self.must_change
+        ):
+            raise ValueError(
+                "non-writing allowed actions cannot be combined with must_change"
+            )
         if self.expected_target_revision is not None and self.expected_target is None:
             raise ValueError(
                 "expected_target_revision requires an expected_target"
             )
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_undeclared_allowed_actions(self, handler):
+        """Keep legacy expected-action-only contract bytes stable."""
+
+        payload = handler(self)
+        if self.allowed_actions is None:
+            payload.pop("allowed_actions", None)
+        return payload

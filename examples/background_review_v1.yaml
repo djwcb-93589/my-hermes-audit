@@ -65,29 +65,35 @@ cases:
   - case_id: skill-review-verified-update
     name: Update one curated Skill from a verified failure-switch-success chain
     description: >-
-      The foreground trace asks for a failed primary method, a documented
-      fallback, and a verified synthetic result; the assistant report remains
-      unverified evidence.
+      A recurring export goal, a failed preferred method, and a verified
+      reusable fallback establish a live Skill update; the assistant report
+      remains unverified evidence.
     mode: single_turn
     input:
       session_id: p5-skill-update
       message: >-
-        Use the file tool. First attempt to read
-        workspace/fixtures/p5-missing-export-source.txt, then read
-        workspace/fixtures/p5-export-source.txt. State that the synthetic
-        fallback export method should be used for this recurring task.
+        Use the file tool for a stable, reusable synthetic export process. The
+        existing curated Skill identifies only its preferred primary method.
+        First attempt to read fixtures/p5-missing-export-source.txt as that
+        preferred method. When it fails, read fixtures/p5-export-source.txt as
+        its verified fallback. For every future identical export, use the
+        verified fallback method. Report only facts the file tool observed and
+        completed.
     execution:
       enabled_toolsets: [file]
     fixture:
       files:
         - path: workspace/fixtures/p5-export-source.txt
           content: >-
-            Synthetic fallback export completed successfully and its checksum
-            matched the expected value.
+            Verified reusable fallback export method: use the synthetic fallback
+            exporter for recurring exports. The fallback export completed
+            successfully and its checksum matched the expected value.
       skills:
         - skill_id: p5-curated-export
           name: p5-curated-export
-          content: Use the primary synthetic export method.
+          content: >-
+            For recurring synthetic exports, use only the preferred primary
+            method at fixtures/p5-missing-export-source.txt.
           source: local
           managed_by: curator
           pinned: false
@@ -183,13 +189,14 @@ cases:
   - case_id: skill-review-duplicate-idempotency
     name: Reject a duplicate Skill Review without a second side effect
     description: >-
-      The same public Review claim is driven twice; only the first synchronous
-      execution may perform a model, tool, or live-state transition.
+      The same public Review claim is driven twice; the first synchronous
+      execution may safely no-op or replace the declared target, while the
+      second must never perform another model, tool, or live-state transition.
     mode: single_turn
     input:
       session_id: p5-skill-duplicate
       message: >-
-        Use the file tool to read workspace/fixtures/p5-duplicate-evidence.txt
+        Use the file tool to read fixtures/p5-duplicate-evidence.txt
         and state the verified synthetic method for future exports.
     execution:
       enabled_toolsets: [file]
@@ -216,13 +223,13 @@ cases:
     expected:
       background_reviews:
         - review_id: p5-skill-duplicate-review
-          expected_action: replace
+          allowed_actions:
+            - no_op
+            - replace
           expected_target:
             target_type: skill
             target_id: p5-duplicate-export
-          must_change:
-            - target_type: skill
-              target_id: p5-duplicate-export
+          must_change: []
           must_not_change: []
           required_evidence_kinds:
             - user_message
@@ -238,16 +245,17 @@ cases:
         required: true
 
   - case_id: skill-review-user-managed-protection
-    name: Reject an overwrite of a user-managed protected Skill
+    name: Preserve a user-managed protected Skill without a partial write
     description: >-
-      The Review may reject the operation, but the user-owned synthetic Skill
-      must never acquire a partial write.
+      The Review may safely no-op before a tool call or receive a governance
+      rejection, but the user-owned synthetic Skill must never acquire a
+      partial write.
     mode: single_turn
     input:
       session_id: p5-skill-user-managed
       message: >-
         Use the file tool to read
-        workspace/fixtures/p5-user-managed-evidence.txt, then propose replacing
+        fixtures/p5-user-managed-evidence.txt, then propose replacing
         the user-managed synthetic incident procedure with a new method.
     execution:
       enabled_toolsets: [file]
@@ -274,7 +282,9 @@ cases:
     expected:
       background_reviews:
         - review_id: p5-user-managed-review
-          expected_action: reject
+          allowed_actions:
+            - no_op
+            - reject
           must_change: []
           must_not_change:
             - target_type: skill
@@ -295,15 +305,15 @@ cases:
         required: true
 
   - case_id: skill-review-pinned-no-half-write
-    name: Preserve a pinned Skill when Review policy refuses the write
+    name: Preserve a pinned Skill without a partial write
     description: >-
-      A pinned Skill provides a public rejection path and verifies that a
-      rejected Review cannot leave a partial state transition.
+      A pinned Skill may cause a safe no-op or a public governance rejection;
+      neither path may leave a partial state transition.
     mode: single_turn
     input:
       session_id: p5-skill-pinned
       message: >-
-        Use the file tool to read workspace/fixtures/p5-pinned-evidence.txt,
+        Use the file tool to read fixtures/p5-pinned-evidence.txt,
         then propose overwriting the pinned synthetic deployment method with an
         unverified assistant recommendation.
     execution:
@@ -331,7 +341,9 @@ cases:
     expected:
       background_reviews:
         - review_id: p5-pinned-review
-          expected_action: reject
+          allowed_actions:
+            - no_op
+            - reject
           must_change: []
           must_not_change:
             - target_type: skill

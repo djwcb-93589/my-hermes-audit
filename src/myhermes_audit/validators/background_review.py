@@ -26,7 +26,7 @@ from myhermes_audit.contracts import (
 from myhermes_audit.validators.base import ValidationContext
 
 
-BACKGROUND_REVIEW_EVALUATOR_VERSION = "p5.0"
+BACKGROUND_REVIEW_EVALUATOR_VERSION = "p5.1"
 _DIMENSIONS = (
     "decision_correctness",
     "evidence_completeness",
@@ -81,21 +81,20 @@ def _decision_metric(
     result: BackgroundReviewExecutionResult,
     prefix: str,
 ) -> MetricResult:
+    action_matched = (
+        result.actual_action is expectation.expected_action
+        if expectation.expected_action is not None
+        else result.actual_action in (expectation.allowed_actions or ())
+    )
+    target_matched = _target_matches_for_action(expectation, result)
     checks: dict[str, bool] = {
         "terminal_status": result.status
         not in {ReviewStatus.PENDING, ReviewStatus.RUNNING},
-        "expected_action": (
-            expectation.expected_action is None
-            or result.actual_action is expectation.expected_action
-        ),
         "must_be_no_op": (
             not expectation.must_be_no_op
             or result.actual_action is ReviewAction.NO_OP
         ),
-        "expected_target": _target_matches(
-            expectation.expected_target,
-            result.actual_target,
-        ),
+        "expected_target": target_matched,
         "expected_stale": (
             not expectation.expected_stale_rejection
             or (
@@ -106,7 +105,24 @@ def _decision_metric(
         ),
         "execution_not_failed": result.status is not ReviewStatus.FAILED,
     }
+    if expectation.expected_action is not None:
+        checks["expected_action"] = action_matched
+    if expectation.allowed_actions is not None:
+        checks["allowed_actions"] = action_matched
     passed = all(checks.values())
+    value: dict[str, object] = {
+        "status": result.status.value,
+        "actual_action": result.actual_action.value,
+        "action_matched": action_matched,
+        "has_actual_target": result.actual_target is not None,
+        "checks": checks,
+    }
+    if expectation.expected_action is not None:
+        value["expected_action"] = expectation.expected_action.value
+    if expectation.allowed_actions is not None:
+        value["allowed_actions"] = [
+            action.value for action in expectation.allowed_actions
+        ]
     return _metric(
         name=f"{prefix}.decision_correctness",
         passed=passed,
@@ -115,12 +131,7 @@ def _decision_metric(
             if passed
             else "Background Review status, action, or target does not match the expectation"
         ),
-        value={
-            "status": result.status.value,
-            "actual_action": result.actual_action.value,
-            "has_actual_target": result.actual_target is not None,
-            "checks": checks,
-        },
+        value=value,
         result=result,
         dimension="decision_correctness",
         hard_gate=True,
@@ -571,6 +582,22 @@ def _target_matches(
         and expected.target_type == actual.target_type
         and expected.target_id == actual.target_id
     )
+
+
+def _target_matches_for_action(
+    expectation: BackgroundReviewExpectation,
+    result: BackgroundReviewExecutionResult,
+) -> bool:
+    """Permit a declared safe non-writing branch to have no actual target."""
+
+    if (
+        expectation.allowed_actions is not None
+        and result.actual_action in {ReviewAction.NO_OP, ReviewAction.REJECT}
+        and result.actual_action in expectation.allowed_actions
+        and result.actual_target is None
+    ):
+        return True
+    return _target_matches(expectation.expected_target, result.actual_target)
 
 
 def _target_key(target_type: str, target_id: str) -> str:

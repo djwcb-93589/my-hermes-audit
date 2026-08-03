@@ -6,7 +6,7 @@
 
 每个 `BackgroundReviewExpectation` 生成六个独立的结构化 Metric：
 
-1. `decision_correctness`：terminal status、expected action、no-op、目标和声明的 stale 语义；
+1. `decision_correctness`：terminal status、严格 expected action 或 allowed action set、no-op、目标和声明的 stale 语义；
 2. `evidence_completeness`：required/forbidden kind 是否实际进入 `prepare_run()` 的 Subject prepared window，以及顺序和前台来源关联；
 3. `update_correctness`：live `observed_changes` 是否满足 `must_change`、`must_not_change`、目标与 revision；
 4. `stale_rejection`：仅在声明 stale 时，公开事实是否表明 stale、零写入和 reject；
@@ -14,6 +14,12 @@
 6. `idempotency`：duplicate lifecycle 的第二次 attempt 没有 loop、模型、工具或状态副作用。
 
 缺少执行结果或结构化 execution error 时，required 维度为 `ERROR`/`value=null`，不伪造成零分。所有 required Review evaluator 通过才令 `review_gate_passed=true`；任一失败或 error 令它为 `false`，并使 `task_success`/`task_passed` 为 false。没有 required Review evaluator 时 gate 为 `null`。Review 指标仅用于诊断与硬门禁；一级 Score 仍只有 `task_success`、`tool_correctness`、`answer_quality`。
+
+### 动作合同
+
+`expected_action` 要求 `actual_action` 精确相等；`allowed_actions` 要求 `actual_action` 属于声明的非空、去重动作集合。一个 expectation 必须且只能声明其中之一，集合按规范化顺序进入 Suite fingerprint。Metric 明确记录实际动作、适用的严格动作或允许集合，以及 `action_matched`；不会把 `no_op` 重写成 `reject`，也不会反向改写。
+
+动作通过不替代其余五个维度。默认 protected Skill Case 接受 `no_op` 或 `reject`，但仍以零修改、protected/non-target snapshot 和无半写入为硬约束。显式 `reject` 只有在 Review 模型实际尝试受治理工具调用时才会产生。duplicate Case 的第一次执行不要求一定更新：它可 no-op 或仅替换声明的目标；无论第一次动作是什么，第二次都必须保留 `claim_valid=false`、`loop_executed=false`、零模型/工具/状态变化、`duplicate_rejected=true` 和 `attempt_count=2`。相反，verified-update Case 仍严格要求 `replace`；在完整失败→fallback→成功证据下返回 no-op 属于 Subject 能力失败。
 
 ## P4 required facts
 

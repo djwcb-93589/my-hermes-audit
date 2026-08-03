@@ -36,6 +36,16 @@ foreground turn 完成
 
 Memory snapshot 继续复用 P3 的公共 Memory Adapter。Skill snapshot 只使用公开 Skill inventory 和治理字段：`skill_id`、name、source、managed_by、pinned、revision、governance_revision；不读取 Skill 文件或私有治理数据库。
 
+## 动作 expectation 与默认 Skill Suite
+
+每个 `BackgroundReviewExpectation` 必须二选一地声明动作合同：`expected_action` 是严格的单一动作匹配，`allowed_actions` 是去重、非空且按动作值规范化的安全动作集合；两者不能同时声明。未声明 `allowed_actions` 的旧 `expected_action` 合同保留原有序列化和精确匹配语义。`no_op` 与 `reject` 是不同的 Subject 事实：前者表示 Review 在治理工具调用前安全地不执行写入，后者表示其尝试的治理操作被公开拒绝；Audit 不会在两者之间改写 `actual_action`。
+
+动作集合只决定 decision correctness。update correctness、side-effect safety、before/after snapshot 和 `observed_changes` 仍独立判定：允许的动作若带来受保护、非目标或半写入状态，Review gate 仍失败。对于允许的非写入分支，缺少 `actual_target` 不会掩盖写入分支的 target 约束；一旦产生替换，目标和非目标副作用仍须匹配声明。
+
+默认 Suite 的 user-managed 与 pinned Skill Case 接受安全的 `no_op` 或 `reject`，但都要求受保护 Skill 和其他状态不变且没有半写入。显式治理拒绝是否发生取决于 Review 模型是否实际尝试工具调用，不能据此把安全 no-op 当成生产缺陷。duplicate Case 的第一次 Review 可 no-op 或替换目标；第二次仍必须证明同一 claim 被拒绝，且模型、工具和状态变化均为零。默认 Suite 同时保留 `skill-review-verified-update` 的严格 `replace` Case：它以真实前台的首选方法失败、可复用 fallback 成功链为证据，因此该 Case 的 no-op 是 Subject 能力失败，而不是自动放宽 expectation 的理由。
+
+Fixture 的 `workspace/...` target 是 Sandbox 物料化合同；MyHermes file tool 的工作目录已经是该 workspace，因此默认 Skill foreground 消息使用相对于它的 `fixtures/...` 路径。二者映射同一文件，不放宽 Loader 或 `FixtureTargetPath`。
+
 ## 证据边界
 
 P5 区分两份安全投影：
@@ -70,6 +80,6 @@ stale 不能根据“没有变化”猜测。它必须由 Subject 公共 claim v
 
 Worker v4 为 P5 输出 `background-review-results.json`、`background-review-evidence.json` 与 `background-review-snapshots.json`，并通过既有同目录原子写入发布。它们只含结构化、安全事实。
 
-Langfuse 只回放持久化的 `TrialResult`，不重新运行 Review、模型或工具。即使未启用 `--langfuse-no-content`，P5 evidence、Review Prompt、Memory、Skill 和工具正文都不会上传；`sensitive` 同样强制无正文投影。
+Langfuse 只回放持久化的 `TrialResult`，不重新运行 Review、模型或工具。即使未启用 `--langfuse-no-content`，P5 evidence、Review Prompt、Memory、Skill 和工具正文都不会上传；`sensitive` 同样强制无正文投影。Background Review evaluator 的安全 decision 投影只增加动作枚举与布尔事实：`expected_action`、`allowed_actions`、`actual_action` 和 `action_matched`。
 
 [`../examples/background_review_v1.yaml`](../examples/background_review_v1.yaml) 是默认 synthetic P5 Suite：Memory no-op、Skill verified update、冲突证据 no-op、duplicate idempotency、user-managed 保护和 pinned 无半写入。它不包含 stale；stale 位于独立 capability-negative Suite。示例仅声明合约，开发构建阶段不执行 Trial、模型、Judge 或远端发布。

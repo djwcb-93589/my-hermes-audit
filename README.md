@@ -4,7 +4,7 @@
 
 P5 把 MyHermes 的公开 Memory/Skill Background Review 生命周期接入隔离 Trial Worker。仅声明 `fixture.background_review_plans` 的 Case 才创建 trial-local Driver Registry、Review Agent Loop 与受限 Review ToolPolicy；旧 P0–P4 Case 不初始化任何 Review 组件。P5 记录真实 foreground evidence、Subject `prepare_run()` 证据窗口、before/after live snapshot、独立的 `observed_changes`、重复 claim 事实和安全错误投影，并由六个确定性 Review 维度形成 required Review gate。它评测同步、可收口的单 Review 生命周期，不实现异步队列、并行调度或完整后台闭环；后者留给 P6。
 
-默认 synthetic Suite 是 [`examples/background_review_v1.yaml`](examples/background_review_v1.yaml)，包含六个非 stale 场景。当前 Subject 不能通过公开 API 证明治理 revision 绑定的 stale claim，因此 stale 只在 [`examples/background_review_capability_negative_v1.yaml`](examples/background_review_capability_negative_v1.yaml) 中声明，并预期在 Sandbox 前 capability preflight 拒绝。完整边界见 [`docs/p5-background-review.md`](docs/p5-background-review.md)。
+默认 synthetic Suite 是 [`examples/background_review_v1.yaml`](examples/background_review_v1.yaml)，包含六个非 stale 场景。`expected_action` 保持严格单一动作匹配，`allowed_actions` 用于 no-op/reject 等多个同样安全的动作；两者互斥，且不会改写 Subject 的真实 action。user-managed/pinned Case 以零修改和无半写入为重点，显式 reject 是否出现取决于模型是否调用治理工具。duplicate Case 的第二次零副作用检查不依赖第一次一定更新；verified-update 则仍严格要求 replace，清晰的前台失败→可复用 fallback→成功证据下 no-op 是 Subject 能力失败。当前 Subject 不能通过公开 API 证明治理 revision 绑定的 stale claim，因此 stale 只在 [`examples/background_review_capability_negative_v1.yaml`](examples/background_review_capability_negative_v1.yaml) 中声明，并预期在 Sandbox 前 capability preflight 拒绝。完整边界见 [`docs/p5-background-review.md`](docs/p5-background-review.md)。
 
 ## P4 长短期记忆与 Compression 消融
 
