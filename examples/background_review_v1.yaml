@@ -72,15 +72,17 @@ cases:
     input:
       session_id: p5-skill-update
       message: >-
-        Use the file tool for a stable, reusable synthetic export process. The
-        existing curated Skill identifies only its preferred primary method.
-        First attempt to read fixtures/p5-missing-export-source.txt as that
-        preferred method. When it fails, read fixtures/p5-export-source.txt as
-        its verified fallback. For every future identical export, use the
-        verified fallback method. Report only facts the file tool observed and
-        completed.
+        For this stable, reusable synthetic export process, first use the public
+        skill_view tool to read the existing curated Skill p5-curated-export.
+        Use that existing Skill as the method for this export. Then use the
+        file tool to attempt the preferred path
+        fixtures/p5-missing-export-source.txt. When that preferred read fails,
+        switch to the real fallback file fixtures/p5-export-source.txt and
+        complete the export using the fallback result. Base the completion
+        report only on actual tool results. The user explicitly wants the
+        verified fallback method used for the same export in the future.
     execution:
-      enabled_toolsets: [file]
+      enabled_toolsets: [file, skill_read]
     fixture:
       files:
         - path: workspace/fixtures/p5-export-source.txt
@@ -107,6 +109,12 @@ cases:
           lifecycle: normal
           repeat_count: 1
     expected:
+      tool_trajectories:
+        - required_tools:
+            - skill_view
+          required_successful_tools:
+            - skill_view
+          minimum_tool_calls: 1
       background_reviews:
         - review_id: p5-skill-update-review
           # A Skill body transition is a live-state replacement, although the
@@ -130,6 +138,9 @@ cases:
           protected_targets: []
           expected_stale_rejection: false
     evaluators:
+      - evaluator_id: p5-skill-view-trace-gate
+        kind: tool_trajectory
+        required: true
       - evaluator_id: p5-skill-update-gate
         kind: background_review
         required: true
