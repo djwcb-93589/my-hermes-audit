@@ -52,6 +52,7 @@ from myhermes_audit.serialization import canonical_sha256
 _POLICY_REJECTION_ERROR_TYPES = frozenset(
     {"permission_denied", "tool_not_authorized", "safety_blocked"}
 )
+_NO_EXACT_SOURCE_EDGE = "no-exact-source-edge"
 _STAGE_ERROR_TYPES = {
     "claim_validation": "background_review_claim_error",
     "claim_revalidation": "background_review_claim_error",
@@ -933,6 +934,11 @@ class MyHermesBackgroundReviewAdapter(BackgroundReviewEvaluationPort):
                 )
                 if source_id is not None:
                     used_source_ids.add(source_id)
+                source_identity = (
+                    source_id
+                    if source_id is not None
+                    else f"{_NO_EXACT_SOURCE_EDGE}:{len(result) + 1}"
+                )
                 prepared_count_by_kind[kind] = (
                     prepared_count_by_kind.get(kind, 0) + 1
                 )
@@ -942,7 +948,7 @@ class MyHermesBackgroundReviewAdapter(BackgroundReviewEvaluationPort):
                             "prepared-evidence",
                             plan.review_id,
                             str(index),
-                            source_id,
+                            source_identity,
                             kind.value,
                         ),
                         kind=kind,

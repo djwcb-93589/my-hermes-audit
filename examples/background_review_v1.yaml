@@ -80,7 +80,7 @@ cases:
       enabled_toolsets: [file]
     fixture:
       files:
-        - path: fixtures/p5-export-source.txt
+        - path: workspace/fixtures/p5-export-source.txt
           content: >-
             Synthetic fallback export completed successfully and its checksum
             matched the expected value.
@@ -195,7 +195,7 @@ cases:
       enabled_toolsets: [file]
     fixture:
       files:
-        - path: fixtures/p5-duplicate-evidence.txt
+        - path: workspace/fixtures/p5-duplicate-evidence.txt
           content: Verified synthetic export method is the fallback exporter.
       skills:
         - skill_id: p5-duplicate-export
@@ -253,7 +253,7 @@ cases:
       enabled_toolsets: [file]
     fixture:
       files:
-        - path: fixtures/p5-user-managed-evidence.txt
+        - path: workspace/fixtures/p5-user-managed-evidence.txt
           content: Synthetic incident evidence proposes an unverified replacement.
       skills:
         - skill_id: p5-user-managed-protected
@@ -310,7 +310,7 @@ cases:
       enabled_toolsets: [file]
     fixture:
       files:
-        - path: fixtures/p5-pinned-evidence.txt
+        - path: workspace/fixtures/p5-pinned-evidence.txt
           content: Synthetic deployment recommendation has not been verified.
       skills:
         - skill_id: p5-pinned-protected
