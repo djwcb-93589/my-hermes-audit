@@ -141,6 +141,14 @@ def _bind_memory_register(signature: inspect.Signature) -> None:
     signature.bind(_BIND_PLACEHOLDER)
 
 
+def _bind_skill_handler(signature: inspect.Signature) -> None:
+    signature.bind(_BIND_PLACEHOLDER)
+
+
+def _bind_skill_register(signature: inspect.Signature) -> None:
+    signature.bind(_BIND_PLACEHOLDER)
+
+
 def _bind_prompt_memory_toggle(signature: inspect.Signature) -> None:
     signature.bind(
         _BIND_PLACEHOLDER,
@@ -844,6 +852,19 @@ def _memory_declaration_surface(value: object) -> bool:
     )
 
 
+def _skill_read_declaration_surface(value: object) -> bool:
+    if not isinstance(value, tuple):
+        return False
+    read_declarations = tuple(
+        item for item in value if getattr(item, "toolset", None) == "skill_read"
+    )
+    return _tool_declaration_surface(
+        read_declarations,
+        expected_toolsets=frozenset({"skill_read"}),
+        expected_names=frozenset({"skill_view", "skills_list"}),
+    )
+
+
 def _validate_subject_origin(request: SubjectCapabilityProbeRequest) -> bool:
     root = Path(request.subject_repo).expanduser().resolve(strict=True)
     hermes = importlib.import_module("hermes")
@@ -1116,6 +1137,34 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         "hermes.tool_declarations.terminal",
         "TOOL_DECLARATIONS",
         _terminal_declaration_surface,
+    )
+    skill_read_declaration = builder.check(
+        "skill_read_toolset",
+        "hermes.tool_declarations.skill",
+        "TOOL_DECLARATIONS",
+        _skill_read_declaration_surface,
+        required=False,
+    )
+    skill_view_tool = builder.check(
+        "skill_view_tool",
+        "hermes.tools.skill",
+        "handle_skill_view",
+        signature_validator=_bind_skill_handler,
+        required=False,
+    )
+    skills_list_tool = builder.check(
+        "skills_list_tool",
+        "hermes.tools.skill",
+        "handle_skill_list",
+        signature_validator=_bind_skill_handler,
+        required=False,
+    )
+    skill_read_registration = builder.check(
+        "skill_read_tool_registration",
+        "hermes.tools.skill",
+        "register",
+        signature_validator=_bind_skill_register,
+        required=False,
     )
 
     # P5 is deliberately optional at probe level so a Subject without Review

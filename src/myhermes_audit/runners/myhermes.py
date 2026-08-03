@@ -76,6 +76,7 @@ from myhermes_audit.errors import (
     MemoryProtocolError,
     MemoryScopeUnsupportedError,
     MemoryStrategyUnsupportedError,
+    SubjectCapabilityError,
     SubjectPreflightError,
     UnsupportedCaseError,
     WorkerProcessError,
@@ -306,6 +307,8 @@ class MyHermesTrialRunner:
                 "P1 requires execution.workdir=workspace",
                 case_id=case.case_id,
             )
+        if ToolsetName.SKILL_READ in case.execution.enabled_toolsets:
+            self._preflight_skill_read_case(case)
         if case.mode is CaseMode.SCRIPTED_MULTI_TURN and any(
             turn.role is not ConversationRole.USER for turn in case.input.turns
         ):
@@ -373,6 +376,40 @@ class MyHermesTrialRunner:
                 case_id=case.case_id,
             )
         preflight_evaluators(case)
+
+    def _preflight_skill_read_case(self, case: AuditCase) -> None:
+        report = self._capability_report
+        required = _SKILL_READ_CAPABILITIES
+        missing = (
+            list(required)
+            if report is None
+            else [
+                name
+                for name in required
+                if not _capability_available(report, name)
+            ]
+        )
+        if not missing:
+            return
+        supported_toolsets = (
+            []
+            if report is None
+            else _supported_foreground_toolsets(report)
+        )
+        missing_capability = missing[0]
+        supported_display = ",".join(supported_toolsets) or "<none>"
+        raise SubjectCapabilityError(
+            (
+                f"case={case.case_id}: requested toolset=skill_read is "
+                f"unsupported; missing capability={missing_capability}; "
+                f"supported toolsets={supported_display}"
+            ),
+            case_id=case.case_id,
+            requested_toolset=ToolsetName.SKILL_READ.value,
+            missing_capability=missing_capability,
+            missing_capabilities=missing,
+            supported_toolsets=supported_toolsets,
+        )
 
     def _preflight_background_review_case(self, case: AuditCase) -> None:
         report = self._capability_report
@@ -1926,9 +1963,34 @@ def _is_background_review_case(case: AuditCase) -> bool:
     return bool(case.fixture.background_review_plans)
 
 
+_SKILL_READ_CAPABILITIES = (
+    "skill_read_toolset",
+    "skill_view_tool",
+    "skills_list_tool",
+    "skill_read_tool_registration",
+)
+
+_FOREGROUND_TOOLSET_CAPABILITIES = (
+    (ToolsetName.FILE.value, ("file_tool_declaration",)),
+    (ToolsetName.TERMINAL.value, ("terminal_tool_declaration",)),
+    (ToolsetName.MEMORY.value, ("memory_tool",)),
+    (ToolsetName.SKILL_READ.value, _SKILL_READ_CAPABILITIES),
+)
+
+
 def _capability_available(report: SubjectCapabilityReport, name: str) -> bool:
     capability = report.capability(name)
     return capability is not None and capability.available
+
+
+def _supported_foreground_toolsets(
+    report: SubjectCapabilityReport,
+) -> list[str]:
+    return [
+        toolset
+        for toolset, capabilities in _FOREGROUND_TOOLSET_CAPABILITIES
+        if all(_capability_available(report, name) for name in capabilities)
+    ]
 
 
 def _compression_capability_summary(

@@ -135,6 +135,7 @@ class ToolsetName(str, Enum):
     FILE = "file"
     TERMINAL = "terminal"
     MEMORY = "memory"
+    SKILL_READ = "skill_read"
 
 
 class ExecutionSpec(ContractModel):
