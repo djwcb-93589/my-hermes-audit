@@ -19,6 +19,7 @@ from myhermes_audit.contracts.common import (
     JsonObject,
     NonEmptyText,
     NonNegativeInt,
+    Number,
     PositiveInt,
     SafeRelativePath,
     Sha256Digest,
@@ -28,6 +29,7 @@ from myhermes_audit.contracts.common import (
 
 ScenarioTimeout = Annotated[PositiveInt, Field(le=3600)]
 ScenarioStepTimeout = Annotated[PositiveInt, Field(le=600)]
+NonNegativeSeconds = Annotated[Number, Field(ge=0)]
 
 
 class E2EScenarioKind(str, Enum):
@@ -49,6 +51,36 @@ class ProcessTimingStatus(str, Enum):
     AVAILABLE_DURATION_ONLY = "available_duration_only"
     UNAVAILABLE = "unavailable"
     INVALID = "invalid"
+
+
+class ProcessObservationSpanStatus(str, Enum):
+    """Availability of the persistence-timestamp observation interval."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    INVALID = "invalid"
+
+
+class ProcessTimingSource(str, Enum):
+    """Public source used for a timing fact; sources are never inferred."""
+
+    WORKER_MONOTONIC = "worker_monotonic"
+    PUBLIC_OBSERVATION_PERSISTENCE = "public_observation_persistence"
+    PUBLIC_DURATION_ONLY = "public_duration_only"
+    UNAVAILABLE = "unavailable"
+
+
+class ProcessHardTimeoutSource(str, Enum):
+    """Watchdog that supplied the conservative scenario deadline."""
+
+    WORKER_CASE_WATCHDOG = "worker_case_watchdog"
+    UNAVAILABLE = "unavailable"
+
+
+class WaitRemainingBudgetStatus(str, Enum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    NOT_APPLICABLE = "not_applicable"
 
 
 class ScenarioProcessStatus(str, Enum):
@@ -566,7 +598,18 @@ class ScenarioStepResult(ContractModel):
     duration_ms: NonNegativeInt | None = None
     timeout_seconds: PositiveInt
     timing_status: ProcessTimingStatus = ProcessTimingStatus.UNAVAILABLE
+    timing_source: ProcessTimingSource = ProcessTimingSource.UNAVAILABLE
     timed_out: StrictBool | None = None
+    event_started_offset_ms: NonNegativeInt | None = None
+    event_completed_offset_ms: NonNegativeInt | None = None
+    event_timing_source: ProcessTimingSource = ProcessTimingSource.UNAVAILABLE
+    # WAIT-only budget facts.  ``None`` is intentional when the Worker has no
+    # reliable per-call monotonic boundary; duration sums are not substituted.
+    elapsed_before_wait_ms: NonNegativeInt | None = None
+    scenario_remaining_before_wait_seconds: NonNegativeSeconds | None = None
+    wait_remaining_budget_status: WaitRemainingBudgetStatus | None = None
+    wait_timeout_budget_matched: StrictBool | None = None
+    wait_budget_timing_source: ProcessTimingSource | None = None
     observation_refs: list[Identifier] = Field(default_factory=list)
     expected_process_id_safe: Identifier | None = None
     actual_process_id_safe: Identifier | None = None
@@ -589,16 +632,35 @@ class ScenarioStepResult(ContractModel):
                 or self.duration_ms is None
             ):
                 raise ValueError("available step timing requires timestamps and duration")
+            if self.timing_source is ProcessTimingSource.UNAVAILABLE:
+                raise ValueError("available step timing requires a timing source")
         elif self.timing_status is ProcessTimingStatus.AVAILABLE_DURATION_ONLY:
             if self.duration_ms is None:
                 raise ValueError("duration-only timing requires duration")
             if self.started_at is not None or self.completed_at is not None:
                 raise ValueError("duration-only timing cannot claim timestamps")
+            if self.timing_source is ProcessTimingSource.UNAVAILABLE:
+                raise ValueError("duration-only timing requires a timing source")
         else:
             if self.duration_ms is not None:
                 raise ValueError("unavailable or invalid timing cannot claim duration")
             if self.timed_out is not None:
                 raise ValueError("unavailable or invalid timing cannot claim timeout")
+            if self.timing_source is not ProcessTimingSource.UNAVAILABLE:
+                raise ValueError("unavailable timing cannot claim a timing source")
+        event_offsets = (
+            self.event_started_offset_ms,
+            self.event_completed_offset_ms,
+        )
+        if any(value is not None for value in event_offsets):
+            if (
+                any(value is None for value in event_offsets)
+                or self.event_timing_source is not ProcessTimingSource.WORKER_MONOTONIC
+                or self.event_completed_offset_ms < self.event_started_offset_ms
+            ):
+                raise ValueError("event offsets require ordered Worker monotonic facts")
+        elif self.event_timing_source is not ProcessTimingSource.UNAVAILABLE:
+            raise ValueError("missing event offsets cannot claim a timing source")
         if self.timing_status in {
             ProcessTimingStatus.AVAILABLE,
             ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
@@ -606,6 +668,34 @@ class ScenarioStepResult(ContractModel):
             expected_timeout = self.duration_ms > self.timeout_seconds * 1000
             if self.timed_out != expected_timeout:
                 raise ValueError("step timed_out must match duration and timeout")
+        wait_fields = (
+            self.elapsed_before_wait_ms,
+            self.scenario_remaining_before_wait_seconds,
+            self.wait_remaining_budget_status,
+            self.wait_timeout_budget_matched,
+            self.wait_budget_timing_source,
+        )
+        if self.action is not ProcessAction.WAIT:
+            if any(value is not None for value in wait_fields):
+                raise ValueError("wait budget facts are only valid for WAIT steps")
+        elif self.wait_remaining_budget_status is None:
+            raise ValueError("WAIT steps require an explicit remaining-budget status")
+        elif self.wait_remaining_budget_status is WaitRemainingBudgetStatus.AVAILABLE:
+            if (
+                self.elapsed_before_wait_ms is None
+                or self.scenario_remaining_before_wait_seconds is None
+                or self.wait_timeout_budget_matched is None
+                or self.wait_budget_timing_source is not ProcessTimingSource.WORKER_MONOTONIC
+            ):
+                raise ValueError("available WAIT budget requires Worker monotonic facts")
+        else:
+            if (
+                self.elapsed_before_wait_ms is not None
+                or self.scenario_remaining_before_wait_seconds is not None
+                or self.wait_timeout_budget_matched is not None
+                or self.wait_budget_timing_source is not ProcessTimingSource.UNAVAILABLE
+            ):
+                raise ValueError("unavailable WAIT budget cannot claim timing facts")
         return self
 
 
@@ -705,8 +795,33 @@ class ProcessScenarioExecutionResult(ContractModel):
     file_fixture_read_observed: StrictBool = False
     status_transitions_valid: StrictBool | None = None
     scenario_timeout_seconds: PositiveInt
-    timing_status: ProcessTimingStatus = ProcessTimingStatus.UNAVAILABLE
-    scenario_timed_out: StrictBool | None = None
+    # Scenario timing is deliberately split.  Persistence timestamps describe
+    # an observation interval; they are not per-handler start/end boundaries.
+    scenario_observation_span_status: ProcessObservationSpanStatus = (
+        ProcessObservationSpanStatus.UNAVAILABLE
+    )
+    scenario_timing_source: ProcessTimingSource = ProcessTimingSource.UNAVAILABLE
+    scenario_observation_started_at: UtcDatetime | None = None
+    scenario_observation_completed_at: UtcDatetime | None = None
+    scenario_observation_span_ms: NonNegativeInt | None = None
+    scenario_monotonic_timing_status: ProcessObservationSpanStatus = (
+        ProcessObservationSpanStatus.UNAVAILABLE
+    )
+    scenario_monotonic_duration_ms: NonNegativeInt | None = None
+    hard_timeout_source: ProcessHardTimeoutSource = ProcessHardTimeoutSource.UNAVAILABLE
+    hard_timeout_seconds: PositiveInt | None = None
+    hard_timeout_triggered: StrictBool = False
+    trial_watchdog_timed_out: StrictBool = False
+    scenario_watchdog_timed_out: StrictBool = False
+    scenario_observation_span_exceeded: StrictBool | None = None
+    wait_remaining_budget_status: WaitRemainingBudgetStatus = (
+        WaitRemainingBudgetStatus.NOT_APPLICABLE
+    )
+    elapsed_before_wait_ms: NonNegativeInt | None = None
+    scenario_remaining_before_wait_seconds: NonNegativeSeconds | None = None
+    wait_timeout_budget_matched: StrictBool | None = None
+    wait_budget_timing_source: ProcessTimingSource | None = None
+    wait_budget_hard_watchdog_fallback: StrictBool = False
     agent_close_required: StrictBool = False
     agent_close_observed: StrictBool = False
     worker_cleanup_result: ProcessCleanupResult | None = None
@@ -715,14 +830,9 @@ class ProcessScenarioExecutionResult(ContractModel):
     event_order_violations: list[ProcessEventDiagnostic] = Field(default_factory=list)
     foreign_process_events: list[ProcessEventDiagnostic] = Field(default_factory=list)
     unconsumed_events: list[ProcessEventDiagnostic] = Field(default_factory=list)
-    scenario_started_at: UtcDatetime | None = None
-    scenario_completed_at: UtcDatetime | None = None
-    scenario_wall_clock_duration_ms: NonNegativeInt | None = None
     tool_duration_sum_ms: NonNegativeInt | None = None
-    # A Process duration is only present when the public Observation window
-    # supplied timing facts classified by ``timing_status``. ``None`` is
-    # deliberately distinct from a measured zero so validators cannot turn
-    # missing timing into a successful timeout gate.
+    # Deprecated compatibility alias.  New consumers must use
+    # ``scenario_observation_span_ms`` and its explicit source/status fields.
     duration_ms: NonNegativeInt | None = None
     errors: list[ScenarioError] = Field(default_factory=list)
 
@@ -730,65 +840,85 @@ class ProcessScenarioExecutionResult(ContractModel):
     def validate_status_transition(self) -> "ProcessScenarioExecutionResult":
         if self.initial_status in _TERMINAL_PROCESS_STATUSES and self.final_status in _ACTIVE_PROCESS_STATUSES:
             raise ValueError("terminal Process cannot transition back to active")
-        if (self.scenario_started_at is None) != (self.scenario_completed_at is None):
-            raise ValueError(
-                "scenario wall-clock timestamps must be provided together"
-            )
-        if (
-            self.scenario_started_at is not None
-            and self.scenario_completed_at is not None
-            and self.scenario_completed_at < self.scenario_started_at
+        if (self.scenario_observation_started_at is None) != (
+            self.scenario_observation_completed_at is None
         ):
-            raise ValueError("scenario completed_at cannot precede started_at")
-        if self.scenario_wall_clock_duration_ms is not None:
-            if self.scenario_started_at is None or self.scenario_completed_at is None:
-                raise ValueError(
-                    "scenario wall-clock duration requires start and end timestamps"
-                )
+            raise ValueError("scenario observation timestamps must be paired")
+        if (
+            self.scenario_observation_started_at is not None
+            and self.scenario_observation_completed_at is not None
+            and self.scenario_observation_completed_at
+            < self.scenario_observation_started_at
+        ):
+            raise ValueError("scenario observation completed_at cannot precede started_at")
+        if self.scenario_observation_span_status is ProcessObservationSpanStatus.AVAILABLE:
+            if (
+                self.scenario_observation_started_at is None
+                or self.scenario_observation_completed_at is None
+                or self.scenario_observation_span_ms is None
+                or self.scenario_timing_source
+                is not ProcessTimingSource.PUBLIC_OBSERVATION_PERSISTENCE
+            ):
+                raise ValueError("available observation span requires persistence facts")
             computed_ms = round(
                 (
-                    self.scenario_completed_at - self.scenario_started_at
+                    self.scenario_observation_completed_at
+                    - self.scenario_observation_started_at
                 ).total_seconds()
                 * 1000
             )
-            if computed_ms != self.scenario_wall_clock_duration_ms:
-                raise ValueError(
-                    "scenario wall-clock duration must match its timestamps"
-                )
-            if self.duration_ms != self.scenario_wall_clock_duration_ms:
-                raise ValueError(
-                    "Process duration must match scenario wall-clock duration"
-                )
-        elif self.scenario_started_at is not None:
-            raise ValueError(
-                "scenario wall-clock timestamps require a wall-clock duration"
-            )
-        elif self.duration_ms is not None:
-            raise ValueError(
-                "Process duration requires a scenario wall-clock duration"
-            )
-        if self.timing_status is ProcessTimingStatus.AVAILABLE and (
-            self.scenario_wall_clock_duration_ms is None
-        ):
-            raise ValueError(
-                "available Process timing requires scenario wall-clock facts"
-            )
-        if self.timing_status is ProcessTimingStatus.AVAILABLE_DURATION_ONLY:
-            raise ValueError(
-                "Process scenario timing requires a wall-clock timestamp span"
-            )
-        elif self.timing_status is ProcessTimingStatus.AVAILABLE:
-            if self.duration_ms is None:
-                raise ValueError("available scenario timing requires duration")
+            if computed_ms != self.scenario_observation_span_ms:
+                raise ValueError("observation span must match persistence timestamps")
         else:
-            if self.duration_ms is not None:
-                raise ValueError("unavailable or invalid scenario timing cannot claim duration")
-            if self.scenario_timed_out is not None:
-                raise ValueError("unavailable or invalid timing cannot claim timeout")
-        if self.timing_status is ProcessTimingStatus.AVAILABLE:
-            expected_timeout = self.duration_ms > self.scenario_timeout_seconds * 1000
-            if self.scenario_timed_out != expected_timeout:
-                raise ValueError("scenario_timed_out must reflect the scenario deadline")
+            if any(
+                value is not None
+                for value in (
+                    self.scenario_observation_started_at,
+                    self.scenario_observation_completed_at,
+                    self.scenario_observation_span_ms,
+                )
+            ):
+                raise ValueError("unavailable observation span cannot claim timestamps")
+            if self.scenario_timing_source is not ProcessTimingSource.UNAVAILABLE:
+                raise ValueError("unavailable observation span cannot claim a source")
+        if self.duration_ms is not None and self.duration_ms != self.scenario_observation_span_ms:
+            raise ValueError("legacy Process duration must match observation span")
+        monotonic_values = (self.scenario_monotonic_duration_ms,)
+        if self.scenario_monotonic_timing_status is ProcessObservationSpanStatus.AVAILABLE:
+            if self.scenario_monotonic_duration_ms is None:
+                raise ValueError("available monotonic timing requires a duration")
+        elif any(value is not None for value in monotonic_values):
+            raise ValueError("unavailable monotonic timing cannot claim a duration")
+        if self.hard_timeout_source is ProcessHardTimeoutSource.UNAVAILABLE:
+            if self.hard_timeout_seconds is not None:
+                raise ValueError("unavailable hard timeout cannot claim a budget")
+        elif self.hard_timeout_seconds is None:
+            raise ValueError("hard timeout source requires a budget")
+        if self.scenario_observation_span_exceeded is not None:
+            if (
+                self.scenario_observation_span_ms is None
+                or self.hard_timeout_seconds is None
+                or self.scenario_observation_span_exceeded
+                != self.scenario_observation_span_ms > self.hard_timeout_seconds * 1000
+            ):
+                raise ValueError("observation span exceeded must match the hard budget")
+        wait_fields = (
+            self.elapsed_before_wait_ms,
+            self.scenario_remaining_before_wait_seconds,
+            self.wait_timeout_budget_matched,
+            self.wait_budget_timing_source,
+        )
+        if self.wait_remaining_budget_status is WaitRemainingBudgetStatus.AVAILABLE:
+            if (
+                self.elapsed_before_wait_ms is None
+                or self.scenario_remaining_before_wait_seconds is None
+                or self.wait_timeout_budget_matched is None
+                or self.wait_budget_timing_source
+                is not ProcessTimingSource.WORKER_MONOTONIC
+            ):
+                raise ValueError("available aggregate WAIT budget requires monotonic facts")
+        elif any(value is not None for value in wait_fields):
+            raise ValueError("unavailable WAIT budget cannot claim timing facts")
         return self
 
 
@@ -818,11 +948,14 @@ __all__ = (
     "ProcessReadIncrementalStep",
     "ProcessScenarioExecutionResult",
     "ProcessScenarioPlan",
+    "ProcessHardTimeoutSource",
+    "ProcessObservationSpanStatus",
     "ProcessSendInputStep",
     "ProcessStartStep",
     "ProcessStatusCheckpoint",
     "ProcessStep",
     "ProcessStepBase",
+    "ProcessTimingSource",
     "ProcessTimingStatus",
     "ProcessWaitStep",
     "ScenarioArtifactObservation",
@@ -842,4 +975,5 @@ __all__ = (
     "StepStatusCheckpoint",
     "ToolchainScenarioExecutionResult",
     "ToolchainScenarioPlan",
+    "WaitRemainingBudgetStatus",
 )

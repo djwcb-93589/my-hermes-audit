@@ -207,9 +207,10 @@ class ValidatorResultsArtifact(ContractModel):
                     "fixture_read",
                     "step_timing",
                     "step_timeout",
-                    "scenario_timing",
-                    "scenario_wall_clock_timing",
-                    "scenario_timeout",
+                    "step_duration_gate",
+                    "scenario_hard_timeout_gate",
+                    "scenario_observation_span_gate",
+                    "wait_remaining_budget_gate",
                     "agent_close",
                     "worker_cleanup",
                 }

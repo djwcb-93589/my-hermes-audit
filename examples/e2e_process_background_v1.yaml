@@ -22,8 +22,10 @@ cases:
         command: python -u -c "import sys; print('P6-BEGIN', flush=True); print('P6-中文', flush=True); signal=sys.stdin.readline().strip(); print('P6-END' if signal == 'continue' else 'P6-INPUT-ERROR', flush=True)".
         After terminal start, use the returned process identity with the public
         process tool in exactly this order: one process action=log with cursor=0,
-        exactly one process action=submit using the declared fixture content
-        (never use write), a
+        exactly one process action=submit with data="continue". The submit data
+        must be exactly the string "continue": do not send an empty string, do
+        not add spaces or other characters, and do not use write; submit itself
+        sends Enter. Then make a
         second process action=log using the cursor returned by the first log,
         process action=wait, and process action=poll for completed (the declared
         assert_status step).

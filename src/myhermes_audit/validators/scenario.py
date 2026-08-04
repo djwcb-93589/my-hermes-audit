@@ -9,6 +9,8 @@ from myhermes_audit.contracts import (
     MetricResult,
     MetricSource,
     MetricStatus,
+    ProcessObservationSpanStatus,
+    ProcessTimingSource,
     ProcessScenarioPlan,
     ProcessTimingStatus,
     ScenarioExecutionResult,
@@ -16,6 +18,7 @@ from myhermes_audit.contracts import (
     ScenarioStatus,
     ToolchainScenarioPlan,
     ProcessReadIncrementalStep,
+    WaitRemainingBudgetStatus,
 )
 from myhermes_audit.validators.base import ValidationContext
 
@@ -469,15 +472,56 @@ def _evaluate_process(
         or getattr(observed, "unconsumed_events", ())
     )
     event_order_gate_passed = not getattr(observed, "event_order_violations", ())
-    scenario_timing_passed = (
-        observed.timing_status is ProcessTimingStatus.AVAILABLE
-        and observed.scenario_started_at is not None
-        and observed.scenario_completed_at is not None
-        and observed.scenario_wall_clock_duration_ms is not None
-        and observed.duration_ms == observed.scenario_wall_clock_duration_ms
+    scenario_observation_span_passed = (
+        observed.scenario_observation_span_status
+        is ProcessObservationSpanStatus.AVAILABLE
+        and observed.scenario_timing_source
+        is ProcessTimingSource.PUBLIC_OBSERVATION_PERSISTENCE
+        and observed.scenario_observation_started_at is not None
+        and observed.scenario_observation_completed_at is not None
+        and observed.scenario_observation_span_ms is not None
+        and observed.scenario_observation_span_exceeded is False
     )
-    scenario_wall_clock_timing_passed = scenario_timing_passed
-    scenario_timeout_passed = scenario_timing_passed and observed.scenario_timed_out is False
+    scenario_hard_timeout_passed = (
+        observed.hard_timeout_source.value == "worker_case_watchdog"
+        and observed.hard_timeout_seconds is not None
+        and observed.hard_timeout_triggered is False
+        and observed.scenario_watchdog_timed_out is False
+    )
+    wait_results = [
+        item
+        for step_id, item in observed_steps.items()
+        if any(step.step_id == step_id and step.action.value == "wait" for step in plan.steps)
+    ]
+    if not wait_results:
+        wait_remaining_budget_passed = True
+        wait_remaining_budget_reason = "no WAIT step was declared"
+    else:
+        exact_wait_budget = all(
+            item.wait_remaining_budget_status is WaitRemainingBudgetStatus.AVAILABLE
+            and item.wait_timeout_budget_matched is True
+            for item in wait_results
+        )
+        fallback_wait_budget = (
+            all(
+                item.wait_remaining_budget_status is WaitRemainingBudgetStatus.UNAVAILABLE
+                and item.wait_timeout_budget_matched is None
+                for item in wait_results
+            )
+            and observed.wait_budget_hard_watchdog_fallback
+            and scenario_hard_timeout_passed
+        )
+        wait_remaining_budget_passed = exact_wait_budget or fallback_wait_budget
+        wait_remaining_budget_reason = (
+            "Worker monotonic remaining budget matched"
+            if exact_wait_budget
+            else (
+                "remaining budget was unavailable; conservative Worker case watchdog "
+                "fallback was enabled and did not fire"
+                if fallback_wait_budget
+                else "remaining budget was unavailable and no explicit watchdog fallback passed"
+            )
+        )
     trace_passed = all(
         any(
             item.tool_name == requirement.tool_name
@@ -515,11 +559,12 @@ def _evaluate_process(
         ("process_status_transitions", "status_transitions", status_transition_passed, "Process status did not return to active after terminal"),
         ("process_trace", "process_trace", trace_passed, "required public Tool trace calls were observed"),
         ("process_fixture_read", "fixture_read", fixture_read_passed, "input fixture was read by the public file tool before submit"),
-        ("process_step_timing", "step_timing", not required_step_timing_missing and not required_step_timing_invalid, "required Process steps supplied reliable timing facts"),
+        ("process_step_duration", "step_duration_gate", not required_step_timing_missing and not required_step_timing_invalid, "required Process steps supplied public handler duration facts"),
+        ("process_step_timing", "step_timing", not required_step_timing_missing and not required_step_timing_invalid, "required Process steps supplied public handler duration facts"),
         ("process_step_timeout", "step_timeout", step_timeout_passed, "required steps supplied real duration facts within timeout"),
-        ("process_scenario_timing", "scenario_timing", scenario_timing_passed, "Process scenario timing was available from public observations"),
-        ("process_scenario_wall_clock_timing", "scenario_wall_clock_timing", scenario_wall_clock_timing_passed, "Process scenario wall-clock timing was available from public observations"),
-        ("process_scenario_timeout", "scenario_timeout", scenario_timeout_passed, "scenario stayed within its hard deadline"),
+        ("process_scenario_observation_span", "scenario_observation_span_gate", scenario_observation_span_passed, "public persistence timestamps supplied an observation span within the hard budget"),
+        ("process_scenario_hard_timeout", "scenario_hard_timeout_gate", scenario_hard_timeout_passed, "Worker case watchdog was configured and did not fire"),
+        ("process_wait_remaining_budget", "wait_remaining_budget_gate", wait_remaining_budget_passed, wait_remaining_budget_reason),
         ("process_agent_close", "agent_close", agent_close_passed, "Agent close expectation was observed independently"),
         ("process_worker_cleanup", "worker_cleanup", cleanup_passed, "Worker cleanup report satisfied its lifecycle expectation"),
     ]
@@ -536,6 +581,24 @@ def _evaluate_process(
         passed: bool,
         reason: str,
     ) -> MetricResult:
+        if metric_type == "step_duration_gate" and required_step_timing_missing:
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="required Process handler duration was not present in public Observation facts",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type="process_step_timing_unavailable",
+            )
+        if metric_type == "step_duration_gate" and required_step_timing_invalid:
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="required Process handler duration was invalid",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type="process_step_timing_invalid",
+            )
         if metric_type == "step_timing" and required_step_timing_missing:
             return _error_metric(
                 name=f"{metric_prefix}.{name}",
@@ -578,23 +641,32 @@ def _evaluate_process(
                 metric_type=metric_type,
                 error_type="process_step_timeout",
             )
-        if metric_type == "scenario_timing" and not scenario_timing_passed:
+        if metric_type == "scenario_observation_span_gate" and not passed:
             return _error_metric(
                 name=f"{metric_prefix}.{name}",
                 scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-                reason="Process scenario timing was not reliably available",
+                reason="public persistence observation span was unavailable or exceeded its hard budget",
                 hard_gate=plan.required,
                 metric_type=metric_type,
-                error_type="process_scenario_timing_unavailable",
+                error_type="process_scenario_observation_span_unavailable",
             )
-        if metric_type == "scenario_timeout" and not scenario_timing_passed:
+        if metric_type == "scenario_hard_timeout_gate" and not passed:
             return _error_metric(
                 name=f"{metric_prefix}.{name}",
                 scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-                reason="Process scenario wall-clock timing was not present in public Observation facts",
+                reason="Worker case watchdog was unavailable or fired",
                 hard_gate=plan.required,
                 metric_type=metric_type,
-                error_type="process_scenario_timing_unavailable",
+                error_type="process_scenario_watchdog_timeout",
+            )
+        if metric_type == "wait_remaining_budget_gate" and not passed:
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason=wait_remaining_budget_reason,
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type="process_wait_remaining_budget_unavailable",
             )
         if metric_type == "fixture_read" and not passed:
             return _error_metric(

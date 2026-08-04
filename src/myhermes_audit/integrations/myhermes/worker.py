@@ -88,6 +88,52 @@ class WorkerTerminationRequested(Exception):
     """Raised by cooperative process-group termination signals."""
 
 
+class _ProcessMonotonicTracker:
+    """Capture public PRE/POST Tool hook boundaries for Process observations.
+
+    The tracker records only monotonic nanoseconds keyed by the public Tool
+    call ID.  It never reads private AgentLoop state or persists command/input
+    content; the Scenario projection later keeps only aggregate boundaries.
+    """
+
+    _TOOLS = frozenset({"terminal", "process"})
+
+    def __init__(self) -> None:
+        self._started_ns: dict[str, int] = {}
+        self._completed_ns: dict[str, int] = {}
+
+    @staticmethod
+    def _identity(context) -> tuple[str, str] | None:
+        payload = context.payload
+        if not isinstance(payload, Mapping):
+            return None
+        tool_name = payload.get("tool_name")
+        tool_call_id = payload.get("tool_call_id")
+        if not isinstance(tool_name, str) or tool_name not in _ProcessMonotonicTracker._TOOLS:
+            return None
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            return None
+        return tool_name, tool_call_id
+
+    def on_pre(self, context) -> None:
+        identity = self._identity(context)
+        if identity is not None:
+            self._started_ns[identity[1]] = time.monotonic_ns()
+
+    def on_post(self, context) -> None:
+        identity = self._identity(context)
+        if identity is not None:
+            self._completed_ns[identity[1]] = time.monotonic_ns()
+
+    def boundaries(self) -> Mapping[str, tuple[int, int]]:
+        return {
+            call_id: (started, self._completed_ns[call_id])
+            for call_id, started in self._started_ns.items()
+            if call_id in self._completed_ns
+            and self._completed_ns[call_id] >= started
+        }
+
+
 class _NoopBackgroundReviewCoordinator:
     """Prevent the Subject's foreground entry point from creating a singleton.
 
@@ -274,6 +320,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
     estimate_context_tokens = None
     response_messages: list[Mapping[str, object]] = []
     cleanup_reports: list[dict] = []
+    process_monotonic_tracker = _ProcessMonotonicTracker()
     scenario_results = []
     process_errors: list[ScenarioError] = []
     process_output_paths: list[Path] = []
@@ -302,7 +349,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
             client,
         )
         from hermes.conversation import run_conversation
-        from hermes.hooks import SyncHookRegistry
+        from hermes.hooks import HookEventName, SyncHookRegistry
         from hermes.persistence.core import create_session
         from hermes.persistence.observation import configure_sqlite_observation_sink
         from hermes.persistence.schema import init_db
@@ -371,6 +418,21 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
             )
         hook_registry = SyncHookRegistry()
         configure_sqlite_observation_sink(hook_registry, request.sqlite_path)
+        if any(item.kind.value == "process_background" for item in request.scenarios):
+            # MyHermes exposes public PRE/POST Tool hooks.  Register a
+            # trial-local monotonic observer so WAIT remaining-budget and
+            # Scenario duration do not depend on persisted timestamps or
+            # summed handler durations.
+            hook_registry.register(
+                HookEventName.PRE_TOOL_CALL.value,
+                process_monotonic_tracker.on_pre,
+                hook_id="myhermes-audit:process-monotonic-pre",
+            )
+            hook_registry.register(
+                HookEventName.POST_TOOL_CALL.value,
+                process_monotonic_tracker.on_post,
+                hook_id="myhermes-audit:process-monotonic-post",
+            )
 
         if request.memory_strategy is not None:
             try:
@@ -962,6 +1024,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                 observations=observations,
                 turns=turns,
                 cleanup_reports=cleanup_reports,
+                process_monotonic_boundaries=process_monotonic_tracker.boundaries(),
                 sensitive_values=sensitive_values,
             )
             toolchain_results = [

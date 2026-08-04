@@ -48,7 +48,7 @@ from myhermes_audit.contracts import (
     ProcessAction,
     E2EScenarioKind,
     ProcessScenarioExecutionResult,
-    ProcessTimingStatus,
+    ProcessHardTimeoutSource,
     ScenarioError,
     ScenarioStatus,
     ToolchainScenarioExecutionResult,
@@ -920,10 +920,25 @@ class MyHermesTrialRunner:
             else configuration.memory_strategy
         )
         review_enabled = _is_background_review_case(case)
+        process_timeouts = [
+            item.timeout_seconds
+            for item in case.scenarios
+            if item.kind is E2EScenarioKind.PROCESS_BACKGROUND and item.required
+        ]
+        declared_scenario_timeouts = process_timeouts or [
+            item.timeout_seconds for item in case.scenarios
+        ]
+        # The parent Worker wait is the conservative hard watchdog.  A Case
+        # has at most one required Process Scenario, so its deadline is the
+        # minimum of the Trial budget and that declared scenario budget.
         scenario_timeout = (
-            min(timeout_seconds, max(item.timeout_seconds for item in case.scenarios))
-            if case.scenarios
-            else timeout_seconds
+            min(timeout_seconds, min(declared_scenario_timeouts))
+            if process_timeouts
+            else (
+                min(timeout_seconds, max(declared_scenario_timeouts))
+                if declared_scenario_timeouts
+                else timeout_seconds
+            )
         )
         paths = _worker_artifact_paths(
             sandbox,
@@ -1120,6 +1135,7 @@ class MyHermesTrialRunner:
                         recovered_background_review_errors
                     ),
                     scenarios=case.scenarios,
+                    trial_watchdog_timed_out=request.timeout_seconds >= timeout_seconds,
                 )
                 result, recovered_memory = _redact_memory_facts(
                     result,
@@ -2912,6 +2928,7 @@ def _fallback_scenario_results(
     duration_ms: int,
     error_type: str,
     timed_out: bool,
+    trial_watchdog_timed_out: bool = False,
 ) -> tuple[list[object], list[ScenarioError]]:
     """Preserve declared P6.1 coverage when the Worker envelope is lost."""
 
@@ -2927,8 +2944,11 @@ def _fallback_scenario_results(
                 scenario_id=plan.scenario_id,
                 status=ScenarioStatus.FAILED,
                 scenario_timeout_seconds=plan.timeout_seconds,
-                timing_status=ProcessTimingStatus.UNAVAILABLE,
-                scenario_timed_out=None,
+                hard_timeout_source=ProcessHardTimeoutSource.WORKER_CASE_WATCHDOG,
+                hard_timeout_seconds=plan.timeout_seconds,
+                hard_timeout_triggered=timed_out,
+                trial_watchdog_timed_out=trial_watchdog_timed_out,
+                scenario_watchdog_timed_out=timed_out,
                 duration_ms=None,
                 errors=[error],
             )
@@ -2964,6 +2984,7 @@ def _fallback_worker_result(
         BackgroundReviewExecutionError
     ] = (),
     scenarios: Sequence[object] = (),
+    trial_watchdog_timed_out: bool = False,
 ) -> MyHermesWorkerResult:
     safe_error_type = error_type.replace("_", "-")
     protocol_errors = (
@@ -2997,6 +3018,7 @@ def _fallback_worker_result(
         duration_ms=duration_ms,
         error_type=error_type,
         timed_out=error_type == "timeout",
+        trial_watchdog_timed_out=trial_watchdog_timed_out,
     )
     scenario_kinds = {item.kind.value for item in scenario_results}
     return MyHermesWorkerResult(

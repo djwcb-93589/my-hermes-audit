@@ -173,6 +173,9 @@ from myhermes_audit.contracts.scenario import (
     ProcessStatusCheckpoint,
     ProcessStep,
     ProcessStepBase,
+    ProcessHardTimeoutSource,
+    ProcessObservationSpanStatus,
+    ProcessTimingSource,
     ProcessTimingStatus,
     ProcessWaitStep,
     ScenarioArtifactObservation,
@@ -192,6 +195,7 @@ from myhermes_audit.contracts.scenario import (
     StepStatusCheckpoint,
     ToolchainScenarioExecutionResult,
     ToolchainScenarioPlan,
+    WaitRemainingBudgetStatus,
 )
 from myhermes_audit.contracts.suite import (
     AuditCase,
@@ -392,6 +396,9 @@ __all__ = (
     "ProcessStatusCheckpoint",
     "ProcessStep",
     "ProcessStepBase",
+    "ProcessHardTimeoutSource",
+    "ProcessObservationSpanStatus",
+    "ProcessTimingSource",
     "ProcessTimingStatus",
     "ProcessWaitStep",
     "ScenarioArtifactObservation",
@@ -411,4 +418,5 @@ __all__ = (
     "StepStatusCheckpoint",
     "ToolchainScenarioExecutionResult",
     "ToolchainScenarioPlan",
+    "WaitRemainingBudgetStatus",
 )

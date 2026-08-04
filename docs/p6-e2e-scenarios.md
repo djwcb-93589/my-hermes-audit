@@ -82,7 +82,7 @@ The required scenario evaluator contributes hard gates to `task_success` and
 `task_passed`; it does not create a fourth first-level score. With no required
 Process scenario, `process_gate_passed` is `null`.
 
-### Process event alignment and wall-clock timing
+### Process event alignment and timing sources
 
 Process observations are aligned with a bounded, forward-only matcher. The
 matcher searches from its current cursor for the first event that satisfies
@@ -102,15 +102,28 @@ optional Step ID. The corresponding stable error types are
 events fail the Process gate, while facts from correctly matched later events
 remain available for diagnosis.
 
-`scenario.timeout_seconds` is evaluated against the measured wall-clock span
-from the first matched foreground Process event to the last matched foreground
-Process event. The public observation timestamp is the persisted completion
-boundary; when present with a non-negative handler duration, the Worker
-projects a UTC start/end interval. If any required timing fact is unavailable
-or invalid, Scenario timing is `unavailable`/`invalid` and no duration is
-invented. `tool_duration_sum_ms` is retained only as a diagnostic and never
-substitutes for the wall-clock timeout. Worker lifecycle cleanup timing remains
-outside this foreground span.
+Each Step uses the public Tool Observation `duration_ms`, which measures only
+the handler and is never treated as model-thinking or inter-call time. The
+Scenario separately projects an observation interval from persisted
+`created_at` values as `scenario_observation_started_at`,
+`scenario_observation_completed_at`, and `scenario_observation_span_ms`, with
+`scenario_timing_source=public_observation_persistence`. These timestamps are
+persistence metadata and do not establish exact per-Tool boundaries. The
+Worker also registers the public PRE/POST Tool hooks and records aggregate
+monotonic boundaries for the declared `terminal`/`process` calls. WAIT
+remaining-budget facts use that Worker-monotonic source when every boundary is
+available; they otherwise remain explicitly unavailable rather than inferred
+from a duration sum.
+Only relative per-event offsets and the aggregate monotonic duration are
+serialized; host-specific absolute monotonic nanoseconds never leave the
+Worker.
+
+The hard deadline is the effective Worker case watchdog
+(`hard_timeout_source=worker_case_watchdog`), which is conservative because it
+starts at Case execution and may include pre-Process setup. It is independent
+of the persistence observation span and exposes separate watchdog booleans.
+`tool_duration_sum_ms` is retained only as a diagnostic. Worker lifecycle
+cleanup timing remains outside this foreground observation span.
 
 The official Process prompts provide the exact Case B/C commands and the
 public `log`, `poll`, and `kill(process_id, grace_seconds)` actions. Case A

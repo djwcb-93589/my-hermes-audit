@@ -10,7 +10,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from myhermes_audit.artifacts import atomic_write_text
@@ -21,11 +21,14 @@ from myhermes_audit.contracts import (
     IncrementalReadObservation,
     ProcessAction,
     ProcessCleanupResult,
+    ProcessHardTimeoutSource,
     ProcessEventDiagnostic,
+    ProcessObservationSpanStatus,
     ProcessInputObservation,
     ProcessScenarioExecutionResult,
     ProcessOutputCheckpoint,
     ProcessTimingStatus,
+    ProcessTimingSource,
     ProcessAssertStatusStep,
     ProcessCloseStep,
     ProcessInterruptStep,
@@ -42,6 +45,7 @@ from myhermes_audit.contracts import (
     ScenarioStatus,
     ScenarioStepResult,
     ScenarioToolCallObservation,
+    WaitRemainingBudgetStatus,
     StepStatusCheckpoint,
     ProcessStatusCheckpoint,
     ToolchainScenarioExecutionResult,
@@ -333,8 +337,6 @@ def _event_timing(
     value = event.get("duration_ms")
     if type(value) is not int or value < 0:
         return None, ProcessTimingStatus.INVALID
-    if _event_bounds(event) is not None:
-        return value, ProcessTimingStatus.AVAILABLE
     return value, ProcessTimingStatus.AVAILABLE_DURATION_ONLY
 
 
@@ -436,29 +438,21 @@ def _event_diagnostic(
     )
 
 
-def _event_bounds(
+def _event_observation_time(
     event: Mapping[str, object] | None,
-) -> tuple[datetime, datetime] | None:
-    """Project the public observation time and handler duration into a UTC span.
+) -> datetime | None:
+    """Return only the public persistence timestamp for an observation.
 
-    MyHermes persists ``created_at`` immediately after the public Tool handler
-    returns and reports the handler's measured ``duration_ms``.  Treating that
-    timestamp as the completion boundary and subtracting the measured duration
-    gives a bounded wall-clock interval without inventing a monotonic clock.
-    Missing or malformed facts make the interval unavailable.
+    ``created_at`` is persistence metadata.  It is intentionally not combined
+    with ``duration_ms`` to fabricate a per-tool start or completion boundary.
     """
 
     if event is None:
         return None
     created_at = event.get("created_at")
-    duration_ms = event.get("duration_ms")
     if not isinstance(created_at, datetime) or created_at.tzinfo is None:
         return None
-    if type(duration_ms) is not int or duration_ms < 0:
-        return None
-    completed_at = created_at.astimezone(timezone.utc)
-    started_at = completed_at - timedelta(milliseconds=duration_ms)
-    return started_at, completed_at
+    return created_at.astimezone(timezone.utc)
 
 
 def _align_process_events(
@@ -776,8 +770,10 @@ def build_scenario_results(
     observations: ObservationBundle,
     turns,
     cleanup_reports: Sequence[Mapping[str, object]],
+    process_monotonic_boundaries: Mapping[str, tuple[int, int]] | None = None,
     sensitive_values: Sequence[str] = (),
 ) -> tuple[list[ScenarioExecutionResult], list[ScenarioError], list[Path]]:
+    process_monotonic_boundaries = process_monotonic_boundaries or {}
     events = _tool_events(responses, observations)
     process_plans = [
         item for item in request.scenarios
@@ -978,6 +974,25 @@ def build_scenario_results(
         alignment = _align_process_events(plan, process_events)
         matched_events = alignment.matched_events
         matched_indices = alignment.matched_indices
+        matched_monotonic_bounds: list[tuple[int, int] | None] = []
+        for event in matched_events:
+            tool_call_id = event.get("tool_call_id") if event else None
+            bounds = (
+                process_monotonic_boundaries.get(tool_call_id)
+                if isinstance(tool_call_id, str)
+                else None
+            )
+            matched_monotonic_bounds.append(bounds)
+        all_matched_monotonic = (
+            bool(matched_events)
+            and all(event is not None for event in matched_events)
+            and all(bounds is not None for bounds in matched_monotonic_bounds)
+        )
+        monotonic_scenario_started_ns = (
+            matched_monotonic_bounds[0][0]
+            if all_matched_monotonic and matched_monotonic_bounds[0] is not None
+            else None
+        )
         start_process_id: str | None = None
         safe_process_id: str | None = None
         declared_command: str | None = None
@@ -998,16 +1013,24 @@ def build_scenario_results(
         initial_status: ScenarioProcessStatus | None = None
         final_status = ScenarioProcessStatus.UNKNOWN
         agent_close_observed = False
-        elapsed_ms = 0
         tool_duration_sum_ms = sum(
             event.get("duration_ms")
             for event in process_events
             if type(event.get("duration_ms")) is int and event.get("duration_ms") >= 0
         )
-        scenario_timed_out: bool | None = None
+        worker_watchdog_timed_out = any(
+            item.runtime_status in {"timeout", "timed_out"}
+            for item in turns
+        )
+        wait_remaining_budget_status = WaitRemainingBudgetStatus.NOT_APPLICABLE
+        wait_elapsed_before_ms: int | None = None
+        wait_remaining_seconds: float | int | None = None
+        wait_timeout_budget_matched: bool | None = None
+        wait_budget_timing_source: ProcessTimingSource | None = None
         for step_index, step in enumerate(plan.steps):
             event = matched_events[step_index]
             matched_index = matched_indices[step_index]
+            monotonic_bounds = matched_monotonic_bounds[step_index]
             result_payload = _event_result(event)
             arguments = _event_arguments(event)
             actual_action = result_payload.get("action") or arguments.get("action")
@@ -1161,20 +1184,11 @@ def build_scenario_results(
                 status_history.append(actual_status)
                 final_status = actual_status
             duration_ms, timing_status = _event_timing(event)
-            elapsed_before_ms = elapsed_ms
-            if matched_index is not None:
-                elapsed_ms = sum(
-                    int(candidate.get("duration_ms"))
-                    for candidate in process_events[: matched_index + 1]
-                    if type(candidate.get("duration_ms")) is int
-                    and candidate.get("duration_ms") >= 0
-                )
-                elapsed_before_ms = sum(
-                    int(candidate.get("duration_ms"))
-                    for candidate in process_events[:matched_index]
-                    if type(candidate.get("duration_ms")) is int
-                    and candidate.get("duration_ms") >= 0
-                )
+            timing_source = (
+                ProcessTimingSource.PUBLIC_DURATION_ONLY
+                if timing_status is ProcessTimingStatus.AVAILABLE_DURATION_ONLY
+                else ProcessTimingSource.UNAVAILABLE
+            )
             timed_out = (
                 None
                 if duration_ms is None
@@ -1182,15 +1196,43 @@ def build_scenario_results(
             )
             if step.action is ProcessAction.WAIT:
                 wait_timeout = arguments.get("timeout")
-                scenario_remaining = plan.timeout_seconds - elapsed_before_ms / 1000
                 wait_ok = (
                     isinstance(wait_timeout, (int, float))
                     and not isinstance(wait_timeout, bool)
                     and wait_timeout >= 0
                     and wait_timeout <= step.timeout_seconds
                     and step.timeout_seconds <= step.maximum_wait_seconds
-                    and step.maximum_wait_seconds <= scenario_remaining
+                    and wait_timeout <= step.maximum_wait_seconds
+                    and wait_timeout <= plan.timeout_seconds
                 )
+                if (
+                    monotonic_scenario_started_ns is not None
+                    and monotonic_bounds is not None
+                    and monotonic_bounds[0] >= monotonic_scenario_started_ns
+                ):
+                    wait_elapsed_before_ms = round(
+                        (monotonic_bounds[0] - monotonic_scenario_started_ns)
+                        / 1_000_000
+                    )
+                    wait_remaining_seconds = max(
+                        0,
+                        plan.timeout_seconds - wait_elapsed_before_ms / 1000,
+                    )
+                    wait_remaining_budget_status = WaitRemainingBudgetStatus.AVAILABLE
+                    wait_budget_timing_source = ProcessTimingSource.WORKER_MONOTONIC
+                    wait_timeout_budget_matched = bool(
+                        wait_ok
+                        and isinstance(wait_timeout, (int, float))
+                        and not isinstance(wait_timeout, bool)
+                        and wait_timeout <= wait_remaining_seconds
+                    )
+                    wait_ok = wait_ok and wait_timeout_budget_matched
+                else:
+                    wait_remaining_budget_status = WaitRemainingBudgetStatus.UNAVAILABLE
+                    wait_elapsed_before_ms = None
+                    wait_remaining_seconds = None
+                    wait_timeout_budget_matched = None
+                    wait_budget_timing_source = ProcessTimingSource.UNAVAILABLE
             else:
                 wait_ok = True
             if step.action is ProcessAction.READ_INCREMENTAL:
@@ -1245,19 +1287,60 @@ def build_scenario_results(
                     step_error_type = "process_cursor_reference_error"
                 elif not read.cursor_chain_matched:
                     step_error_type = "process_cursor_chain_error"
-            event_bounds = _event_bounds(event)
             step_results.append(ScenarioStepResult(
                 step_id=step.step_id,
                 action=step.action,
                 status=ScenarioStatus.COMPLETED if passed else ScenarioStatus.ERROR,
                 actual_action=str(actual_action) if isinstance(actual_action, str) else None,
                 actual_status=actual_status,
-                started_at=None if event_bounds is None else event_bounds[0],
-                completed_at=None if event_bounds is None else event_bounds[1],
+                # Public Observation persistence does not provide per-tool
+                # boundaries; only the handler duration is projected here.
+                started_at=None,
+                completed_at=None,
                 duration_ms=duration_ms,
                 timeout_seconds=step.timeout_seconds,
                 timing_status=timing_status,
+                timing_source=timing_source,
                 timed_out=timed_out,
+                event_started_offset_ms=(
+                    None
+                    if monotonic_scenario_started_ns is None
+                    or monotonic_bounds is None
+                    else round(
+                        (monotonic_bounds[0] - monotonic_scenario_started_ns)
+                        / 1_000_000
+                    )
+                ),
+                event_completed_offset_ms=(
+                    None
+                    if monotonic_scenario_started_ns is None
+                    or monotonic_bounds is None
+                    else round(
+                        (monotonic_bounds[1] - monotonic_scenario_started_ns)
+                        / 1_000_000
+                    )
+                ),
+                event_timing_source=(
+                    ProcessTimingSource.WORKER_MONOTONIC
+                    if monotonic_scenario_started_ns is not None
+                    and monotonic_bounds is not None
+                    else ProcessTimingSource.UNAVAILABLE
+                ),
+                elapsed_before_wait_ms=(
+                    wait_elapsed_before_ms if step.action is ProcessAction.WAIT else None
+                ),
+                scenario_remaining_before_wait_seconds=(
+                    wait_remaining_seconds if step.action is ProcessAction.WAIT else None
+                ),
+                wait_remaining_budget_status=(
+                    wait_remaining_budget_status if step.action is ProcessAction.WAIT else None
+                ),
+                wait_timeout_budget_matched=(
+                    wait_timeout_budget_matched if step.action is ProcessAction.WAIT else None
+                ),
+                wait_budget_timing_source=(
+                    wait_budget_timing_source if step.action is ProcessAction.WAIT else None
+                ),
                 observation_refs=[_safe_id(event.get("tool_call_id"))] if event else [],
                 expected_process_id_safe=safe_process_id,
                 actual_process_id_safe=event_safe_process_id,
@@ -1361,58 +1444,105 @@ def build_scenario_results(
             ))
             if checkpoint_error is not None:
                 checkpoint_errors.append(checkpoint_error)
-        required_step_timing_statuses = [
-            step_result.timing_status
-            for step, step_result in zip(plan.steps, step_results, strict=False)
-            if step.required
-        ]
-        step_timing_statuses = required_step_timing_statuses
-        matched_bounds = [
-            bounds
+        matched_observation_times = [
+            observation_time
             for event in matched_events
-            if (bounds := _event_bounds(event)) is not None
+            if (observation_time := _event_observation_time(event)) is not None
         ]
         matched_event_count = sum(event is not None for event in matched_events)
-        all_matched_events_timed = (
-            matched_event_count > 0 and len(matched_bounds) == matched_event_count
-        )
-        scenario_started_at = None
-        scenario_completed_at = None
-        scenario_wall_clock_duration_ms = None
-        if all_matched_events_timed:
-            candidate_start = matched_bounds[0][0]
-            candidate_end = matched_bounds[-1][1]
-            if candidate_end >= candidate_start and all(
-                current[0] >= previous[0]
-                for previous, current in zip(matched_bounds, matched_bounds[1:], strict=False)
-            ):
-                scenario_started_at = candidate_start
-                scenario_completed_at = candidate_end
-                scenario_wall_clock_duration_ms = round(
-                    (candidate_end - candidate_start).total_seconds() * 1000
+        observation_span_status = ProcessObservationSpanStatus.UNAVAILABLE
+        observation_started_at = None
+        observation_completed_at = None
+        observation_span_ms = None
+        if (
+            matched_event_count > 0
+            and len(matched_observation_times) == matched_event_count
+            and all(
+                current >= previous
+                for previous, current in zip(
+                    matched_observation_times,
+                    matched_observation_times[1:],
+                    strict=False,
                 )
-        if any(item is ProcessTimingStatus.INVALID for item in step_timing_statuses):
-            scenario_timing_status = ProcessTimingStatus.INVALID
-            scenario_started_at = None
-            scenario_completed_at = None
-            scenario_wall_clock_duration_ms = None
-            scenario_duration_ms = None
-            scenario_timed_out = None
-        elif (
-            step_timing_statuses
-            and all(item is ProcessTimingStatus.AVAILABLE for item in step_timing_statuses)
-            and scenario_wall_clock_duration_ms is not None
+            )
         ):
-            scenario_timing_status = ProcessTimingStatus.AVAILABLE
-            scenario_duration_ms = scenario_wall_clock_duration_ms
-            scenario_timed_out = scenario_wall_clock_duration_ms > plan.timeout_seconds * 1000
+            observation_started_at = matched_observation_times[0]
+            observation_completed_at = matched_observation_times[-1]
+            observation_span_ms = round(
+                (observation_completed_at - observation_started_at).total_seconds()
+                * 1000
+            )
+            observation_span_status = ProcessObservationSpanStatus.AVAILABLE
+        elif matched_event_count > 0:
+            observation_span_status = ProcessObservationSpanStatus.INVALID
+        scenario_timing_source = (
+            ProcessTimingSource.PUBLIC_OBSERVATION_PERSISTENCE
+            if observation_span_status is ProcessObservationSpanStatus.AVAILABLE
+            else ProcessTimingSource.UNAVAILABLE
+        )
+        monotonic_scenario_started_ns = None
+        monotonic_scenario_completed_ns = None
+        monotonic_scenario_duration_ms = None
+        monotonic_timing_status = ProcessObservationSpanStatus.UNAVAILABLE
+        if all_matched_monotonic:
+            monotonic_bounds = [
+                bounds
+                for bounds in matched_monotonic_bounds
+                if bounds is not None
+            ]
+            if monotonic_bounds and all(
+                current[0] >= previous[0]
+                and current[1] >= previous[1]
+                for previous, current in zip(
+                    monotonic_bounds,
+                    monotonic_bounds[1:],
+                    strict=False,
+                )
+            ):
+                monotonic_scenario_started_ns = monotonic_bounds[0][0]
+                monotonic_scenario_completed_ns = monotonic_bounds[-1][1]
+                if monotonic_scenario_completed_ns >= monotonic_scenario_started_ns:
+                    monotonic_scenario_duration_ms = round(
+                        (
+                            monotonic_scenario_completed_ns
+                            - monotonic_scenario_started_ns
+                        )
+                        / 1_000_000
+                    )
+                    monotonic_timing_status = ProcessObservationSpanStatus.AVAILABLE
+        effective_hard_timeout_seconds = min(
+            request.timeout_seconds,
+            plan.timeout_seconds,
+        )
+        scenario_observation_span_exceeded = (
+            None
+            if observation_span_ms is None
+            else observation_span_ms > effective_hard_timeout_seconds * 1000
+        )
+        hard_timeout_triggered = worker_watchdog_timed_out
+        scenario_watchdog_timed_out = worker_watchdog_timed_out
+        wait_steps = [
+            item for item in step_results if item.action is ProcessAction.WAIT
+        ]
+        if wait_steps and all(
+            item.wait_remaining_budget_status is WaitRemainingBudgetStatus.AVAILABLE
+            for item in wait_steps
+        ):
+            wait_remaining_budget_status = WaitRemainingBudgetStatus.AVAILABLE
+            wait_budget_timing_source = ProcessTimingSource.WORKER_MONOTONIC
+            wait_timeout_budget_matched = all(
+                item.wait_timeout_budget_matched is True for item in wait_steps
+            )
+            wait_budget_hard_watchdog_fallback = False
         else:
-            scenario_timing_status = ProcessTimingStatus.UNAVAILABLE
-            scenario_started_at = None
-            scenario_completed_at = None
-            scenario_wall_clock_duration_ms = None
-            scenario_duration_ms = None
-            scenario_timed_out = None
+            if wait_steps:
+                wait_remaining_budget_status = WaitRemainingBudgetStatus.UNAVAILABLE
+                wait_elapsed_before_ms = None
+                wait_remaining_seconds = None
+                wait_timeout_budget_matched = None
+                wait_budget_timing_source = ProcessTimingSource.UNAVAILABLE
+            wait_budget_hard_watchdog_fallback = bool(wait_steps)
+        scenario_duration_ms = observation_span_ms
         alignment_diagnostics = (
             alignment.unexpected_events
             + alignment.missing_expected_events
@@ -1438,11 +1568,18 @@ def build_scenario_results(
                 "process_step_timeout",
             }:
                 scenario_errors.append(step_result.error)
-        if scenario_timed_out is True:
+        if hard_timeout_triggered:
             scenario_errors.append(
                 _scenario_error(
                     "process_scenario_timeout",
-                    f"scenario={plan.scenario_id}; Process wall-clock deadline exceeded",
+                    f"scenario={plan.scenario_id}; Worker case watchdog exceeded",
+                )
+            )
+        if scenario_observation_span_exceeded is True:
+            scenario_errors.append(
+                _scenario_error(
+                    "process_scenario_observation_span_exceeded",
+                    f"scenario={plan.scenario_id}; public observation span exceeded the hard budget",
                 )
             )
         scenario_status = ScenarioStatus.COMPLETED if (
@@ -1451,9 +1588,9 @@ def build_scenario_results(
             and cursor_integrity and status_transitions_valid and trace_passed
             and (not fixture_read_required or file_fixture_read_observed)
             and not alignment_diagnostics
-            and scenario_timed_out is not True
-            and scenario_timing_status is ProcessTimingStatus.AVAILABLE
-            and scenario_wall_clock_duration_ms is not None
+            and not hard_timeout_triggered
+            and scenario_observation_span_status is ProcessObservationSpanStatus.AVAILABLE
+            and scenario_observation_span_exceeded is False
             and all(item.passed is True for item in checkpoint_results if item.required)
         ) else ScenarioStatus.FAILED
         if not scenario_errors and scenario_status is not ScenarioStatus.COMPLETED:
@@ -1485,8 +1622,25 @@ def build_scenario_results(
             file_fixture_read_observed=file_fixture_read_observed,
             status_transitions_valid=status_transitions_valid,
             scenario_timeout_seconds=plan.timeout_seconds,
-            timing_status=scenario_timing_status,
-            scenario_timed_out=scenario_timed_out,
+            scenario_observation_span_status=observation_span_status,
+            scenario_timing_source=scenario_timing_source,
+            scenario_observation_started_at=observation_started_at,
+            scenario_observation_completed_at=observation_completed_at,
+            scenario_observation_span_ms=observation_span_ms,
+            scenario_monotonic_timing_status=monotonic_timing_status,
+            scenario_monotonic_duration_ms=monotonic_scenario_duration_ms,
+            hard_timeout_source=ProcessHardTimeoutSource.WORKER_CASE_WATCHDOG,
+            hard_timeout_seconds=effective_hard_timeout_seconds,
+            hard_timeout_triggered=hard_timeout_triggered,
+            trial_watchdog_timed_out=False,
+            scenario_watchdog_timed_out=scenario_watchdog_timed_out,
+            scenario_observation_span_exceeded=scenario_observation_span_exceeded,
+            wait_remaining_budget_status=wait_remaining_budget_status,
+            elapsed_before_wait_ms=wait_elapsed_before_ms,
+            scenario_remaining_before_wait_seconds=wait_remaining_seconds,
+            wait_timeout_budget_matched=wait_timeout_budget_matched,
+            wait_budget_timing_source=wait_budget_timing_source,
+            wait_budget_hard_watchdog_fallback=wait_budget_hard_watchdog_fallback,
             agent_close_required=any(
                 item.action is ProcessAction.CLOSE and item.required
                 for item in plan.steps
@@ -1498,9 +1652,6 @@ def build_scenario_results(
             event_order_violations=alignment.event_order_violations,
             foreign_process_events=alignment.foreign_process_events,
             unconsumed_events=alignment.unconsumed_events,
-            scenario_started_at=scenario_started_at,
-            scenario_completed_at=scenario_completed_at,
-            scenario_wall_clock_duration_ms=scenario_wall_clock_duration_ms,
             tool_duration_sum_ms=tool_duration_sum_ms,
             duration_ms=scenario_duration_ms,
             errors=scenario_errors,

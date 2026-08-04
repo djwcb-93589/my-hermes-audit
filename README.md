@@ -25,9 +25,11 @@ Required Process Step timing is explicitly classified as available,
 duration-only, unavailable, or invalid. Missing/invalid required timing fails
 the Process gate; optional timing is not evaluable. Timeout uses the strict
 `duration_ms > timeout_seconds * 1000` rule, and `wait` validates both its real
-Tool Call timeout and the remaining Scenario budget. The Scenario deadline
-itself requires a measured UTC wall-clock span; a duration-only Step projection
-cannot substitute for it.
+Tool Call timeout and the remaining Scenario budget. The Scenario exposes a
+separate persistence observation span (`scenario_observation_span_*`) and a
+Worker case watchdog; a duration-only Step projection is never presented as
+an exact Scenario boundary. Per-call monotonic timing is explicit when
+available and otherwise remains unavailable.
 
 Process status expectations are capability-driven from the public
 `ProcessStatus` enum. The current Subject exposes `starting`, `running`,
@@ -41,10 +43,13 @@ Process events are aligned with a bounded forward-only matcher rather than
 array position. Extra, missing, out-of-order, foreign-process, and trailing
 events are preserved as safe structured diagnostics and fail the strict
 Process gate without overwriting facts from later correctly matched events.
-Scenario timeout is measured from the first matched foreground Process event
-to the last using UTC observation timing; the sum of individual Tool durations
-is diagnostic only. Worker cleanup timing is separate from this foreground
-wall-clock span. The default Process prompts state exact commands and public
+The observation span is projected from persisted UTC timestamps between the
+first and last matched foreground Process observations; the sum of individual
+Tool durations is diagnostic only. The hard timeout is enforced by the Worker
+case watchdog and is separate from the observation span and cleanup timing.
+Relative Process event offsets come from the public PRE/POST Tool hooks; host
+specific absolute monotonic values are not serialized.
+The default Process prompts state exact commands and public
 `log`, `poll`, and `kill(process_id, grace_seconds)` actions.
 
 The P6.1 closing contracts use an explicit stdin handshake in the short

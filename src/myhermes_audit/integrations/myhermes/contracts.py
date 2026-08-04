@@ -47,9 +47,9 @@ from myhermes_audit.contracts.common import (
 )
 
 
-WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v9"
-LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v8"
-WorkerProtocolVersion = Literal["myhermes-audit-worker-v9"]
+WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v10"
+LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v9"
+WorkerProtocolVersion = Literal["myhermes-audit-worker-v10"]
 
 
 class WorkerMode(str, Enum):
@@ -318,10 +318,9 @@ class ToolObservationRecord(ContractModel):
     success: StrictBool
     error_type: Identifier | None = None
     duration_ms: NonNegativeInt
-    # MyHermes persists this public observation timestamp immediately after the
-    # Tool handler returns.  P6.1 may use it as the completion boundary when a
-    # non-negative handler duration is also present; missing timing remains
-    # explicitly unavailable rather than being fabricated.
+    # MyHermes persists this public Observation timestamp as persistence
+    # metadata.  It is suitable only for an observation-span projection; it
+    # does not establish a per-handler start or completion boundary.
     created_at: UtcDatetime | None = None
 
 

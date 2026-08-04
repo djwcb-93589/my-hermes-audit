@@ -317,8 +317,31 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
             "scenario_kind": scenario.kind.value,
             "status": scenario.status.value,
             "duration_ms": scenario.duration_ms,
-            "scenario_wall_clock_duration_ms": getattr(
-                scenario, "scenario_wall_clock_duration_ms", None
+            "scenario_observation_span_ms": getattr(
+                scenario, "scenario_observation_span_ms", None
+            ),
+            "scenario_observation_span_status": getattr(
+                getattr(scenario, "scenario_observation_span_status", None),
+                "value",
+                getattr(scenario, "scenario_observation_span_status", None),
+            ),
+            "scenario_timing_source": getattr(
+                getattr(scenario, "scenario_timing_source", None),
+                "value",
+                getattr(scenario, "scenario_timing_source", None),
+            ),
+            "timing_source": getattr(
+                getattr(scenario, "scenario_timing_source", None),
+                "value",
+                getattr(scenario, "scenario_timing_source", None),
+            ),
+            "scenario_monotonic_timing_status": getattr(
+                getattr(scenario, "scenario_monotonic_timing_status", None),
+                "value",
+                getattr(scenario, "scenario_monotonic_timing_status", None),
+            ),
+            "scenario_monotonic_duration_ms": getattr(
+                scenario, "scenario_monotonic_duration_ms", None
             ),
             "tool_duration_sum_ms": getattr(scenario, "tool_duration_sum_ms", None),
             "error_count": len(scenario.errors),
@@ -327,17 +350,42 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
             "input_matched": getattr(scenario, "input_matched", None),
             "file_fixture_read_observed": getattr(scenario, "file_fixture_read_observed", False),
             "cursor_unit": getattr(scenario, "cursor_unit", "character"),
-            "timing_status": getattr(
-                getattr(scenario, "timing_status", None),
-                "value",
-                getattr(scenario, "timing_status", None),
-            ),
             "timeout_seconds": getattr(scenario, "scenario_timeout_seconds", None),
             "scenario_timeout_seconds": getattr(
                 scenario, "scenario_timeout_seconds", None
             ),
-            "scenario_timed_out": getattr(scenario, "scenario_timed_out", None),
-            "timed_out": getattr(scenario, "scenario_timed_out", None),
+            "hard_timeout_source": getattr(
+                getattr(scenario, "hard_timeout_source", None),
+                "value",
+                getattr(scenario, "hard_timeout_source", None),
+            ),
+            "hard_timeout_seconds": getattr(scenario, "hard_timeout_seconds", None),
+            "hard_timeout_triggered": getattr(scenario, "hard_timeout_triggered", None),
+            "trial_watchdog_timed_out": getattr(scenario, "trial_watchdog_timed_out", None),
+            "scenario_watchdog_timed_out": getattr(scenario, "scenario_watchdog_timed_out", None),
+            "scenario_observation_span_exceeded": getattr(
+                scenario, "scenario_observation_span_exceeded", None
+            ),
+            "wait_remaining_budget_status": getattr(
+                getattr(scenario, "wait_remaining_budget_status", None),
+                "value",
+                getattr(scenario, "wait_remaining_budget_status", None),
+            ),
+            "elapsed_before_wait_ms": getattr(scenario, "elapsed_before_wait_ms", None),
+            "scenario_remaining_before_wait_seconds": getattr(
+                scenario, "scenario_remaining_before_wait_seconds", None
+            ),
+            "wait_timeout_budget_matched": getattr(
+                scenario, "wait_timeout_budget_matched", None
+            ),
+            "wait_budget_timing_source": getattr(
+                getattr(scenario, "wait_budget_timing_source", None),
+                "value",
+                getattr(scenario, "wait_budget_timing_source", None),
+            ),
+            "wait_budget_hard_watchdog_fallback": getattr(
+                scenario, "wait_budget_hard_watchdog_fallback", None
+            ),
             "event_alignment_passed": not any(
                 getattr(scenario, field_name, ())
                 for field_name in (
@@ -363,14 +411,14 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
             "unconsumed_event_count": len(
                 getattr(scenario, "unconsumed_events", ())
             ),
-            "scenario_started_at": (
-                scenario.scenario_started_at.isoformat()
-                if getattr(scenario, "scenario_started_at", None) is not None
+            "scenario_observation_started_at": (
+                scenario.scenario_observation_started_at.isoformat()
+                if getattr(scenario, "scenario_observation_started_at", None) is not None
                 else None
             ),
-            "scenario_completed_at": (
-                scenario.scenario_completed_at.isoformat()
-                if getattr(scenario, "scenario_completed_at", None) is not None
+            "scenario_observation_completed_at": (
+                scenario.scenario_observation_completed_at.isoformat()
+                if getattr(scenario, "scenario_observation_completed_at", None) is not None
                 else None
             ),
             "agent_close_required": getattr(scenario, "agent_close_required", False),
@@ -433,7 +481,42 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                         "value",
                         getattr(step, "timing_status", None),
                     ),
+                    "timing_source": getattr(
+                        getattr(step, "timing_source", None),
+                        "value",
+                        getattr(step, "timing_source", None),
+                    ),
                     "timed_out": step.timed_out,
+                    "event_started_offset_ms": getattr(
+                        step, "event_started_offset_ms", None
+                    ),
+                    "event_completed_offset_ms": getattr(
+                        step, "event_completed_offset_ms", None
+                    ),
+                    "event_timing_source": getattr(
+                        getattr(step, "event_timing_source", None),
+                        "value",
+                        getattr(step, "event_timing_source", None),
+                    ),
+                    "elapsed_before_wait_ms": getattr(
+                        step, "elapsed_before_wait_ms", None
+                    ),
+                    "scenario_remaining_before_wait_seconds": getattr(
+                        step, "scenario_remaining_before_wait_seconds", None
+                    ),
+                    "wait_remaining_budget_status": getattr(
+                        getattr(step, "wait_remaining_budget_status", None),
+                        "value",
+                        getattr(step, "wait_remaining_budget_status", None),
+                    ),
+                    "wait_timeout_budget_matched": getattr(
+                        step, "wait_timeout_budget_matched", None
+                    ),
+                    "wait_budget_timing_source": getattr(
+                        getattr(step, "wait_budget_timing_source", None),
+                        "value",
+                        getattr(step, "wait_budget_timing_source", None),
+                    ),
                     "expected_process_id_safe": step.expected_process_id_safe,
                     "actual_process_id_safe": step.actual_process_id_safe,
                     "process_identity_matched": step.process_identity_matched,

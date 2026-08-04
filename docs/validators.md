@@ -5,7 +5,8 @@
 The `scenario` evaluator consumes only Worker-produced Toolchain and Process
 observations. It emits independent Process metrics for command identity,
 process identity, input identity, action, character cursor integrity, marker
-expectations, status transitions, step/scenario timeout, Agent close, Worker
+expectations, status transitions, Step duration, observation span, hard
+watchdog, remaining budget, Agent close, Worker
 cleanup, and typed checkpoints. Required scenario metrics are hard gates;
 the aggregate is exposed as `toolchain_gate_passed` or
 `process_gate_passed` and flows into the existing task gate. No fourth
@@ -20,8 +21,9 @@ hard-gate facts when declared by a required scenario.
 
 Process validation also keeps independent `command_identity`, `process_identity`,
 `input_identity`, `business_status`, `step_action`, `process_trace`,
-`fixture_read`, `step_timing`, `step_timeout`, `scenario_timing`,
-`scenario_timeout`, and `worker_cleanup` dimensions. A required Step with
+`fixture_read`, `step_duration_gate`, `scenario_observation_span_gate`,
+`scenario_hard_timeout_gate`, `wait_remaining_budget_gate`, and
+`worker_cleanup` dimensions. A required Step with
 missing or invalid timing emits `process_step_timing_unavailable` or
 `process_step_timing_invalid`; a measured budget overrun emits
 `process_step_timeout`. These are not collapsed into a business-status error.
@@ -31,8 +33,9 @@ gate without adding a first-level score. Optional missing timing is represented
 as `NOT_APPLICABLE` for the timeout dimension.
 
 Process validation also has explicit `event_alignment`,
-`unexpected_event_gate`, `event_order_gate`, and
-`scenario_wall_clock_timing` metrics. Alignment is a one-way bounded search,
+`unexpected_event_gate`, `event_order_gate`, `step_duration_gate`,
+`scenario_hard_timeout_gate`, `scenario_observation_span_gate`, and
+`wait_remaining_budget_gate` metrics. Alignment is a one-way bounded search,
 not positional array indexing. Unexpected, missing, foreign, trailing, and
 out-of-order events are content-free structured facts and required ones are
 hard-gate failures; correctly matched later events are still evaluated for
@@ -41,10 +44,16 @@ stable event error types are `process_unexpected_event`,
 `process_missing_expected_event`, `process_event_order_violation`,
 `process_foreign_process_event`, and `process_unconsumed_event`.
 
-Scenario timeout uses the UTC wall-clock span between the first and last
-matched foreground Process observations. `tool_duration_sum_ms` is a separate
-diagnostic and cannot make unavailable timing pass. Cleanup timing is owned by
-the Worker lifecycle and is not included in the foreground Scenario deadline.
+Step duration gates use only public handler `duration_ms`. The observation-span
+gate uses persisted `created_at` timestamps under the explicit
+`public_observation_persistence` source; it is not an exact per-Tool boundary.
+The hard-timeout gate uses the Worker case watchdog. The Worker captures
+aggregate Process boundaries through the public PRE/POST Tool hooks. When
+those boundaries are unavailable, the WAIT gate may pass only through its
+explicit conservative watchdog fallback and never marks
+`wait_timeout_budget_matched` as true. `tool_duration_sum_ms` cannot make
+unavailable timing pass. Cleanup timing is owned by the Worker lifecycle and
+is not included in the foreground Scenario deadline.
 
 Process status checkpoints and incremental output checkpoints are independent
 metrics. The input Case passes its waiting phase only when the public status is
