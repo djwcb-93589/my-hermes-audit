@@ -9,6 +9,7 @@ from myhermes_audit.contracts import (
     MetricResult,
     MetricSource,
     MetricStatus,
+    ProcessHardTimeoutSource,
     ProcessObservationSpanStatus,
     ProcessTimingSource,
     ProcessScenarioPlan,
@@ -472,21 +473,33 @@ def _evaluate_process(
         or getattr(observed, "unconsumed_events", ())
     )
     event_order_gate_passed = not getattr(observed, "event_order_violations", ())
-    scenario_observation_span_passed = (
+    scenario_observation_span_available = (
         observed.scenario_observation_span_status
         is ProcessObservationSpanStatus.AVAILABLE
-        and observed.scenario_timing_source
+        and observed.scenario_observation_timing_source
         is ProcessTimingSource.PUBLIC_OBSERVATION_PERSISTENCE
         and observed.scenario_observation_started_at is not None
         and observed.scenario_observation_completed_at is not None
         and observed.scenario_observation_span_ms is not None
-        and observed.scenario_observation_span_exceeded is False
+    )
+    scenario_observation_span_exceeded = (
+        observed.scenario_observation_span_exceeded is True
+    )
+    scenario_observation_span_passed = not scenario_observation_span_exceeded
+    expected_hard_timeout_source = (
+        ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
+        if plan.required
+        else ProcessHardTimeoutSource.TRIAL_WATCHDOG
     )
     scenario_hard_timeout_passed = (
-        observed.hard_timeout_source.value == "worker_case_watchdog"
+        observed.hard_timeout_source is expected_hard_timeout_source
         and observed.hard_timeout_seconds is not None
         and observed.hard_timeout_triggered is False
         and observed.scenario_watchdog_timed_out is False
+        and (
+            plan.required
+            or observed.trial_watchdog_timed_out is False
+        )
     )
     wait_results = [
         item
@@ -498,28 +511,43 @@ def _evaluate_process(
         wait_remaining_budget_reason = "no WAIT step was declared"
     else:
         exact_wait_budget = all(
-            item.wait_remaining_budget_status is WaitRemainingBudgetStatus.AVAILABLE
+            item.wait_remaining_budget_status is WaitRemainingBudgetStatus.MATCHED
             and item.wait_timeout_budget_matched is True
+            and item.hard_watchdog_fallback_used is False
             for item in wait_results
         )
         fallback_wait_budget = (
             all(
-                item.wait_remaining_budget_status is WaitRemainingBudgetStatus.UNAVAILABLE
+                item.wait_remaining_budget_status
+                is WaitRemainingBudgetStatus.FALLBACK_USED
                 and item.wait_timeout_budget_matched is None
+                and item.hard_watchdog_fallback_allowed is True
+                and item.hard_watchdog_fallback_used is True
                 for item in wait_results
             )
-            and observed.wait_budget_hard_watchdog_fallback
+            and observed.hard_watchdog_fallback_allowed
+            and observed.hard_watchdog_fallback_used
             and scenario_hard_timeout_passed
+            and observed.hard_timeout_source
+            is ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
         )
         wait_remaining_budget_passed = exact_wait_budget or fallback_wait_budget
         wait_remaining_budget_reason = (
-            "Worker monotonic remaining budget matched"
+            "Worker PRE-to-PRE remaining budget matched"
             if exact_wait_budget
             else (
-                "remaining budget was unavailable; conservative Worker case watchdog "
-                "fallback was enabled and did not fire"
+                "remaining budget was unavailable; explicitly declared Process "
+                "Scenario watchdog fallback was enabled and did not fire"
                 if fallback_wait_budget
-                else "remaining budget was unavailable and no explicit watchdog fallback passed"
+                else (
+                    "remaining budget was mismatched"
+                    if any(
+                        item.wait_remaining_budget_status
+                        is WaitRemainingBudgetStatus.MISMATCHED
+                        for item in wait_results
+                    )
+                    else "remaining budget was unavailable and no explicit watchdog fallback passed"
+                )
             )
         )
     trace_passed = all(
@@ -562,8 +590,8 @@ def _evaluate_process(
         ("process_step_duration", "step_duration_gate", not required_step_timing_missing and not required_step_timing_invalid, "required Process steps supplied public handler duration facts"),
         ("process_step_timing", "step_timing", not required_step_timing_missing and not required_step_timing_invalid, "required Process steps supplied public handler duration facts"),
         ("process_step_timeout", "step_timeout", step_timeout_passed, "required steps supplied real duration facts within timeout"),
-        ("process_scenario_observation_span", "scenario_observation_span_gate", scenario_observation_span_passed, "public persistence timestamps supplied an observation span within the hard budget"),
-        ("process_scenario_hard_timeout", "scenario_hard_timeout_gate", scenario_hard_timeout_passed, "Worker case watchdog was configured and did not fire"),
+        ("process_scenario_observation_span", "scenario_observation_span_gate", scenario_observation_span_passed, "public persistence observation span was within the hard budget or was not available for diagnosis"),
+        ("process_scenario_hard_timeout", "scenario_hard_timeout_gate", scenario_hard_timeout_passed, "the applicable Worker watchdog was configured and did not fire"),
         ("process_wait_remaining_budget", "wait_remaining_budget_gate", wait_remaining_budget_passed, wait_remaining_budget_reason),
         ("process_agent_close", "agent_close", agent_close_passed, "Agent close expectation was observed independently"),
         ("process_worker_cleanup", "worker_cleanup", cleanup_passed, "Worker cleanup report satisfied its lifecycle expectation"),
@@ -641,32 +669,57 @@ def _evaluate_process(
                 metric_type=metric_type,
                 error_type="process_step_timeout",
             )
+        if (
+            metric_type == "scenario_observation_span_gate"
+            and not scenario_observation_span_available
+            and not scenario_observation_span_exceeded
+        ):
+            return _not_applicable_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                metric_type=metric_type,
+                reason="public persistence observation span was unavailable; this is diagnostic only",
+                hard_gate=False,
+            )
         if metric_type == "scenario_observation_span_gate" and not passed:
             return _error_metric(
                 name=f"{metric_prefix}.{name}",
                 scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-                reason="public persistence observation span was unavailable or exceeded its hard budget",
+                reason="public persistence observation span exceeded its hard budget",
                 hard_gate=plan.required,
                 metric_type=metric_type,
-                error_type="process_scenario_observation_span_unavailable",
+                error_type="process_scenario_observation_span_exceeded",
             )
         if metric_type == "scenario_hard_timeout_gate" and not passed:
             return _error_metric(
                 name=f"{metric_prefix}.{name}",
                 scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-                reason="Worker case watchdog was unavailable or fired",
+                reason="the applicable Worker watchdog was unavailable or fired",
                 hard_gate=plan.required,
                 metric_type=metric_type,
-                error_type="process_scenario_watchdog_timeout",
+                error_type=(
+                    "process_scenario_watchdog_timeout"
+                    if plan.required
+                    else "trial_watchdog_timeout"
+                ),
             )
         if metric_type == "wait_remaining_budget_gate" and not passed:
+            wait_error_type = (
+                "process_wait_remaining_budget_mismatch"
+                if any(
+                    item.wait_remaining_budget_status
+                    is WaitRemainingBudgetStatus.MISMATCHED
+                    for item in wait_results
+                )
+                else "process_wait_remaining_budget_unavailable"
+            )
             return _error_metric(
                 name=f"{metric_prefix}.{name}",
                 scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
                 reason=wait_remaining_budget_reason,
                 hard_gate=plan.required,
                 metric_type=metric_type,
-                error_type="process_wait_remaining_budget_unavailable",
+                error_type=wait_error_type,
             )
         if metric_type == "fixture_read" and not passed:
             return _error_metric(

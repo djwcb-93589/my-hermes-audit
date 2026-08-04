@@ -64,22 +64,47 @@ class ProcessObservationSpanStatus(str, Enum):
 class ProcessTimingSource(str, Enum):
     """Public source used for a timing fact; sources are never inferred."""
 
-    WORKER_MONOTONIC = "worker_monotonic"
     PUBLIC_OBSERVATION_PERSISTENCE = "public_observation_persistence"
     PUBLIC_DURATION_ONLY = "public_duration_only"
     UNAVAILABLE = "unavailable"
 
 
+class ProcessHookTimingSource(str, Enum):
+    """Source for a serialized public PRE or POST hook boundary."""
+
+    WORKER_PRE_TOOL_CONTROL_HOOK = "worker_pre_tool_control_hook"
+    WORKER_POST_TOOL_PERSISTENCE_HOOK = "worker_post_tool_persistence_hook"
+    UNAVAILABLE = "unavailable"
+
+
+class ProcessWaitTimingSource(str, Enum):
+    """Source for the PRE-to-PRE WAIT budget interval."""
+
+    WORKER_PRE_TOOL_CONTROL_HOOKS = "worker_pre_tool_control_hooks"
+    UNAVAILABLE = "unavailable"
+
+
+class ProcessHookSpanStatus(str, Enum):
+    """Availability of the conservative PRE-to-POST hook span."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    INVALID = "invalid"
+
+
 class ProcessHardTimeoutSource(str, Enum):
     """Watchdog that supplied the conservative scenario deadline."""
 
-    WORKER_CASE_WATCHDOG = "worker_case_watchdog"
+    TRIAL_WATCHDOG = "trial_watchdog"
+    WORKER_PROCESS_SCENARIO_WATCHDOG = "worker_process_scenario_watchdog"
     UNAVAILABLE = "unavailable"
 
 
 class WaitRemainingBudgetStatus(str, Enum):
-    AVAILABLE = "available"
+    MATCHED = "matched"
+    MISMATCHED = "mismatched"
     UNAVAILABLE = "unavailable"
+    FALLBACK_USED = "fallback_used"
     NOT_APPLICABLE = "not_applicable"
 
 
@@ -319,6 +344,7 @@ class ProcessWaitStep(ProcessStepBase):
     action: Literal[ProcessAction.WAIT] = ProcessAction.WAIT
     expected_status: ScenarioProcessStatus
     maximum_wait_seconds: Annotated[PositiveInt, Field(le=600)] = 30
+    allow_hard_watchdog_fallback: StrictBool = False
 
 
 class ProcessInterruptStep(ProcessStepBase):
@@ -600,16 +626,24 @@ class ScenarioStepResult(ContractModel):
     timing_status: ProcessTimingStatus = ProcessTimingStatus.UNAVAILABLE
     timing_source: ProcessTimingSource = ProcessTimingSource.UNAVAILABLE
     timed_out: StrictBool | None = None
-    event_started_offset_ms: NonNegativeInt | None = None
-    event_completed_offset_ms: NonNegativeInt | None = None
-    event_timing_source: ProcessTimingSource = ProcessTimingSource.UNAVAILABLE
+    event_pre_hook_offset_ms: NonNegativeInt | None = None
+    event_post_hook_offset_ms: NonNegativeInt | None = None
+    event_pre_hook_source: ProcessHookTimingSource = (
+        ProcessHookTimingSource.UNAVAILABLE
+    )
+    event_post_hook_source: ProcessHookTimingSource = (
+        ProcessHookTimingSource.UNAVAILABLE
+    )
     # WAIT-only budget facts.  ``None`` is intentional when the Worker has no
-    # reliable per-call monotonic boundary; duration sums are not substituted.
+    # reliable PRE-to-PRE control-hook boundaries; duration sums are not
+    # substituted.
     elapsed_before_wait_ms: NonNegativeInt | None = None
     scenario_remaining_before_wait_seconds: NonNegativeSeconds | None = None
     wait_remaining_budget_status: WaitRemainingBudgetStatus | None = None
     wait_timeout_budget_matched: StrictBool | None = None
-    wait_budget_timing_source: ProcessTimingSource | None = None
+    wait_budget_timing_source: ProcessWaitTimingSource | None = None
+    hard_watchdog_fallback_allowed: StrictBool | None = None
+    hard_watchdog_fallback_used: StrictBool | None = None
     observation_refs: list[Identifier] = Field(default_factory=list)
     expected_process_id_safe: Identifier | None = None
     actual_process_id_safe: Identifier | None = None
@@ -648,19 +682,22 @@ class ScenarioStepResult(ContractModel):
                 raise ValueError("unavailable or invalid timing cannot claim timeout")
             if self.timing_source is not ProcessTimingSource.UNAVAILABLE:
                 raise ValueError("unavailable timing cannot claim a timing source")
-        event_offsets = (
-            self.event_started_offset_ms,
-            self.event_completed_offset_ms,
-        )
-        if any(value is not None for value in event_offsets):
-            if (
-                any(value is None for value in event_offsets)
-                or self.event_timing_source is not ProcessTimingSource.WORKER_MONOTONIC
-                or self.event_completed_offset_ms < self.event_started_offset_ms
-            ):
-                raise ValueError("event offsets require ordered Worker monotonic facts")
-        elif self.event_timing_source is not ProcessTimingSource.UNAVAILABLE:
-            raise ValueError("missing event offsets cannot claim a timing source")
+        if self.event_pre_hook_offset_ms is None:
+            if self.event_pre_hook_source is not ProcessHookTimingSource.UNAVAILABLE:
+                raise ValueError("missing PRE hook offset cannot claim a source")
+        elif self.event_pre_hook_source is not ProcessHookTimingSource.WORKER_PRE_TOOL_CONTROL_HOOK:
+            raise ValueError("PRE hook offset requires the public PRE hook source")
+        if self.event_post_hook_offset_ms is None:
+            if self.event_post_hook_source is not ProcessHookTimingSource.UNAVAILABLE:
+                raise ValueError("missing POST hook offset cannot claim a source")
+        elif self.event_post_hook_source is not ProcessHookTimingSource.WORKER_POST_TOOL_PERSISTENCE_HOOK:
+            raise ValueError("POST hook offset requires the public POST hook source")
+        if (
+            self.event_pre_hook_offset_ms is not None
+            and self.event_post_hook_offset_ms is not None
+            and self.event_post_hook_offset_ms < self.event_pre_hook_offset_ms
+        ):
+            raise ValueError("POST hook offset cannot precede PRE hook offset")
         if self.timing_status in {
             ProcessTimingStatus.AVAILABLE,
             ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
@@ -674,26 +711,60 @@ class ScenarioStepResult(ContractModel):
             self.wait_remaining_budget_status,
             self.wait_timeout_budget_matched,
             self.wait_budget_timing_source,
+            self.hard_watchdog_fallback_allowed,
+            self.hard_watchdog_fallback_used,
         )
         if self.action is not ProcessAction.WAIT:
             if any(value is not None for value in wait_fields):
                 raise ValueError("wait budget facts are only valid for WAIT steps")
         elif self.wait_remaining_budget_status is None:
             raise ValueError("WAIT steps require an explicit remaining-budget status")
-        elif self.wait_remaining_budget_status is WaitRemainingBudgetStatus.AVAILABLE:
+        elif self.hard_watchdog_fallback_allowed is None or self.hard_watchdog_fallback_used is None:
+            raise ValueError("WAIT steps require explicit watchdog fallback facts")
+        elif self.wait_remaining_budget_status in {
+            WaitRemainingBudgetStatus.MATCHED,
+            WaitRemainingBudgetStatus.MISMATCHED,
+        }:
             if (
                 self.elapsed_before_wait_ms is None
                 or self.scenario_remaining_before_wait_seconds is None
                 or self.wait_timeout_budget_matched is None
-                or self.wait_budget_timing_source is not ProcessTimingSource.WORKER_MONOTONIC
+                or self.wait_budget_timing_source
+                is not ProcessWaitTimingSource.WORKER_PRE_TOOL_CONTROL_HOOKS
+                or self.hard_watchdog_fallback_used
+                or (
+                    self.wait_remaining_budget_status
+                    is WaitRemainingBudgetStatus.MATCHED
+                    and self.wait_timeout_budget_matched is not True
+                )
+                or (
+                    self.wait_remaining_budget_status
+                    is WaitRemainingBudgetStatus.MISMATCHED
+                    and self.wait_timeout_budget_matched is not False
+                )
             ):
-                raise ValueError("available WAIT budget requires Worker monotonic facts")
+                raise ValueError("exact WAIT budget requires PRE-to-PRE facts")
+        elif self.wait_remaining_budget_status is WaitRemainingBudgetStatus.FALLBACK_USED:
+            if (
+                self.elapsed_before_wait_ms is not None
+                or self.scenario_remaining_before_wait_seconds is not None
+                or self.wait_timeout_budget_matched is not None
+                or self.wait_budget_timing_source
+                is not ProcessWaitTimingSource.UNAVAILABLE
+                or self.hard_watchdog_fallback_allowed is not True
+                or self.hard_watchdog_fallback_used is not True
+            ):
+                raise ValueError("fallback WAIT budget cannot claim exact timing facts")
+        elif self.wait_remaining_budget_status is WaitRemainingBudgetStatus.NOT_APPLICABLE:
+            raise ValueError("WAIT steps cannot use a not-applicable budget status")
         else:
             if (
                 self.elapsed_before_wait_ms is not None
                 or self.scenario_remaining_before_wait_seconds is not None
                 or self.wait_timeout_budget_matched is not None
-                or self.wait_budget_timing_source is not ProcessTimingSource.UNAVAILABLE
+                or self.wait_budget_timing_source
+                is not ProcessWaitTimingSource.UNAVAILABLE
+                or self.hard_watchdog_fallback_used
             ):
                 raise ValueError("unavailable WAIT budget cannot claim timing facts")
         return self
@@ -800,14 +871,14 @@ class ProcessScenarioExecutionResult(ContractModel):
     scenario_observation_span_status: ProcessObservationSpanStatus = (
         ProcessObservationSpanStatus.UNAVAILABLE
     )
-    scenario_timing_source: ProcessTimingSource = ProcessTimingSource.UNAVAILABLE
+    scenario_observation_timing_source: ProcessTimingSource = (
+        ProcessTimingSource.UNAVAILABLE
+    )
     scenario_observation_started_at: UtcDatetime | None = None
     scenario_observation_completed_at: UtcDatetime | None = None
     scenario_observation_span_ms: NonNegativeInt | None = None
-    scenario_monotonic_timing_status: ProcessObservationSpanStatus = (
-        ProcessObservationSpanStatus.UNAVAILABLE
-    )
-    scenario_monotonic_duration_ms: NonNegativeInt | None = None
+    scenario_hook_span_status: ProcessHookSpanStatus = ProcessHookSpanStatus.UNAVAILABLE
+    scenario_pre_to_post_hook_span_ms: NonNegativeInt | None = None
     hard_timeout_source: ProcessHardTimeoutSource = ProcessHardTimeoutSource.UNAVAILABLE
     hard_timeout_seconds: PositiveInt | None = None
     hard_timeout_triggered: StrictBool = False
@@ -817,11 +888,14 @@ class ProcessScenarioExecutionResult(ContractModel):
     wait_remaining_budget_status: WaitRemainingBudgetStatus = (
         WaitRemainingBudgetStatus.NOT_APPLICABLE
     )
+    process_start_pre_hook_available: StrictBool = False
+    wait_pre_hook_available: StrictBool | None = None
     elapsed_before_wait_ms: NonNegativeInt | None = None
     scenario_remaining_before_wait_seconds: NonNegativeSeconds | None = None
     wait_timeout_budget_matched: StrictBool | None = None
-    wait_budget_timing_source: ProcessTimingSource | None = None
-    wait_budget_hard_watchdog_fallback: StrictBool = False
+    wait_budget_timing_source: ProcessWaitTimingSource | None = None
+    hard_watchdog_fallback_allowed: StrictBool = False
+    hard_watchdog_fallback_used: StrictBool = False
     agent_close_required: StrictBool = False
     agent_close_observed: StrictBool = False
     worker_cleanup_result: ProcessCleanupResult | None = None
@@ -831,9 +905,9 @@ class ProcessScenarioExecutionResult(ContractModel):
     foreign_process_events: list[ProcessEventDiagnostic] = Field(default_factory=list)
     unconsumed_events: list[ProcessEventDiagnostic] = Field(default_factory=list)
     tool_duration_sum_ms: NonNegativeInt | None = None
-    # Deprecated compatibility alias.  New consumers must use
-    # ``scenario_observation_span_ms`` and its explicit source/status fields.
-    duration_ms: NonNegativeInt | None = None
+    # Deprecated compatibility alias.  It is only the persistence observation
+    # span; it is never a handler-completion or hard-timeout measurement.
+    duration_ms: NonNegativeInt | None = Field(default=None, deprecated=True)
     errors: list[ScenarioError] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -856,7 +930,7 @@ class ProcessScenarioExecutionResult(ContractModel):
                 self.scenario_observation_started_at is None
                 or self.scenario_observation_completed_at is None
                 or self.scenario_observation_span_ms is None
-                or self.scenario_timing_source
+                or self.scenario_observation_timing_source
                 is not ProcessTimingSource.PUBLIC_OBSERVATION_PERSISTENCE
             ):
                 raise ValueError("available observation span requires persistence facts")
@@ -879,16 +953,15 @@ class ProcessScenarioExecutionResult(ContractModel):
                 )
             ):
                 raise ValueError("unavailable observation span cannot claim timestamps")
-            if self.scenario_timing_source is not ProcessTimingSource.UNAVAILABLE:
+            if self.scenario_observation_timing_source is not ProcessTimingSource.UNAVAILABLE:
                 raise ValueError("unavailable observation span cannot claim a source")
         if self.duration_ms is not None and self.duration_ms != self.scenario_observation_span_ms:
             raise ValueError("legacy Process duration must match observation span")
-        monotonic_values = (self.scenario_monotonic_duration_ms,)
-        if self.scenario_monotonic_timing_status is ProcessObservationSpanStatus.AVAILABLE:
-            if self.scenario_monotonic_duration_ms is None:
-                raise ValueError("available monotonic timing requires a duration")
-        elif any(value is not None for value in monotonic_values):
-            raise ValueError("unavailable monotonic timing cannot claim a duration")
+        if self.scenario_hook_span_status is ProcessHookSpanStatus.AVAILABLE:
+            if self.scenario_pre_to_post_hook_span_ms is None:
+                raise ValueError("available hook span requires a duration")
+        elif self.scenario_pre_to_post_hook_span_ms is not None:
+            raise ValueError("unavailable hook span cannot claim a duration")
         if self.hard_timeout_source is ProcessHardTimeoutSource.UNAVAILABLE:
             if self.hard_timeout_seconds is not None:
                 raise ValueError("unavailable hard timeout cannot claim a budget")
@@ -908,17 +981,65 @@ class ProcessScenarioExecutionResult(ContractModel):
             self.wait_timeout_budget_matched,
             self.wait_budget_timing_source,
         )
-        if self.wait_remaining_budget_status is WaitRemainingBudgetStatus.AVAILABLE:
+        if self.wait_remaining_budget_status is WaitRemainingBudgetStatus.NOT_APPLICABLE:
+            if self.wait_pre_hook_available is not None:
+                raise ValueError("not-applicable WAIT budget cannot claim a WAIT PRE fact")
+        elif self.wait_pre_hook_available is None:
+            raise ValueError("Process results require an explicit WAIT PRE fact")
+        if self.wait_remaining_budget_status in {
+            WaitRemainingBudgetStatus.MATCHED,
+            WaitRemainingBudgetStatus.MISMATCHED,
+        } and (
+            not self.process_start_pre_hook_available
+            or self.wait_pre_hook_available is not True
+        ):
+            raise ValueError("exact WAIT budget requires both PRE facts")
+        if self.wait_remaining_budget_status in {
+            WaitRemainingBudgetStatus.MATCHED,
+            WaitRemainingBudgetStatus.MISMATCHED,
+        }:
             if (
                 self.elapsed_before_wait_ms is None
                 or self.scenario_remaining_before_wait_seconds is None
                 or self.wait_timeout_budget_matched is None
                 or self.wait_budget_timing_source
-                is not ProcessTimingSource.WORKER_MONOTONIC
+                is not ProcessWaitTimingSource.WORKER_PRE_TOOL_CONTROL_HOOKS
+                or self.hard_watchdog_fallback_used
+                or (
+                    self.wait_remaining_budget_status
+                    is WaitRemainingBudgetStatus.MATCHED
+                    and self.wait_timeout_budget_matched is not True
+                )
+                or (
+                    self.wait_remaining_budget_status
+                    is WaitRemainingBudgetStatus.MISMATCHED
+                    and self.wait_timeout_budget_matched is not False
+                )
             ):
-                raise ValueError("available aggregate WAIT budget requires monotonic facts")
+                raise ValueError("exact aggregate WAIT budget requires PRE-to-PRE facts")
+        elif self.wait_remaining_budget_status is WaitRemainingBudgetStatus.FALLBACK_USED:
+            if (
+                any(value is not None for value in wait_fields[:-1])
+                or self.wait_budget_timing_source
+                is not ProcessWaitTimingSource.UNAVAILABLE
+                or self.wait_timeout_budget_matched is not None
+                or self.hard_watchdog_fallback_allowed is not True
+                or self.hard_watchdog_fallback_used is not True
+            ):
+                raise ValueError("fallback aggregate WAIT budget cannot claim exact facts")
         elif any(value is not None for value in wait_fields):
-            raise ValueError("unavailable WAIT budget cannot claim timing facts")
+            if (
+                self.wait_remaining_budget_status
+                is not WaitRemainingBudgetStatus.UNAVAILABLE
+                or self.wait_budget_timing_source
+                is not ProcessWaitTimingSource.UNAVAILABLE
+                or self.wait_timeout_budget_matched is not None
+                or self.hard_watchdog_fallback_used
+            ):
+                raise ValueError("unavailable WAIT budget cannot claim timing facts")
+        elif self.wait_remaining_budget_status is WaitRemainingBudgetStatus.NOT_APPLICABLE:
+            if self.hard_watchdog_fallback_allowed or self.hard_watchdog_fallback_used:
+                raise ValueError("not-applicable WAIT budget cannot claim fallback facts")
         return self
 
 
@@ -949,6 +1070,8 @@ __all__ = (
     "ProcessScenarioExecutionResult",
     "ProcessScenarioPlan",
     "ProcessHardTimeoutSource",
+    "ProcessHookSpanStatus",
+    "ProcessHookTimingSource",
     "ProcessObservationSpanStatus",
     "ProcessSendInputStep",
     "ProcessStartStep",
@@ -957,6 +1080,7 @@ __all__ = (
     "ProcessStepBase",
     "ProcessTimingSource",
     "ProcessTimingStatus",
+    "ProcessWaitTimingSource",
     "ProcessWaitStep",
     "ScenarioArtifactObservation",
     "ScenarioCheckpoint",

@@ -24,12 +24,16 @@ UTF-8 byte length. File observations remain outside the Process event sequence.
 Required Process Step timing is explicitly classified as available,
 duration-only, unavailable, or invalid. Missing/invalid required timing fails
 the Process gate; optional timing is not evaluable. Timeout uses the strict
-`duration_ms > timeout_seconds * 1000` rule, and `wait` validates both its real
-Tool Call timeout and the remaining Scenario budget. The Scenario exposes a
-separate persistence observation span (`scenario_observation_span_*`) and a
-Worker case watchdog; a duration-only Step projection is never presented as
-an exact Scenario boundary. Per-call monotonic timing is explicit when
-available and otherwise remains unavailable.
+`duration_ms > timeout_seconds * 1000` rule. PRE is the public control hook
+before Tool dispatch; POST is the public hook after Observation-batch
+persistence, not exact handler completion. The Scenario exposes a separate
+persistence observation span (`scenario_observation_span_*`) and a conservative
+PRE-to-POST hook span. WAIT remaining budget uses only Process-start PRE to
+WAIT PRE with an explicit fallback contract; `tool_duration_sum_ms` and
+persistence timestamps never substitute for it. The observation span is
+diagnostic when unavailable, while an exceeded available span remains a
+separate fact. Only a required Process Scenario can tighten the Worker
+watchdog; Toolchain, optional Process, and P0–P5 cases keep the Trial timeout.
 
 Process status expectations are capability-driven from the public
 `ProcessStatus` enum. The current Subject exposes `starting`, `running`,
@@ -45,8 +49,9 @@ events are preserved as safe structured diagnostics and fail the strict
 Process gate without overwriting facts from later correctly matched events.
 The observation span is projected from persisted UTC timestamps between the
 first and last matched foreground Process observations; the sum of individual
-Tool durations is diagnostic only. The hard timeout is enforced by the Worker
-case watchdog and is separate from the observation span and cleanup timing.
+Tool durations is diagnostic only. A required Process Scenario may use the
+Worker Process watchdog; otherwise the existing Trial watchdog remains in
+force. Both are separate from the observation span and cleanup timing.
 Relative Process event offsets come from the public PRE/POST Tool hooks; host
 specific absolute monotonic values are not serialized.
 The default Process prompts state exact commands and public

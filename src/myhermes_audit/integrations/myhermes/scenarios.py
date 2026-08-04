@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,6 +23,8 @@ from myhermes_audit.contracts import (
     ProcessAction,
     ProcessCleanupResult,
     ProcessHardTimeoutSource,
+    ProcessHookSpanStatus,
+    ProcessHookTimingSource,
     ProcessEventDiagnostic,
     ProcessObservationSpanStatus,
     ProcessInputObservation,
@@ -29,6 +32,7 @@ from myhermes_audit.contracts import (
     ProcessOutputCheckpoint,
     ProcessTimingStatus,
     ProcessTimingSource,
+    ProcessWaitTimingSource,
     ProcessAssertStatusStep,
     ProcessCloseStep,
     ProcessInterruptStep,
@@ -60,6 +64,19 @@ from myhermes_audit.security import redact_text
 _MAX_PROCESS_LOG_BYTES = 256 * 1024
 _MAX_TOOLCHAIN_ARTIFACT_BYTES = 256 * 1024
 _TRUNCATION_MARKER = "\n...[truncated by my-hermes-audit]...\n"
+_WAIT_BUDGET_EPSILON_SECONDS = 0.001
+
+
+def _budget_at_most(value: object, budget: float) -> bool:
+    """Compare bounded WAIT seconds with one documented float tolerance."""
+
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) >= 0
+        and float(value) <= budget + _WAIT_BUDGET_EPSILON_SECONDS
+    )
 
 
 @dataclass(frozen=True)
@@ -770,10 +787,12 @@ def build_scenario_results(
     observations: ObservationBundle,
     turns,
     cleanup_reports: Sequence[Mapping[str, object]],
-    process_monotonic_boundaries: Mapping[str, tuple[int, int]] | None = None,
+    process_hook_boundaries: Mapping[
+        str, tuple[int | None, int | None]
+    ] | None = None,
     sensitive_values: Sequence[str] = (),
 ) -> tuple[list[ScenarioExecutionResult], list[ScenarioError], list[Path]]:
-    process_monotonic_boundaries = process_monotonic_boundaries or {}
+    process_hook_boundaries = process_hook_boundaries or {}
     events = _tool_events(responses, observations)
     process_plans = [
         item for item in request.scenarios
@@ -974,25 +993,38 @@ def build_scenario_results(
         alignment = _align_process_events(plan, process_events)
         matched_events = alignment.matched_events
         matched_indices = alignment.matched_indices
-        matched_monotonic_bounds: list[tuple[int, int] | None] = []
+        matched_hook_boundaries: list[tuple[int | None, int | None] | None] = []
         for event in matched_events:
             tool_call_id = event.get("tool_call_id") if event else None
             bounds = (
-                process_monotonic_boundaries.get(tool_call_id)
+                process_hook_boundaries.get(tool_call_id)
                 if isinstance(tool_call_id, str)
                 else None
             )
-            matched_monotonic_bounds.append(bounds)
-        all_matched_monotonic = (
-            bool(matched_events)
-            and all(event is not None for event in matched_events)
-            and all(bounds is not None for bounds in matched_monotonic_bounds)
+            matched_hook_boundaries.append(bounds)
+        start_step_index = next(
+            (
+                index
+                for index, candidate in enumerate(plan.steps)
+                if candidate.action is ProcessAction.START
+            ),
+            None,
         )
-        monotonic_scenario_started_ns = (
-            matched_monotonic_bounds[0][0]
-            if all_matched_monotonic and matched_monotonic_bounds[0] is not None
+        process_start_pre_ns = (
+            matched_hook_boundaries[start_step_index][0]
+            if start_step_index is not None
+            and start_step_index < len(matched_hook_boundaries)
+            and matched_hook_boundaries[start_step_index] is not None
             else None
         )
+        hook_pre_origin_ns = process_start_pre_ns
+        if hook_pre_origin_ns is None:
+            pre_values = [
+                bounds[0]
+                for bounds in matched_hook_boundaries
+                if bounds is not None and bounds[0] is not None
+            ]
+            hook_pre_origin_ns = min(pre_values) if pre_values else None
         start_process_id: str | None = None
         safe_process_id: str | None = None
         declared_command: str | None = None
@@ -1022,15 +1054,24 @@ def build_scenario_results(
             item.runtime_status in {"timeout", "timed_out"}
             for item in turns
         )
+        process_watchdog_enabled = plan.required
+        hard_timeout_source = (
+            ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
+            if process_watchdog_enabled
+            else ProcessHardTimeoutSource.TRIAL_WATCHDOG
+        )
+        hard_timeout_seconds = request.timeout_seconds
         wait_remaining_budget_status = WaitRemainingBudgetStatus.NOT_APPLICABLE
         wait_elapsed_before_ms: int | None = None
         wait_remaining_seconds: float | int | None = None
         wait_timeout_budget_matched: bool | None = None
-        wait_budget_timing_source: ProcessTimingSource | None = None
+        wait_budget_timing_source: ProcessWaitTimingSource | None = None
+        hard_watchdog_fallback_allowed = False
+        hard_watchdog_fallback_used = False
         for step_index, step in enumerate(plan.steps):
             event = matched_events[step_index]
             matched_index = matched_indices[step_index]
-            monotonic_bounds = matched_monotonic_bounds[step_index]
+            hook_boundaries = matched_hook_boundaries[step_index]
             result_payload = _event_result(event)
             arguments = _event_arguments(event)
             actual_action = result_payload.get("action") or arguments.get("action")
@@ -1194,45 +1235,83 @@ def build_scenario_results(
                 if duration_ms is None
                 else duration_ms > step.timeout_seconds * 1000
             )
+            step_wait_status: WaitRemainingBudgetStatus | None = None
+            step_wait_elapsed_ms: int | None = None
+            step_wait_remaining_seconds: float | None = None
+            step_wait_timeout_matched: bool | None = None
+            step_wait_timing_source: ProcessWaitTimingSource | None = (
+                ProcessWaitTimingSource.UNAVAILABLE
+            )
+            step_fallback_allowed: bool | None = None
+            step_fallback_used: bool | None = None
             if step.action is ProcessAction.WAIT:
                 wait_timeout = arguments.get("timeout")
-                wait_ok = (
-                    isinstance(wait_timeout, (int, float))
-                    and not isinstance(wait_timeout, bool)
-                    and wait_timeout >= 0
-                    and wait_timeout <= step.timeout_seconds
-                    and step.timeout_seconds <= step.maximum_wait_seconds
-                    and wait_timeout <= step.maximum_wait_seconds
-                    and wait_timeout <= plan.timeout_seconds
-                )
+                step_fallback_allowed = step.allow_hard_watchdog_fallback
                 if (
-                    monotonic_scenario_started_ns is not None
-                    and monotonic_bounds is not None
-                    and monotonic_bounds[0] >= monotonic_scenario_started_ns
+                    process_start_pre_ns is not None
+                    and hook_boundaries is not None
+                    and hook_boundaries[0] is not None
+                    and hook_boundaries[0] >= process_start_pre_ns
                 ):
-                    wait_elapsed_before_ms = round(
-                        (monotonic_bounds[0] - monotonic_scenario_started_ns)
-                        / 1_000_000
+                    elapsed_before_wait_seconds = (
+                        hook_boundaries[0] - process_start_pre_ns
+                    ) / 1_000_000_000
+                    step_wait_elapsed_ms = round(
+                        elapsed_before_wait_seconds * 1000
                     )
-                    wait_remaining_seconds = max(
-                        0,
-                        plan.timeout_seconds - wait_elapsed_before_ms / 1000,
+                    step_wait_remaining_seconds = max(
+                        0.0,
+                        float(plan.timeout_seconds)
+                        - elapsed_before_wait_seconds,
                     )
-                    wait_remaining_budget_status = WaitRemainingBudgetStatus.AVAILABLE
-                    wait_budget_timing_source = ProcessTimingSource.WORKER_MONOTONIC
-                    wait_timeout_budget_matched = bool(
-                        wait_ok
-                        and isinstance(wait_timeout, (int, float))
-                        and not isinstance(wait_timeout, bool)
-                        and wait_timeout <= wait_remaining_seconds
+                    static_wait_ok = (
+                        _budget_at_most(wait_timeout, float(step.timeout_seconds))
+                        and _budget_at_most(
+                            wait_timeout,
+                            float(step.maximum_wait_seconds),
+                        )
+                        and _budget_at_most(
+                            wait_timeout,
+                            float(plan.timeout_seconds),
+                        )
                     )
-                    wait_ok = wait_ok and wait_timeout_budget_matched
+                    step_wait_timeout_matched = bool(
+                        static_wait_ok
+                        and _budget_at_most(
+                            wait_timeout,
+                            step_wait_remaining_seconds,
+                        )
+                    )
+                    step_wait_status = (
+                        WaitRemainingBudgetStatus.MATCHED
+                        if step_wait_timeout_matched
+                        else WaitRemainingBudgetStatus.MISMATCHED
+                    )
+                    step_wait_timing_source = (
+                        ProcessWaitTimingSource.WORKER_PRE_TOOL_CONTROL_HOOKS
+                    )
+                elif (
+                    step_fallback_allowed
+                    and hard_timeout_source
+                    is ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
+                    and not worker_watchdog_timed_out
+                ):
+                    step_wait_status = WaitRemainingBudgetStatus.FALLBACK_USED
+                    step_fallback_used = True
                 else:
-                    wait_remaining_budget_status = WaitRemainingBudgetStatus.UNAVAILABLE
-                    wait_elapsed_before_ms = None
-                    wait_remaining_seconds = None
-                    wait_timeout_budget_matched = None
-                    wait_budget_timing_source = ProcessTimingSource.UNAVAILABLE
+                    step_wait_status = WaitRemainingBudgetStatus.UNAVAILABLE
+                    step_fallback_used = False
+                wait_elapsed_before_ms = step_wait_elapsed_ms
+                wait_remaining_seconds = step_wait_remaining_seconds
+                wait_timeout_budget_matched = step_wait_timeout_matched
+                wait_budget_timing_source = step_wait_timing_source
+                wait_remaining_budget_status = step_wait_status
+                hard_watchdog_fallback_allowed = bool(step_fallback_allowed)
+                hard_watchdog_fallback_used = bool(step_fallback_used)
+                wait_ok = step_wait_status in {
+                    WaitRemainingBudgetStatus.MATCHED,
+                    WaitRemainingBudgetStatus.FALLBACK_USED,
+                }
             else:
                 wait_ok = True
             if step.action is ProcessAction.READ_INCREMENTAL:
@@ -1282,6 +1361,16 @@ def build_scenario_results(
                     step_error_type = "process_step_timing_invalid"
                 elif timed_out is True:
                     step_error_type = "process_step_timeout"
+            if (
+                event is not None
+                and not passed
+                and step.required
+                and step.action is ProcessAction.WAIT
+            ):
+                if step_wait_status is WaitRemainingBudgetStatus.MISMATCHED:
+                    step_error_type = "process_wait_remaining_budget_mismatch"
+                elif step_wait_status is WaitRemainingBudgetStatus.UNAVAILABLE:
+                    step_error_type = "process_wait_remaining_budget_unavailable"
             if event is not None and step.action is ProcessAction.READ_INCREMENTAL:
                 if not read.cursor_reference_matched:
                     step_error_type = "process_cursor_reference_error"
@@ -1302,29 +1391,41 @@ def build_scenario_results(
                 timing_status=timing_status,
                 timing_source=timing_source,
                 timed_out=timed_out,
-                event_started_offset_ms=(
+                event_pre_hook_offset_ms=(
                     None
-                    if monotonic_scenario_started_ns is None
-                    or monotonic_bounds is None
+                    if hook_pre_origin_ns is None
+                    or hook_boundaries is None
+                    or hook_boundaries[0] is None
+                    or hook_boundaries[0] < hook_pre_origin_ns
                     else round(
-                        (monotonic_bounds[0] - monotonic_scenario_started_ns)
-                        / 1_000_000
+                        (hook_boundaries[0] - hook_pre_origin_ns) / 1_000_000
                     )
                 ),
-                event_completed_offset_ms=(
+                event_post_hook_offset_ms=(
                     None
-                    if monotonic_scenario_started_ns is None
-                    or monotonic_bounds is None
+                    if hook_pre_origin_ns is None
+                    or hook_boundaries is None
+                    or hook_boundaries[1] is None
+                    or hook_boundaries[1] < hook_pre_origin_ns
                     else round(
-                        (monotonic_bounds[1] - monotonic_scenario_started_ns)
-                        / 1_000_000
+                        (hook_boundaries[1] - hook_pre_origin_ns) / 1_000_000
                     )
                 ),
-                event_timing_source=(
-                    ProcessTimingSource.WORKER_MONOTONIC
-                    if monotonic_scenario_started_ns is not None
-                    and monotonic_bounds is not None
-                    else ProcessTimingSource.UNAVAILABLE
+                event_pre_hook_source=(
+                    ProcessHookTimingSource.WORKER_PRE_TOOL_CONTROL_HOOK
+                    if hook_pre_origin_ns is not None
+                    and hook_boundaries is not None
+                    and hook_boundaries[0] is not None
+                    and hook_boundaries[0] >= hook_pre_origin_ns
+                    else ProcessHookTimingSource.UNAVAILABLE
+                ),
+                event_post_hook_source=(
+                    ProcessHookTimingSource.WORKER_POST_TOOL_PERSISTENCE_HOOK
+                    if hook_pre_origin_ns is not None
+                    and hook_boundaries is not None
+                    and hook_boundaries[1] is not None
+                    and hook_boundaries[1] >= hook_pre_origin_ns
+                    else ProcessHookTimingSource.UNAVAILABLE
                 ),
                 elapsed_before_wait_ms=(
                     wait_elapsed_before_ms if step.action is ProcessAction.WAIT else None
@@ -1333,13 +1434,21 @@ def build_scenario_results(
                     wait_remaining_seconds if step.action is ProcessAction.WAIT else None
                 ),
                 wait_remaining_budget_status=(
-                    wait_remaining_budget_status if step.action is ProcessAction.WAIT else None
+                    step_wait_status if step.action is ProcessAction.WAIT else None
                 ),
                 wait_timeout_budget_matched=(
-                    wait_timeout_budget_matched if step.action is ProcessAction.WAIT else None
+                    step_wait_timeout_matched if step.action is ProcessAction.WAIT else None
                 ),
                 wait_budget_timing_source=(
-                    wait_budget_timing_source if step.action is ProcessAction.WAIT else None
+                    step_wait_timing_source if step.action is ProcessAction.WAIT else None
+                ),
+                hard_watchdog_fallback_allowed=(
+                    step_fallback_allowed if step.action is ProcessAction.WAIT else None
+                ),
+                hard_watchdog_fallback_used=(
+                    bool(step_fallback_used)
+                    if step.action is ProcessAction.WAIT
+                    else None
                 ),
                 observation_refs=[_safe_id(event.get("tool_call_id"))] if event else [],
                 expected_process_id_safe=safe_process_id,
@@ -1475,73 +1584,120 @@ def build_scenario_results(
             observation_span_status = ProcessObservationSpanStatus.AVAILABLE
         elif matched_event_count > 0:
             observation_span_status = ProcessObservationSpanStatus.INVALID
-        scenario_timing_source = (
+        scenario_observation_timing_source = (
             ProcessTimingSource.PUBLIC_OBSERVATION_PERSISTENCE
             if observation_span_status is ProcessObservationSpanStatus.AVAILABLE
             else ProcessTimingSource.UNAVAILABLE
         )
-        monotonic_scenario_started_ns = None
-        monotonic_scenario_completed_ns = None
-        monotonic_scenario_duration_ms = None
-        monotonic_timing_status = ProcessObservationSpanStatus.UNAVAILABLE
-        if all_matched_monotonic:
-            monotonic_bounds = [
-                bounds
-                for bounds in matched_monotonic_bounds
-                if bounds is not None
-            ]
-            if monotonic_bounds and all(
-                current[0] >= previous[0]
-                and current[1] >= previous[1]
-                for previous, current in zip(
-                    monotonic_bounds,
-                    monotonic_bounds[1:],
-                    strict=False,
+        pre_hook_values = [
+            bounds[0]
+            for bounds in matched_hook_boundaries
+            if bounds is not None and bounds[0] is not None
+        ]
+        post_hook_values = [
+            bounds[1]
+            for bounds in matched_hook_boundaries
+            if bounds is not None and bounds[1] is not None
+        ]
+        scenario_hook_span_status = ProcessHookSpanStatus.UNAVAILABLE
+        scenario_pre_to_post_hook_span_ms = None
+        if pre_hook_values and post_hook_values:
+            first_pre_hook_ns = min(pre_hook_values)
+            last_post_hook_ns = max(post_hook_values)
+            if last_post_hook_ns >= first_pre_hook_ns:
+                scenario_hook_span_status = ProcessHookSpanStatus.AVAILABLE
+                scenario_pre_to_post_hook_span_ms = round(
+                    (last_post_hook_ns - first_pre_hook_ns) / 1_000_000
                 )
-            ):
-                monotonic_scenario_started_ns = monotonic_bounds[0][0]
-                monotonic_scenario_completed_ns = monotonic_bounds[-1][1]
-                if monotonic_scenario_completed_ns >= monotonic_scenario_started_ns:
-                    monotonic_scenario_duration_ms = round(
-                        (
-                            monotonic_scenario_completed_ns
-                            - monotonic_scenario_started_ns
-                        )
-                        / 1_000_000
-                    )
-                    monotonic_timing_status = ProcessObservationSpanStatus.AVAILABLE
-        effective_hard_timeout_seconds = min(
-            request.timeout_seconds,
-            plan.timeout_seconds,
-        )
+            else:
+                scenario_hook_span_status = ProcessHookSpanStatus.INVALID
+        effective_hard_timeout_seconds = hard_timeout_seconds
         scenario_observation_span_exceeded = (
             None
             if observation_span_ms is None
-            else observation_span_ms > effective_hard_timeout_seconds * 1000
+            else observation_span_ms > hard_timeout_seconds * 1000
         )
         hard_timeout_triggered = worker_watchdog_timed_out
-        scenario_watchdog_timed_out = worker_watchdog_timed_out
+        scenario_watchdog_timed_out = (
+            worker_watchdog_timed_out and process_watchdog_enabled
+        )
+        trial_watchdog_timed_out = (
+            worker_watchdog_timed_out and not process_watchdog_enabled
+        )
         wait_steps = [
             item for item in step_results if item.action is ProcessAction.WAIT
         ]
-        if wait_steps and all(
-            item.wait_remaining_budget_status is WaitRemainingBudgetStatus.AVAILABLE
-            for item in wait_steps
-        ):
-            wait_remaining_budget_status = WaitRemainingBudgetStatus.AVAILABLE
-            wait_budget_timing_source = ProcessTimingSource.WORKER_MONOTONIC
-            wait_timeout_budget_matched = all(
-                item.wait_timeout_budget_matched is True for item in wait_steps
-            )
-            wait_budget_hard_watchdog_fallback = False
+        if not wait_steps:
+            wait_remaining_budget_status = WaitRemainingBudgetStatus.NOT_APPLICABLE
+            process_start_pre_hook_available = process_start_pre_ns is not None
+            wait_pre_hook_available = None
+            wait_elapsed_before_ms = None
+            wait_remaining_seconds = None
+            wait_timeout_budget_matched = None
+            wait_budget_timing_source = None
+            hard_watchdog_fallback_allowed = False
+            hard_watchdog_fallback_used = False
         else:
-            if wait_steps:
+            process_start_pre_hook_available = process_start_pre_ns is not None
+            wait_pre_hook_available = all(
+                item.event_pre_hook_offset_ms is not None
+                for item in wait_steps
+            )
+            wait_statuses = [item.wait_remaining_budget_status for item in wait_steps]
+            exact_wait_steps = [
+                item
+                for item in wait_steps
+                if item.wait_remaining_budget_status
+                in {
+                    WaitRemainingBudgetStatus.MATCHED,
+                    WaitRemainingBudgetStatus.MISMATCHED,
+                }
+            ]
+            representative = exact_wait_steps[0] if exact_wait_steps else None
+            hard_watchdog_fallback_allowed = any(
+                item.hard_watchdog_fallback_allowed is True
+                for item in wait_steps
+            )
+            hard_watchdog_fallback_used = any(
+                item.hard_watchdog_fallback_used is True
+                for item in wait_steps
+            )
+            if any(
+                status is WaitRemainingBudgetStatus.MISMATCHED
+                for status in wait_statuses
+            ):
+                wait_remaining_budget_status = WaitRemainingBudgetStatus.MISMATCHED
+            elif any(
+                status is WaitRemainingBudgetStatus.FALLBACK_USED
+                for status in wait_statuses
+            ):
+                wait_remaining_budget_status = WaitRemainingBudgetStatus.FALLBACK_USED
+            elif all(
+                status is WaitRemainingBudgetStatus.MATCHED
+                for status in wait_statuses
+            ):
+                wait_remaining_budget_status = WaitRemainingBudgetStatus.MATCHED
+            else:
                 wait_remaining_budget_status = WaitRemainingBudgetStatus.UNAVAILABLE
+            if representative is None:
                 wait_elapsed_before_ms = None
                 wait_remaining_seconds = None
                 wait_timeout_budget_matched = None
-                wait_budget_timing_source = ProcessTimingSource.UNAVAILABLE
-            wait_budget_hard_watchdog_fallback = bool(wait_steps)
+                wait_budget_timing_source = ProcessWaitTimingSource.UNAVAILABLE
+            else:
+                wait_elapsed_before_ms = representative.elapsed_before_wait_ms
+                wait_remaining_seconds = representative.scenario_remaining_before_wait_seconds
+                wait_timeout_budget_matched = (
+                    all(item.wait_timeout_budget_matched is True for item in wait_steps)
+                    if wait_remaining_budget_status is WaitRemainingBudgetStatus.MATCHED
+                    else False
+                )
+                wait_budget_timing_source = ProcessWaitTimingSource.WORKER_PRE_TOOL_CONTROL_HOOKS
+            if wait_remaining_budget_status is WaitRemainingBudgetStatus.FALLBACK_USED:
+                wait_elapsed_before_ms = None
+                wait_remaining_seconds = None
+                wait_timeout_budget_matched = None
+                wait_budget_timing_source = ProcessWaitTimingSource.UNAVAILABLE
         scenario_duration_ms = observation_span_ms
         alignment_diagnostics = (
             alignment.unexpected_events
@@ -1566,13 +1722,26 @@ def build_scenario_results(
                 "process_step_timing_unavailable",
                 "process_step_timing_invalid",
                 "process_step_timeout",
+                "process_wait_remaining_budget_unavailable",
+                "process_wait_remaining_budget_mismatch",
             }:
                 scenario_errors.append(step_result.error)
         if hard_timeout_triggered:
             scenario_errors.append(
                 _scenario_error(
-                    "process_scenario_timeout",
+                    (
+                        "process_scenario_watchdog_timeout"
+                        if process_watchdog_enabled
+                        else "trial_watchdog_timeout"
+                    ),
                     f"scenario={plan.scenario_id}; Worker case watchdog exceeded",
+                )
+            )
+        if observation_span_status is not ProcessObservationSpanStatus.AVAILABLE:
+            scenario_errors.append(
+                _scenario_error(
+                    "process_scenario_observation_span_unavailable",
+                    f"scenario={plan.scenario_id}; public observation persistence span was unavailable",
                 )
             )
         if scenario_observation_span_exceeded is True:
@@ -1589,8 +1758,7 @@ def build_scenario_results(
             and (not fixture_read_required or file_fixture_read_observed)
             and not alignment_diagnostics
             and not hard_timeout_triggered
-            and scenario_observation_span_status is ProcessObservationSpanStatus.AVAILABLE
-            and scenario_observation_span_exceeded is False
+            and scenario_observation_span_exceeded is not True
             and all(item.passed is True for item in checkpoint_results if item.required)
         ) else ScenarioStatus.FAILED
         if not scenario_errors and scenario_status is not ScenarioStatus.COMPLETED:
@@ -1623,24 +1791,27 @@ def build_scenario_results(
             status_transitions_valid=status_transitions_valid,
             scenario_timeout_seconds=plan.timeout_seconds,
             scenario_observation_span_status=observation_span_status,
-            scenario_timing_source=scenario_timing_source,
+            scenario_observation_timing_source=scenario_observation_timing_source,
             scenario_observation_started_at=observation_started_at,
             scenario_observation_completed_at=observation_completed_at,
             scenario_observation_span_ms=observation_span_ms,
-            scenario_monotonic_timing_status=monotonic_timing_status,
-            scenario_monotonic_duration_ms=monotonic_scenario_duration_ms,
-            hard_timeout_source=ProcessHardTimeoutSource.WORKER_CASE_WATCHDOG,
+            scenario_hook_span_status=scenario_hook_span_status,
+            scenario_pre_to_post_hook_span_ms=scenario_pre_to_post_hook_span_ms,
+            hard_timeout_source=hard_timeout_source,
             hard_timeout_seconds=effective_hard_timeout_seconds,
             hard_timeout_triggered=hard_timeout_triggered,
-            trial_watchdog_timed_out=False,
+            trial_watchdog_timed_out=trial_watchdog_timed_out,
             scenario_watchdog_timed_out=scenario_watchdog_timed_out,
             scenario_observation_span_exceeded=scenario_observation_span_exceeded,
             wait_remaining_budget_status=wait_remaining_budget_status,
+            process_start_pre_hook_available=process_start_pre_hook_available,
+            wait_pre_hook_available=wait_pre_hook_available,
             elapsed_before_wait_ms=wait_elapsed_before_ms,
             scenario_remaining_before_wait_seconds=wait_remaining_seconds,
             wait_timeout_budget_matched=wait_timeout_budget_matched,
             wait_budget_timing_source=wait_budget_timing_source,
-            wait_budget_hard_watchdog_fallback=wait_budget_hard_watchdog_fallback,
+            hard_watchdog_fallback_allowed=hard_watchdog_fallback_allowed,
+            hard_watchdog_fallback_used=hard_watchdog_fallback_used,
             agent_close_required=any(
                 item.action is ProcessAction.CLOSE and item.required
                 for item in plan.steps

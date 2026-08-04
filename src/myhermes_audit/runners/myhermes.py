@@ -920,25 +920,19 @@ class MyHermesTrialRunner:
             else configuration.memory_strategy
         )
         review_enabled = _is_background_review_case(case)
-        process_timeouts = [
-            item.timeout_seconds
+        required_process_scenarios = [
+            item
             for item in case.scenarios
             if item.kind is E2EScenarioKind.PROCESS_BACKGROUND and item.required
         ]
-        declared_scenario_timeouts = process_timeouts or [
-            item.timeout_seconds for item in case.scenarios
-        ]
-        # The parent Worker wait is the conservative hard watchdog.  A Case
-        # has at most one required Process Scenario, so its deadline is the
-        # minimum of the Trial budget and that declared scenario budget.
+        process_watchdog_enabled = len(required_process_scenarios) == 1
+        # Only the single required Process Scenario is allowed to tighten the
+        # parent Worker watchdog. Toolchain and optional Process scenarios do
+        # not change the existing Trial/execution timeout.
         scenario_timeout = (
-            min(timeout_seconds, min(declared_scenario_timeouts))
-            if process_timeouts
-            else (
-                min(timeout_seconds, max(declared_scenario_timeouts))
-                if declared_scenario_timeouts
-                else timeout_seconds
-            )
+            min(timeout_seconds, required_process_scenarios[0].timeout_seconds)
+            if process_watchdog_enabled
+            else timeout_seconds
         )
         paths = _worker_artifact_paths(
             sandbox,
@@ -1119,7 +1113,11 @@ class MyHermesTrialRunner:
                 result = _fallback_worker_result(
                     paths,
                     error_type="timeout",
-                    message="MyHermes worker exceeded the Trial timeout",
+                    message=(
+                        "MyHermes worker exceeded the required Process Scenario timeout"
+                        if process_watchdog_enabled
+                        else "MyHermes worker exceeded the Trial timeout"
+                    ),
                     duration_ms=duration_ms,
                     warnings=runtime_warnings,
                     memory_strategy=memory_strategy,
@@ -1135,7 +1133,12 @@ class MyHermesTrialRunner:
                         recovered_background_review_errors
                     ),
                     scenarios=case.scenarios,
-                    trial_watchdog_timed_out=request.timeout_seconds >= timeout_seconds,
+                    process_watchdog_enabled=process_watchdog_enabled,
+                    hard_timeout_seconds=request.timeout_seconds,
+                    trial_watchdog_timed_out=(
+                        not process_watchdog_enabled
+                        and request.timeout_seconds >= timeout_seconds
+                    ),
                 )
                 result, recovered_memory = _redact_memory_facts(
                     result,
@@ -1377,6 +1380,8 @@ class MyHermesTrialRunner:
                     recovered_background_review_errors
                 ),
                 scenarios=case.scenarios,
+                process_watchdog_enabled=process_watchdog_enabled,
+                hard_timeout_seconds=scenario_timeout,
             )
             result, recovered_memory = _redact_memory_facts(
                 result,
@@ -1432,6 +1437,8 @@ class MyHermesTrialRunner:
                         recovered_background_review_errors
                     ),
                     scenarios=case.scenarios,
+                    process_watchdog_enabled=process_watchdog_enabled,
+                    hard_timeout_seconds=scenario_timeout,
                 )
             return self._outcome_from_result(
                 result,
@@ -2928,6 +2935,8 @@ def _fallback_scenario_results(
     duration_ms: int,
     error_type: str,
     timed_out: bool,
+    process_watchdog_enabled: bool = False,
+    hard_timeout_seconds: int | None = None,
     trial_watchdog_timed_out: bool = False,
 ) -> tuple[list[object], list[ScenarioError]]:
     """Preserve declared P6.1 coverage when the Worker envelope is lost."""
@@ -2940,15 +2949,25 @@ def _fallback_scenario_results(
             message="Worker did not return a complete scenario observation",
         )
         if plan.kind is E2EScenarioKind.PROCESS_BACKGROUND:
+            hard_timeout_source = (
+                ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
+                if process_watchdog_enabled
+                else ProcessHardTimeoutSource.TRIAL_WATCHDOG
+            )
             result = ProcessScenarioExecutionResult(
                 scenario_id=plan.scenario_id,
                 status=ScenarioStatus.FAILED,
                 scenario_timeout_seconds=plan.timeout_seconds,
-                hard_timeout_source=ProcessHardTimeoutSource.WORKER_CASE_WATCHDOG,
-                hard_timeout_seconds=plan.timeout_seconds,
+                hard_timeout_source=hard_timeout_source,
+                hard_timeout_seconds=hard_timeout_seconds or plan.timeout_seconds,
                 hard_timeout_triggered=timed_out,
-                trial_watchdog_timed_out=trial_watchdog_timed_out,
-                scenario_watchdog_timed_out=timed_out,
+                trial_watchdog_timed_out=(
+                    trial_watchdog_timed_out
+                    or (timed_out and not process_watchdog_enabled)
+                ),
+                scenario_watchdog_timed_out=(
+                    timed_out and process_watchdog_enabled
+                ),
                 duration_ms=None,
                 errors=[error],
             )
@@ -2984,6 +3003,8 @@ def _fallback_worker_result(
         BackgroundReviewExecutionError
     ] = (),
     scenarios: Sequence[object] = (),
+    process_watchdog_enabled: bool = False,
+    hard_timeout_seconds: int | None = None,
     trial_watchdog_timed_out: bool = False,
 ) -> MyHermesWorkerResult:
     safe_error_type = error_type.replace("_", "-")
@@ -3018,6 +3039,8 @@ def _fallback_worker_result(
         duration_ms=duration_ms,
         error_type=error_type,
         timed_out=error_type == "timeout",
+        process_watchdog_enabled=process_watchdog_enabled,
+        hard_timeout_seconds=hard_timeout_seconds,
         trial_watchdog_timed_out=trial_watchdog_timed_out,
     )
     scenario_kinds = {item.kind.value for item in scenario_results}

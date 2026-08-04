@@ -325,23 +325,18 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                 "value",
                 getattr(scenario, "scenario_observation_span_status", None),
             ),
-            "scenario_timing_source": getattr(
-                getattr(scenario, "scenario_timing_source", None),
+            "scenario_observation_timing_source": getattr(
+                getattr(scenario, "scenario_observation_timing_source", None),
                 "value",
-                getattr(scenario, "scenario_timing_source", None),
+                getattr(scenario, "scenario_observation_timing_source", None),
             ),
-            "timing_source": getattr(
-                getattr(scenario, "scenario_timing_source", None),
+            "scenario_hook_span_status": getattr(
+                getattr(scenario, "scenario_hook_span_status", None),
                 "value",
-                getattr(scenario, "scenario_timing_source", None),
+                getattr(scenario, "scenario_hook_span_status", None),
             ),
-            "scenario_monotonic_timing_status": getattr(
-                getattr(scenario, "scenario_monotonic_timing_status", None),
-                "value",
-                getattr(scenario, "scenario_monotonic_timing_status", None),
-            ),
-            "scenario_monotonic_duration_ms": getattr(
-                scenario, "scenario_monotonic_duration_ms", None
+            "scenario_pre_to_post_hook_span_ms": getattr(
+                scenario, "scenario_pre_to_post_hook_span_ms", None
             ),
             "tool_duration_sum_ms": getattr(scenario, "tool_duration_sum_ms", None),
             "error_count": len(scenario.errors),
@@ -371,6 +366,12 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                 "value",
                 getattr(scenario, "wait_remaining_budget_status", None),
             ),
+            "process_start_pre_hook_available": getattr(
+                scenario, "process_start_pre_hook_available", None
+            ),
+            "wait_pre_hook_available": getattr(
+                scenario, "wait_pre_hook_available", None
+            ),
             "elapsed_before_wait_ms": getattr(scenario, "elapsed_before_wait_ms", None),
             "scenario_remaining_before_wait_seconds": getattr(
                 scenario, "scenario_remaining_before_wait_seconds", None
@@ -383,8 +384,11 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                 "value",
                 getattr(scenario, "wait_budget_timing_source", None),
             ),
-            "wait_budget_hard_watchdog_fallback": getattr(
-                scenario, "wait_budget_hard_watchdog_fallback", None
+            "hard_watchdog_fallback_allowed": getattr(
+                scenario, "hard_watchdog_fallback_allowed", None
+            ),
+            "hard_watchdog_fallback_used": getattr(
+                scenario, "hard_watchdog_fallback_used", None
             ),
             "event_alignment_passed": not any(
                 getattr(scenario, field_name, ())
@@ -487,16 +491,21 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                         getattr(step, "timing_source", None),
                     ),
                     "timed_out": step.timed_out,
-                    "event_started_offset_ms": getattr(
-                        step, "event_started_offset_ms", None
+                    "event_pre_hook_offset_ms": getattr(
+                        step, "event_pre_hook_offset_ms", None
                     ),
-                    "event_completed_offset_ms": getattr(
-                        step, "event_completed_offset_ms", None
+                    "event_post_hook_offset_ms": getattr(
+                        step, "event_post_hook_offset_ms", None
                     ),
-                    "event_timing_source": getattr(
-                        getattr(step, "event_timing_source", None),
+                    "event_pre_hook_source": getattr(
+                        getattr(step, "event_pre_hook_source", None),
                         "value",
-                        getattr(step, "event_timing_source", None),
+                        getattr(step, "event_pre_hook_source", None),
+                    ),
+                    "event_post_hook_source": getattr(
+                        getattr(step, "event_post_hook_source", None),
+                        "value",
+                        getattr(step, "event_post_hook_source", None),
                     ),
                     "elapsed_before_wait_ms": getattr(
                         step, "elapsed_before_wait_ms", None
@@ -516,6 +525,12 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                         getattr(step, "wait_budget_timing_source", None),
                         "value",
                         getattr(step, "wait_budget_timing_source", None),
+                    ),
+                    "hard_watchdog_fallback_allowed": getattr(
+                        step, "hard_watchdog_fallback_allowed", None
+                    ),
+                    "hard_watchdog_fallback_used": getattr(
+                        step, "hard_watchdog_fallback_used", None
                     ),
                     "expected_process_id_safe": step.expected_process_id_safe,
                     "actual_process_id_safe": step.actual_process_id_safe,

@@ -91,9 +91,12 @@ class WorkerTerminationRequested(Exception):
 class _ProcessMonotonicTracker:
     """Capture public PRE/POST Tool hook boundaries for Process observations.
 
-    The tracker records only monotonic nanoseconds keyed by the public Tool
-    call ID.  It never reads private AgentLoop state or persists command/input
-    content; the Scenario projection later keeps only aggregate boundaries.
+    PRE is the public control hook before dispatch. POST is the public hook
+    after the Observation batch is persisted. It is deliberately not treated
+    as exact handler completion. The tracker records only monotonic nanoseconds
+    keyed by the public Tool call ID. It never reads private AgentLoop state or
+    persists command/input content; the Scenario projection later keeps only
+    relative offsets and safe spans.
     """
 
     _TOOLS = frozenset({"terminal", "process"})
@@ -125,12 +128,21 @@ class _ProcessMonotonicTracker:
         if identity is not None:
             self._completed_ns[identity[1]] = time.monotonic_ns()
 
-    def boundaries(self) -> Mapping[str, tuple[int, int]]:
+    def boundaries(self) -> Mapping[str, tuple[int | None, int | None]]:
+        """Return independent PRE and POST offsets for each public call.
+
+        The absolute monotonic readings remain Worker-local.  A missing POST
+        must not erase an otherwise reliable PRE boundary used by WAIT's
+        PRE-to-PRE budget calculation.
+        """
+
+        call_ids = set(self._started_ns) | set(self._completed_ns)
         return {
-            call_id: (started, self._completed_ns[call_id])
-            for call_id, started in self._started_ns.items()
-            if call_id in self._completed_ns
-            and self._completed_ns[call_id] >= started
+            call_id: (
+                self._started_ns.get(call_id),
+                self._completed_ns.get(call_id),
+            )
+            for call_id in call_ids
         }
 
 
@@ -1024,7 +1036,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                 observations=observations,
                 turns=turns,
                 cleanup_reports=cleanup_reports,
-                process_monotonic_boundaries=process_monotonic_tracker.boundaries(),
+                process_hook_boundaries=process_monotonic_tracker.boundaries(),
                 sensitive_values=sensitive_values,
             )
             toolchain_results = [

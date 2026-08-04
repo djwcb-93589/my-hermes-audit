@@ -44,16 +44,23 @@ stable event error types are `process_unexpected_event`,
 `process_missing_expected_event`, `process_event_order_violation`,
 `process_foreign_process_event`, and `process_unconsumed_event`.
 
-Step duration gates use only public handler `duration_ms`. The observation-span
-gate uses persisted `created_at` timestamps under the explicit
-`public_observation_persistence` source; it is not an exact per-Tool boundary.
-The hard-timeout gate uses the Worker case watchdog. The Worker captures
-aggregate Process boundaries through the public PRE/POST Tool hooks. When
-those boundaries are unavailable, the WAIT gate may pass only through its
-explicit conservative watchdog fallback and never marks
-`wait_timeout_budget_matched` as true. `tool_duration_sum_ms` cannot make
-unavailable timing pass. Cleanup timing is owned by the Worker lifecycle and
-is not included in the foreground Scenario deadline.
+Step duration gates use only public handler `duration_ms`. PRE and POST hook
+sources are separate: PRE is the control boundary before dispatch, while POST
+is the public hook after Observation-batch persistence and is not exact handler
+completion. The observation-span gate uses persisted `created_at` timestamps
+under the explicit `public_observation_persistence` source; it is not an exact
+per-Tool boundary. Its unavailable state is diagnostic/`NOT_APPLICABLE`, not a
+Process hard-gate failure; an exceeded available span has its independent
+`process_scenario_observation_span_exceeded` error. The hard-timeout gate uses
+the required Process Scenario watchdog, or the existing Trial watchdog for an
+optional Process Scenario. WAIT exact timing uses only Process-start PRE to
+WAIT PRE and the three bounded timeout comparisons. When those boundaries are
+unavailable, the WAIT gate may pass only through the Step's explicit
+`allow_hard_watchdog_fallback: true` and an enabled, untriggered Process
+Scenario watchdog; fallback never marks `wait_timeout_budget_matched` as true.
+`tool_duration_sum_ms` cannot make unavailable timing pass. Cleanup timing is
+owned by the Worker lifecycle and is not included in the foreground Scenario
+deadline.
 
 Process status checkpoints and incremental output checkpoints are independent
 metrics. The input Case passes its waiting phase only when the public status is

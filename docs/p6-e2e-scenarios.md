@@ -104,26 +104,44 @@ remain available for diagnosis.
 
 Each Step uses the public Tool Observation `duration_ms`, which measures only
 the handler and is never treated as model-thinking or inter-call time. The
-Scenario separately projects an observation interval from persisted
+Worker's public `PRE_TOOL_CALL` hook is the control boundary before dispatch;
+the public `POST_TOOL_CALL` hook is emitted after the Tool Observation batch is
+persisted. POST therefore is not an exact handler-completion timestamp. Step
+projections keep independent `event_pre_hook_offset_ms` and
+`event_post_hook_offset_ms` fields with sources
+`worker_pre_tool_control_hook` and `worker_post_tool_persistence_hook`.
+`scenario_pre_to_post_hook_span_ms` is the conservative first-PRE to last-POST
+hook/persistence span, not a Tool wall-clock duration.
+
+The Scenario separately projects an observation interval from persisted
 `created_at` values as `scenario_observation_started_at`,
 `scenario_observation_completed_at`, and `scenario_observation_span_ms`, with
-`scenario_timing_source=public_observation_persistence`. These timestamps are
-persistence metadata and do not establish exact per-Tool boundaries. The
-Worker also registers the public PRE/POST Tool hooks and records aggregate
-monotonic boundaries for the declared `terminal`/`process` calls. WAIT
-remaining-budget facts use that Worker-monotonic source when every boundary is
-available; they otherwise remain explicitly unavailable rather than inferred
-from a duration sum.
-Only relative per-event offsets and the aggregate monotonic duration are
-serialized; host-specific absolute monotonic nanoseconds never leave the
-Worker.
+`scenario_observation_timing_source=public_observation_persistence`. These
+timestamps are persistence metadata and do not establish exact per-Tool
+boundaries. WAIT remaining-budget facts use only the Process start PRE and the
+current WAIT PRE from the same Worker monotonic clock; unrelated POST facts,
+later events, cleanup timing, persistence timestamps, and
+`tool_duration_sum_ms` are not substituted. A single documented millisecond
+tolerance is used for the three WAIT budget comparisons.
 
-The hard deadline is the effective Worker case watchdog
-(`hard_timeout_source=worker_case_watchdog`), which is conservative because it
-starts at Case execution and may include pre-Process setup. It is independent
-of the persistence observation span and exposes separate watchdog booleans.
-`tool_duration_sum_ms` is retained only as a diagnostic. Worker lifecycle
-cleanup timing remains outside this foreground observation span.
+If exact PRE-to-PRE timing is unavailable, a WAIT may use a conservative
+hard-watchdog fallback only when its `ProcessWaitStep` explicitly declares
+`allow_hard_watchdog_fallback: true`. The default is false, and fallback keeps
+`wait_timeout_budget_matched: null` with status `fallback_used`; it never
+pretends that exact remaining budget was verified. The persistence observation
+span is diagnostic: unavailable is `NOT_APPLICABLE` and does not alone block
+the Process gate, while `observation_span_exceeded` remains an independent
+failure fact.
+
+The hard deadline is either the required Process Scenario watchdog
+(`hard_timeout_source=worker_process_scenario_watchdog`) or the existing Trial
+watchdog (`hard_timeout_source=trial_watchdog`). Only one required
+`process_background` Scenario may tighten the parent Worker timeout. Toolchain
+and optional Process Scenarios retain the Trial budget. The watchdog is
+independent of all after-the-fact timing projections and exposes separate
+`trial_watchdog_timed_out` and `scenario_watchdog_timed_out` booleans.
+`tool_duration_sum_ms` remains diagnostic only. Worker lifecycle cleanup timing
+remains outside this foreground observation span.
 
 The official Process prompts provide the exact Case B/C commands and the
 public `log`, `poll`, and `kill(process_id, grace_seconds)` actions. Case A
