@@ -20,10 +20,14 @@ cases:
       message: >-
         Use the public terminal tool to start this bounded background Python
         command: python -u -c "import sys; print('P6-BEGIN', flush=True); print('P6-中文', flush=True); signal=sys.stdin.readline().strip(); print('P6-END' if signal == 'continue' else 'P6-INPUT-ERROR', flush=True)".
-        Use the returned process identity with the public process tool. Read
-        the initial output before sending the continue signal from the declared
-        fixture, read the final output from the previous cursor, wait for
-        completion, and report the observed markers only after Worker cleanup.
+        After terminal start, use the returned process identity with the public
+        process tool in exactly this order: one process action=log with cursor=0,
+        exactly one process action=submit using the declared fixture content
+        (never use write), a
+        second process action=log using the cursor returned by the first log,
+        process action=wait, and process action=poll for completed (the declared
+        assert_status step).
+        Report the observed markers only after Worker cleanup.
     execution:
       enabled_toolsets: [terminal]
     fixture:
@@ -124,16 +128,15 @@ cases:
     mode: single_turn
     input:
       message: >-
-        Start a bounded background Python task with the public terminal tool
-        that waits for one line on stdin and prints P6-INPUT-OK. Use the public
-        process tool to confirm that the background process remains running
-        after the new log contains P6-WAIT, then submit the exact content
-        returned by the file tool, wait for completed, and report only the
-        truthful result. First use the file tool with action read on
-        fixtures/process-input.txt. Then start the process, confirm status
-        running and the P6-WAIT output marker, submit the content actually
-        returned by that file read, read the result, wait for completed, and
-        verify the final status. Do not interpret P6-WAIT as a new Process
+        First use the file tool with action read on fixtures/process-input.txt.
+        Then use the public terminal tool with background=true to execute exactly
+        this command (without rewriting it): python -c "import sys; print('P6-WAIT', flush=True); line=sys.stdin.readline(); print('P6-INPUT-OK', flush=True)".
+        Use the returned process identity and call the public process tool with
+        process action=log and cursor=0 to observe P6-WAIT and status=running;
+        do not use poll as a replacement for this log step. Next submit the exact
+        content returned by the file read, wait for completed, use the previous
+        cursor for the final log, and report only the truthful result. Do not
+        interpret P6-WAIT as a new Process
         status, do not request waiting_for_input, do not read the fixture with
         cat, type, Get-Content, or any terminal command, and never include the
         input body in the report.
@@ -241,12 +244,14 @@ cases:
     mode: single_turn
     input:
       message: >-
-        Start a bounded background Python task with the public terminal tool
-        that prints P6-LONG and sleeps for ten seconds. Use the public process
-        tool to read its initial output, issue kill with a bounded grace period,
-        assert the killed status and let the Worker report session cleanup. Do
-        not call close after the process is terminal, do not use an OS kill
-        command, and do not claim completion from assistant text.
+        Use the public terminal tool with background=true to execute exactly this
+        command (without rewriting it): python -c "import time; print('P6-LONG', flush=True); time.sleep(10)".
+        Use the returned process identity and the public process tool with action=log
+        and cursor=0 to observe P6-LONG. Then use process action=kill with that
+        returned process_id and grace_seconds=2, followed by process action=poll
+        to verify killed status. Let the Worker report session
+        cleanup. Do not call close after the process is terminal, do not use an OS
+        kill command, and do not claim completion from assistant text.
     execution:
       enabled_toolsets: [terminal]
     fixture:

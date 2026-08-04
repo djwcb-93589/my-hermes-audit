@@ -10,6 +10,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
 from myhermes_audit.artifacts import atomic_write_text
@@ -20,6 +21,7 @@ from myhermes_audit.contracts import (
     IncrementalReadObservation,
     ProcessAction,
     ProcessCleanupResult,
+    ProcessEventDiagnostic,
     ProcessInputObservation,
     ProcessScenarioExecutionResult,
     ProcessOutputCheckpoint,
@@ -73,6 +75,19 @@ class _FixtureReadFacts:
     content_sha256: str | None = None
     content_char_length: int | None = None
     content_utf8_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class _ProcessEventAlignment:
+    """One-way binding of declared Process steps to public observations."""
+
+    matched_events: list[Mapping[str, object] | None]
+    matched_indices: list[int | None]
+    unexpected_events: list[ProcessEventDiagnostic]
+    missing_expected_events: list[ProcessEventDiagnostic]
+    event_order_violations: list[ProcessEventDiagnostic]
+    foreign_process_events: list[ProcessEventDiagnostic]
+    unconsumed_events: list[ProcessEventDiagnostic]
 
 
 def _safe_id(value: object) -> str:
@@ -318,8 +333,8 @@ def _event_timing(
     value = event.get("duration_ms")
     if type(value) is not int or value < 0:
         return None, ProcessTimingStatus.INVALID
-    # The public projection currently exposes a duration but no authoritative
-    # start/end pair.  Do not synthesize timestamps from an observation time.
+    if _event_bounds(event) is not None:
+        return value, ProcessTimingStatus.AVAILABLE
     return value, ProcessTimingStatus.AVAILABLE_DURATION_ONLY
 
 
@@ -369,6 +384,204 @@ def _event_matches_step(event: Mapping[str, object] | None, step) -> bool:
     else:
         return False
     return observed_action == expected_action
+
+
+def _safe_diagnostic_label(value: object) -> str | None:
+    """Return a bounded public label, hashing values outside the safe grammar."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if value.isascii() and len(value) <= 128 and value[0].isalnum() and all(
+        char.isalnum() or char in "._:-" for char in value
+    ):
+        return value
+    return _safe_id(value)
+
+
+def _event_public_action(event: Mapping[str, object] | None) -> object:
+    result = _event_result(event)
+    arguments = _event_arguments(event)
+    return result.get("action") or arguments.get("action")
+
+
+def _event_diagnostic(
+    event: Mapping[str, object] | None,
+    *,
+    event_index: int,
+    reason: str,
+    step_id: str | None = None,
+) -> ProcessEventDiagnostic:
+    return ProcessEventDiagnostic(
+        event_index=event_index,
+        tool_name=_safe_diagnostic_label(event.get("name")) if event else None,
+        public_action=_safe_diagnostic_label(_event_public_action(event)) if event else None,
+        process_id_safe=(
+            _safe_id(process_id)
+            if (process_id := _event_process_id(event))
+            else None
+        ),
+        tool_call_id_safe=(
+            _safe_id(tool_call_id)
+            if event and (tool_call_id := event.get("tool_call_id"))
+            else None
+        ),
+        observation_status=(
+            _safe_diagnostic_label(_event_status(event).value) if event else None
+        ),
+        step_id=step_id,
+        reason=reason,
+    )
+
+
+def _event_bounds(
+    event: Mapping[str, object] | None,
+) -> tuple[datetime, datetime] | None:
+    """Project the public observation time and handler duration into a UTC span.
+
+    MyHermes persists ``created_at`` immediately after the public Tool handler
+    returns and reports the handler's measured ``duration_ms``.  Treating that
+    timestamp as the completion boundary and subtracting the measured duration
+    gives a bounded wall-clock interval without inventing a monotonic clock.
+    Missing or malformed facts make the interval unavailable.
+    """
+
+    if event is None:
+        return None
+    created_at = event.get("created_at")
+    duration_ms = event.get("duration_ms")
+    if not isinstance(created_at, datetime) or created_at.tzinfo is None:
+        return None
+    if type(duration_ms) is not int or duration_ms < 0:
+        return None
+    completed_at = created_at.astimezone(timezone.utc)
+    started_at = completed_at - timedelta(milliseconds=duration_ms)
+    return started_at, completed_at
+
+
+def _align_process_events(
+    plan,
+    events: Sequence[Mapping[str, object]],
+) -> _ProcessEventAlignment:
+    """Align Process steps to observations with a bounded, forward-only cursor."""
+
+    cursor = 0
+    process_id: str | None = None
+    matched_events: list[Mapping[str, object] | None] = []
+    matched_indices: list[int | None] = []
+    unexpected_events: list[ProcessEventDiagnostic] = []
+    missing_expected_events: list[ProcessEventDiagnostic] = []
+    event_order_violations: list[ProcessEventDiagnostic] = []
+    foreign_process_events: list[ProcessEventDiagnostic] = []
+    unconsumed_events: list[ProcessEventDiagnostic] = []
+
+    for step_index, step in enumerate(plan.steps):
+        matched: Mapping[str, object] | None = None
+        matched_index: int | None = None
+        while cursor < len(events):
+            event_index = cursor
+            event = events[event_index]
+            cursor += 1
+            event_process_id = _event_process_id(event)
+            if step.action is not ProcessAction.START:
+                if process_id is None:
+                    unexpected_events.append(
+                        _event_diagnostic(
+                            event,
+                            event_index=event_index,
+                            reason="unexpected_event",
+                            step_id=step.step_id,
+                        )
+                    )
+                    continue
+                if event_process_id != process_id:
+                    foreign_process_events.append(
+                        _event_diagnostic(
+                            event,
+                            event_index=event_index,
+                            reason="foreign_process_event",
+                            step_id=step.step_id,
+                        )
+                    )
+                    continue
+            if _event_matches_step(event, step):
+                matched = event
+                matched_index = event_index
+                if step.action is ProcessAction.START:
+                    process_id = event_process_id
+                break
+            future_match = (
+                process_id is not None
+                and event_process_id == process_id
+                and any(
+                    _event_matches_step(event, candidate)
+                    for candidate in plan.steps[step_index + 1 :]
+                )
+            )
+            diagnostic = _event_diagnostic(
+                event,
+                event_index=event_index,
+                reason=(
+                    "event_order_violation" if future_match else "unexpected_event"
+                ),
+                step_id=step.step_id,
+            )
+            if future_match:
+                event_order_violations.append(diagnostic)
+            else:
+                unexpected_events.append(diagnostic)
+        matched_events.append(matched)
+        matched_indices.append(matched_index)
+        if matched is None:
+            missing_expected_events.append(
+                _event_diagnostic(
+                    None,
+                    event_index=cursor,
+                    reason="missing_expected_event",
+                    step_id=step.step_id,
+                )
+            )
+
+    for event_index in range(cursor, len(events)):
+        unconsumed_events.append(
+            _event_diagnostic(
+                events[event_index],
+                event_index=event_index,
+                reason="unconsumed_event",
+            )
+        )
+    return _ProcessEventAlignment(
+        matched_events=matched_events,
+        matched_indices=matched_indices,
+        unexpected_events=unexpected_events,
+        missing_expected_events=missing_expected_events,
+        event_order_violations=event_order_violations,
+        foreign_process_events=foreign_process_events,
+        unconsumed_events=unconsumed_events,
+    )
+
+
+_ALIGNMENT_ERROR_TYPES = {
+    "unexpected_event": "process_unexpected_event",
+    "missing_expected_event": "process_missing_expected_event",
+    "event_order_violation": "process_event_order_violation",
+    "foreign_process_event": "process_foreign_process_event",
+    "unconsumed_event": "process_unconsumed_event",
+}
+
+
+def _alignment_error(plan, diagnostic: ProcessEventDiagnostic) -> ScenarioError:
+    error_type = _ALIGNMENT_ERROR_TYPES[diagnostic.reason]
+    step_label = diagnostic.step_id or "none"
+    return _scenario_error(
+        error_type,
+        "scenario="
+        f"{plan.scenario_id}; step={step_label}; event_index={diagnostic.event_index}; "
+        f"{error_type}",
+        step_id=diagnostic.step_id,
+    )
 
 
 def _scenario_tool_call_seen(events: Sequence[Mapping[str, object]], expected) -> bool:
@@ -762,7 +975,9 @@ def build_scenario_results(
             requirement.required and requirement.tool_name == "file"
             for requirement in plan.trace_requirements
         )
-        event_index = 0
+        alignment = _align_process_events(plan, process_events)
+        matched_events = alignment.matched_events
+        matched_indices = alignment.matched_indices
         start_process_id: str | None = None
         safe_process_id: str | None = None
         declared_command: str | None = None
@@ -784,10 +999,15 @@ def build_scenario_results(
         final_status = ScenarioProcessStatus.UNKNOWN
         agent_close_observed = False
         elapsed_ms = 0
+        tool_duration_sum_ms = sum(
+            event.get("duration_ms")
+            for event in process_events
+            if type(event.get("duration_ms")) is int and event.get("duration_ms") >= 0
+        )
         scenario_timed_out: bool | None = None
-        for step in plan.steps:
-            event = process_events[event_index] if event_index < len(process_events) else None
-            event_index += 1
+        for step_index, step in enumerate(plan.steps):
+            event = matched_events[step_index]
+            matched_index = matched_indices[step_index]
             result_payload = _event_result(event)
             arguments = _event_arguments(event)
             actual_action = result_payload.get("action") or arguments.get("action")
@@ -942,14 +1162,24 @@ def build_scenario_results(
                 final_status = actual_status
             duration_ms, timing_status = _event_timing(event)
             elapsed_before_ms = elapsed_ms
-            elapsed_ms += duration_ms or 0
+            if matched_index is not None:
+                elapsed_ms = sum(
+                    int(candidate.get("duration_ms"))
+                    for candidate in process_events[: matched_index + 1]
+                    if type(candidate.get("duration_ms")) is int
+                    and candidate.get("duration_ms") >= 0
+                )
+                elapsed_before_ms = sum(
+                    int(candidate.get("duration_ms"))
+                    for candidate in process_events[:matched_index]
+                    if type(candidate.get("duration_ms")) is int
+                    and candidate.get("duration_ms") >= 0
+                )
             timed_out = (
                 None
                 if duration_ms is None
                 else duration_ms > step.timeout_seconds * 1000
             )
-            if timed_out is True:
-                scenario_timed_out = True
             if step.action is ProcessAction.WAIT:
                 wait_timeout = arguments.get("timeout")
                 scenario_remaining = plan.timeout_seconds - elapsed_before_ms / 1000
@@ -998,27 +1228,32 @@ def build_scenario_results(
             )
             if step.action is ProcessAction.START:
                 passed = passed and actual_status is step.expected_initial_status and bool(command_matched)
-            step_error_type = "process-observation-missing" if event is None else "process-step-gate-failed"
-            if not passed and step.required:
+            step_error_type = (
+                "process_missing_expected_event"
+                if event is None
+                else "process_step_gate_failed"
+            )
+            if event is not None and not passed and step.required:
                 if timing_status is ProcessTimingStatus.UNAVAILABLE:
                     step_error_type = "process_step_timing_unavailable"
                 elif timing_status is ProcessTimingStatus.INVALID:
                     step_error_type = "process_step_timing_invalid"
                 elif timed_out is True:
                     step_error_type = "process_step_timeout"
-            if step.action is ProcessAction.READ_INCREMENTAL:
+            if event is not None and step.action is ProcessAction.READ_INCREMENTAL:
                 if not read.cursor_reference_matched:
                     step_error_type = "process_cursor_reference_error"
                 elif not read.cursor_chain_matched:
                     step_error_type = "process_cursor_chain_error"
+            event_bounds = _event_bounds(event)
             step_results.append(ScenarioStepResult(
                 step_id=step.step_id,
                 action=step.action,
                 status=ScenarioStatus.COMPLETED if passed else ScenarioStatus.ERROR,
                 actual_action=str(actual_action) if isinstance(actual_action, str) else None,
                 actual_status=actual_status,
-                started_at=None,
-                completed_at=None,
+                started_at=None if event_bounds is None else event_bounds[0],
+                completed_at=None if event_bounds is None else event_bounds[1],
                 duration_ms=duration_ms,
                 timeout_seconds=step.timeout_seconds,
                 timing_status=timing_status,
@@ -1030,6 +1265,7 @@ def build_scenario_results(
                 action_matched=action_matched,
                 error=None if passed else _scenario_error(
                     step_error_type,
+                    f"scenario={plan.scenario_id}; step={step.step_id}; "
                     "public Process observation did not satisfy the declared step",
                     step_id=step.step_id,
                 ),
@@ -1131,28 +1367,63 @@ def build_scenario_results(
             if step.required
         ]
         step_timing_statuses = required_step_timing_statuses
+        matched_bounds = [
+            bounds
+            for event in matched_events
+            if (bounds := _event_bounds(event)) is not None
+        ]
+        matched_event_count = sum(event is not None for event in matched_events)
+        all_matched_events_timed = (
+            matched_event_count > 0 and len(matched_bounds) == matched_event_count
+        )
+        scenario_started_at = None
+        scenario_completed_at = None
+        scenario_wall_clock_duration_ms = None
+        if all_matched_events_timed:
+            candidate_start = matched_bounds[0][0]
+            candidate_end = matched_bounds[-1][1]
+            if candidate_end >= candidate_start and all(
+                current[0] >= previous[0]
+                for previous, current in zip(matched_bounds, matched_bounds[1:], strict=False)
+            ):
+                scenario_started_at = candidate_start
+                scenario_completed_at = candidate_end
+                scenario_wall_clock_duration_ms = round(
+                    (candidate_end - candidate_start).total_seconds() * 1000
+                )
         if any(item is ProcessTimingStatus.INVALID for item in step_timing_statuses):
             scenario_timing_status = ProcessTimingStatus.INVALID
+            scenario_started_at = None
+            scenario_completed_at = None
+            scenario_wall_clock_duration_ms = None
             scenario_duration_ms = None
             scenario_timed_out = None
-        elif step_timing_statuses and all(
-            item in {
-                ProcessTimingStatus.AVAILABLE,
-                ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
-            }
-            for item in step_timing_statuses
+        elif (
+            step_timing_statuses
+            and all(item is ProcessTimingStatus.AVAILABLE for item in step_timing_statuses)
+            and scenario_wall_clock_duration_ms is not None
         ):
-            scenario_timing_status = ProcessTimingStatus.AVAILABLE_DURATION_ONLY
-            scenario_duration_ms = elapsed_ms
-            scenario_timed_out = (
-                scenario_timed_out is True
-                or scenario_duration_ms > plan.timeout_seconds * 1000
-            )
+            scenario_timing_status = ProcessTimingStatus.AVAILABLE
+            scenario_duration_ms = scenario_wall_clock_duration_ms
+            scenario_timed_out = scenario_wall_clock_duration_ms > plan.timeout_seconds * 1000
         else:
             scenario_timing_status = ProcessTimingStatus.UNAVAILABLE
+            scenario_started_at = None
+            scenario_completed_at = None
+            scenario_wall_clock_duration_ms = None
             scenario_duration_ms = None
             scenario_timed_out = None
-        scenario_errors = list(checkpoint_errors)
+        alignment_diagnostics = (
+            alignment.unexpected_events
+            + alignment.missing_expected_events
+            + alignment.event_order_violations
+            + alignment.foreign_process_events
+            + alignment.unconsumed_events
+        )
+        scenario_errors = [
+            _alignment_error(plan, diagnostic)
+            for diagnostic in alignment_diagnostics
+        ] + list(checkpoint_errors)
         if fixture_read_required and not file_fixture_read_observed:
             scenario_errors.append(
                 _scenario_error(
@@ -1167,13 +1438,22 @@ def build_scenario_results(
                 "process_step_timeout",
             }:
                 scenario_errors.append(step_result.error)
+        if scenario_timed_out is True:
+            scenario_errors.append(
+                _scenario_error(
+                    "process_scenario_timeout",
+                    f"scenario={plan.scenario_id}; Process wall-clock deadline exceeded",
+                )
+            )
         scenario_status = ScenarioStatus.COMPLETED if (
             completed and required_steps_ok and cleanup_ok and process_identity_matched
             and bool(command_matched) and (input_matched is not False)
             and cursor_integrity and status_transitions_valid and trace_passed
             and (not fixture_read_required or file_fixture_read_observed)
+            and not alignment_diagnostics
             and scenario_timed_out is not True
-            and scenario_duration_ms is not None
+            and scenario_timing_status is ProcessTimingStatus.AVAILABLE
+            and scenario_wall_clock_duration_ms is not None
             and all(item.passed is True for item in checkpoint_results if item.required)
         ) else ScenarioStatus.FAILED
         if not scenario_errors and scenario_status is not ScenarioStatus.COMPLETED:
@@ -1213,6 +1493,15 @@ def build_scenario_results(
             ),
             agent_close_observed=agent_close_observed,
             worker_cleanup_result=cleanup,
+            unexpected_events=alignment.unexpected_events,
+            missing_expected_events=alignment.missing_expected_events,
+            event_order_violations=alignment.event_order_violations,
+            foreign_process_events=alignment.foreign_process_events,
+            unconsumed_events=alignment.unconsumed_events,
+            scenario_started_at=scenario_started_at,
+            scenario_completed_at=scenario_completed_at,
+            scenario_wall_clock_duration_ms=scenario_wall_clock_duration_ms,
+            tool_duration_sum_ms=tool_duration_sum_ms,
             duration_ms=scenario_duration_ms,
             errors=scenario_errors,
         )

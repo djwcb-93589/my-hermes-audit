@@ -448,6 +448,28 @@ class ScenarioError(ContractModel):
     retryable: StrictBool = False
 
 
+ProcessEventReason = Literal[
+    "unexpected_event",
+    "missing_expected_event",
+    "event_order_violation",
+    "foreign_process_event",
+    "unconsumed_event",
+]
+
+
+class ProcessEventDiagnostic(ContractModel):
+    """Content-free alignment fact for one Process observation position."""
+
+    event_index: NonNegativeInt
+    tool_name: Identifier | None = None
+    public_action: Identifier | None = None
+    process_id_safe: Identifier | None = None
+    tool_call_id_safe: Identifier | None = None
+    observation_status: Identifier | None = None
+    step_id: Identifier | None = None
+    reason: ProcessEventReason
+
+
 class ScenarioCheckpointResult(ContractModel):
     checkpoint_id: Identifier
     kind: ScenarioCheckpointKind
@@ -688,6 +710,15 @@ class ProcessScenarioExecutionResult(ContractModel):
     agent_close_required: StrictBool = False
     agent_close_observed: StrictBool = False
     worker_cleanup_result: ProcessCleanupResult | None = None
+    unexpected_events: list[ProcessEventDiagnostic] = Field(default_factory=list)
+    missing_expected_events: list[ProcessEventDiagnostic] = Field(default_factory=list)
+    event_order_violations: list[ProcessEventDiagnostic] = Field(default_factory=list)
+    foreign_process_events: list[ProcessEventDiagnostic] = Field(default_factory=list)
+    unconsumed_events: list[ProcessEventDiagnostic] = Field(default_factory=list)
+    scenario_started_at: UtcDatetime | None = None
+    scenario_completed_at: UtcDatetime | None = None
+    scenario_wall_clock_duration_ms: NonNegativeInt | None = None
+    tool_duration_sum_ms: NonNegativeInt | None = None
     # A Process duration is only present when the public Observation window
     # supplied timing facts classified by ``timing_status``. ``None`` is
     # deliberately distinct from a measured zero so validators cannot turn
@@ -699,9 +730,53 @@ class ProcessScenarioExecutionResult(ContractModel):
     def validate_status_transition(self) -> "ProcessScenarioExecutionResult":
         if self.initial_status in _TERMINAL_PROCESS_STATUSES and self.final_status in _ACTIVE_PROCESS_STATUSES:
             raise ValueError("terminal Process cannot transition back to active")
+        if (self.scenario_started_at is None) != (self.scenario_completed_at is None):
+            raise ValueError(
+                "scenario wall-clock timestamps must be provided together"
+            )
+        if (
+            self.scenario_started_at is not None
+            and self.scenario_completed_at is not None
+            and self.scenario_completed_at < self.scenario_started_at
+        ):
+            raise ValueError("scenario completed_at cannot precede started_at")
+        if self.scenario_wall_clock_duration_ms is not None:
+            if self.scenario_started_at is None or self.scenario_completed_at is None:
+                raise ValueError(
+                    "scenario wall-clock duration requires start and end timestamps"
+                )
+            computed_ms = round(
+                (
+                    self.scenario_completed_at - self.scenario_started_at
+                ).total_seconds()
+                * 1000
+            )
+            if computed_ms != self.scenario_wall_clock_duration_ms:
+                raise ValueError(
+                    "scenario wall-clock duration must match its timestamps"
+                )
+            if self.duration_ms != self.scenario_wall_clock_duration_ms:
+                raise ValueError(
+                    "Process duration must match scenario wall-clock duration"
+                )
+        elif self.scenario_started_at is not None:
+            raise ValueError(
+                "scenario wall-clock timestamps require a wall-clock duration"
+            )
+        elif self.duration_ms is not None:
+            raise ValueError(
+                "Process duration requires a scenario wall-clock duration"
+            )
+        if self.timing_status is ProcessTimingStatus.AVAILABLE and (
+            self.scenario_wall_clock_duration_ms is None
+        ):
+            raise ValueError(
+                "available Process timing requires scenario wall-clock facts"
+            )
         if self.timing_status is ProcessTimingStatus.AVAILABLE_DURATION_ONLY:
-            if self.duration_ms is None:
-                raise ValueError("duration-only scenario timing requires duration")
+            raise ValueError(
+                "Process scenario timing requires a wall-clock timestamp span"
+            )
         elif self.timing_status is ProcessTimingStatus.AVAILABLE:
             if self.duration_ms is None:
                 raise ValueError("available scenario timing requires duration")
@@ -710,10 +785,7 @@ class ProcessScenarioExecutionResult(ContractModel):
                 raise ValueError("unavailable or invalid scenario timing cannot claim duration")
             if self.scenario_timed_out is not None:
                 raise ValueError("unavailable or invalid timing cannot claim timeout")
-        if self.timing_status in {
-            ProcessTimingStatus.AVAILABLE,
-            ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
-        }:
+        if self.timing_status is ProcessTimingStatus.AVAILABLE:
             expected_timeout = self.duration_ms > self.scenario_timeout_seconds * 1000
             if self.scenario_timed_out != expected_timeout:
                 raise ValueError("scenario_timed_out must reflect the scenario deadline")
@@ -733,6 +805,8 @@ __all__ = (
     "IncrementalReadObservation",
     "OutputCheckpoint",
     "ProcessOutputCheckpoint",
+    "ProcessEventDiagnostic",
+    "ProcessEventReason",
     "ProcessAction",
     "ProcessAssertStatusStep",
     "ProcessCleanupExpectation",

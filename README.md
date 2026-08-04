@@ -25,7 +25,9 @@ Required Process Step timing is explicitly classified as available,
 duration-only, unavailable, or invalid. Missing/invalid required timing fails
 the Process gate; optional timing is not evaluable. Timeout uses the strict
 `duration_ms > timeout_seconds * 1000` rule, and `wait` validates both its real
-Tool Call timeout and the remaining Scenario budget.
+Tool Call timeout and the remaining Scenario budget. The Scenario deadline
+itself requires a measured UTC wall-clock span; a duration-only Step projection
+cannot substitute for it.
 
 Process status expectations are capability-driven from the public
 `ProcessStatus` enum. The current Subject exposes `starting`, `running`,
@@ -34,6 +36,16 @@ remains `running`. The default input Case independently gates the `running`
 status and the `P6-WAIT` incremental output marker. It never infers
 `waiting_for_input` from output or Python `readline()` behavior; that status is
 reserved for a future Subject capability and preflight.
+
+Process events are aligned with a bounded forward-only matcher rather than
+array position. Extra, missing, out-of-order, foreign-process, and trailing
+events are preserved as safe structured diagnostics and fail the strict
+Process gate without overwriting facts from later correctly matched events.
+Scenario timeout is measured from the first matched foreground Process event
+to the last using UTC observation timing; the sum of individual Tool durations
+is diagnostic only. Worker cleanup timing is separate from this foreground
+wall-clock span. The default Process prompts state exact commands and public
+`log`, `poll`, and `kill(process_id, grace_seconds)` actions.
 
 The P6.1 closing contracts use an explicit stdin handshake in the short
 Process example, cursor references between incremental reads, at most one

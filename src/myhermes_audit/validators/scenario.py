@@ -455,14 +455,28 @@ def _evaluate_process(
         for item in observed.incremental_reads
     )
     status_transition_passed = observed.status_transitions_valid is True
-    scenario_timing_passed = (
-        observed.timing_status
-        in {
-            ProcessTimingStatus.AVAILABLE,
-            ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
-        }
-        and observed.duration_ms is not None
+    alignment_diagnostics = (
+        list(getattr(observed, "unexpected_events", ()))
+        + list(getattr(observed, "missing_expected_events", ()))
+        + list(getattr(observed, "event_order_violations", ()))
+        + list(getattr(observed, "foreign_process_events", ()))
+        + list(getattr(observed, "unconsumed_events", ()))
     )
+    event_alignment_passed = not alignment_diagnostics
+    unexpected_event_gate_passed = not (
+        getattr(observed, "unexpected_events", ())
+        or getattr(observed, "foreign_process_events", ())
+        or getattr(observed, "unconsumed_events", ())
+    )
+    event_order_gate_passed = not getattr(observed, "event_order_violations", ())
+    scenario_timing_passed = (
+        observed.timing_status is ProcessTimingStatus.AVAILABLE
+        and observed.scenario_started_at is not None
+        and observed.scenario_completed_at is not None
+        and observed.scenario_wall_clock_duration_ms is not None
+        and observed.duration_ms == observed.scenario_wall_clock_duration_ms
+    )
+    scenario_wall_clock_timing_passed = scenario_timing_passed
     scenario_timeout_passed = scenario_timing_passed and observed.scenario_timed_out is False
     trace_passed = all(
         any(
@@ -484,6 +498,9 @@ def _evaluate_process(
     agent_close_required = any(item.action.value == "close" and item.required for item in plan.steps)
     agent_close_passed = not agent_close_required or observed.agent_close_observed
     metric_specs = [
+        ("process_event_alignment", "event_alignment", event_alignment_passed, "declared Process steps aligned to public events without omissions or extras"),
+        ("process_unexpected_event_gate", "unexpected_event_gate", unexpected_event_gate_passed, "no unexpected, foreign, or trailing Process events were observed"),
+        ("process_event_order_gate", "event_order_gate", event_order_gate_passed, "public Process events respected declared step order"),
         ("process_command_identity", "command_identity", command_identity_passed, "declared and observed command identity matched"),
         ("process_identity", "process_identity", process_identity_passed, "all public Process calls referenced the start process"),
         ("process_input_identity", "input_identity", input_identity_passed, "fixture input matched the observed public input"),
@@ -501,6 +518,7 @@ def _evaluate_process(
         ("process_step_timing", "step_timing", not required_step_timing_missing and not required_step_timing_invalid, "required Process steps supplied reliable timing facts"),
         ("process_step_timeout", "step_timeout", step_timeout_passed, "required steps supplied real duration facts within timeout"),
         ("process_scenario_timing", "scenario_timing", scenario_timing_passed, "Process scenario timing was available from public observations"),
+        ("process_scenario_wall_clock_timing", "scenario_wall_clock_timing", scenario_wall_clock_timing_passed, "Process scenario wall-clock timing was available from public observations"),
         ("process_scenario_timeout", "scenario_timeout", scenario_timeout_passed, "scenario stayed within its hard deadline"),
         ("process_agent_close", "agent_close", agent_close_passed, "Agent close expectation was observed independently"),
         ("process_worker_cleanup", "worker_cleanup", cleanup_passed, "Worker cleanup report satisfied its lifecycle expectation"),
@@ -573,7 +591,7 @@ def _evaluate_process(
             return _error_metric(
                 name=f"{metric_prefix}.{name}",
                 scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-                reason="Process scenario duration was not present in public Observation facts",
+                reason="Process scenario wall-clock timing was not present in public Observation facts",
                 hard_gate=plan.required,
                 metric_type=metric_type,
                 error_type="process_scenario_timing_unavailable",

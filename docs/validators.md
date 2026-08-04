@@ -30,6 +30,22 @@ cleanup dimension and flows into the existing `task_success`/`task_passed`
 gate without adding a first-level score. Optional missing timing is represented
 as `NOT_APPLICABLE` for the timeout dimension.
 
+Process validation also has explicit `event_alignment`,
+`unexpected_event_gate`, `event_order_gate`, and
+`scenario_wall_clock_timing` metrics. Alignment is a one-way bounded search,
+not positional array indexing. Unexpected, missing, foreign, trailing, and
+out-of-order events are content-free structured facts and required ones are
+hard-gate failures; correctly matched later events are still evaluated for
+command, process identity, input, cursor, status, and cleanup facts. The
+stable event error types are `process_unexpected_event`,
+`process_missing_expected_event`, `process_event_order_violation`,
+`process_foreign_process_event`, and `process_unconsumed_event`.
+
+Scenario timeout uses the UTC wall-clock span between the first and last
+matched foreground Process observations. `tool_duration_sum_ms` is a separate
+diagnostic and cannot make unavailable timing pass. Cleanup timing is owned by
+the Worker lifecycle and is not included in the foreground Scenario deadline.
+
 Process status checkpoints and incremental output checkpoints are independent
 metrics. The input Case passes its waiting phase only when the public status is
 `running` and the new output contains `P6-WAIT`; a marker never rewrites a

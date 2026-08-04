@@ -82,6 +82,42 @@ The required scenario evaluator contributes hard gates to `task_success` and
 `task_passed`; it does not create a fourth first-level score. With no required
 Process scenario, `process_gate_passed` is `null`.
 
+### Process event alignment and wall-clock timing
+
+Process observations are aligned with a bounded, forward-only matcher. The
+matcher searches from its current cursor for the first event that satisfies
+each typed Step; it never rewinds, reuses an event, or matches across process
+identities. File, Memory, Skill, Review, Assistant text, and marker text are
+not Process events. Events skipped while searching are retained as structured
+diagnostics, and trailing events are retained as unconsumed diagnostics.
+
+The result keeps separate `unexpected_events`, `missing_expected_events`,
+`event_order_violations`, `foreign_process_events`, and `unconsumed_events`
+lists. Their safe fields contain only an event index, public tool/action,
+hashed process and Tool-call identities, observation status, reason, and an
+optional Step ID. The corresponding stable error types are
+`process_unexpected_event`, `process_missing_expected_event`,
+`process_event_order_violation`, `process_foreign_process_event`, and
+`process_unconsumed_event`. Required extra, missing, foreign, or out-of-order
+events fail the Process gate, while facts from correctly matched later events
+remain available for diagnosis.
+
+`scenario.timeout_seconds` is evaluated against the measured wall-clock span
+from the first matched foreground Process event to the last matched foreground
+Process event. The public observation timestamp is the persisted completion
+boundary; when present with a non-negative handler duration, the Worker
+projects a UTC start/end interval. If any required timing fact is unavailable
+or invalid, Scenario timing is `unavailable`/`invalid` and no duration is
+invented. `tool_duration_sum_ms` is retained only as a diagnostic and never
+substitutes for the wall-clock timeout. Worker lifecycle cleanup timing remains
+outside this foreground span.
+
+The official Process prompts provide the exact Case B/C commands and the
+public `log`, `poll`, and `kill(process_id, grace_seconds)` actions. Case A
+explicitly uses one `submit` (never `write`) and performs its second `log`
+before `wait`; these prompts do not loosen command, identity, cursor, or timing
+gates.
+
 The default synthetic declarations are
 `examples/e2e_toolchain_v1.yaml` and
 `examples/e2e_process_background_v1.yaml`. The capability-negative declaration

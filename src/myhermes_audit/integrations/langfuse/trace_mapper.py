@@ -317,6 +317,10 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
             "scenario_kind": scenario.kind.value,
             "status": scenario.status.value,
             "duration_ms": scenario.duration_ms,
+            "scenario_wall_clock_duration_ms": getattr(
+                scenario, "scenario_wall_clock_duration_ms", None
+            ),
+            "tool_duration_sum_ms": getattr(scenario, "tool_duration_sum_ms", None),
             "error_count": len(scenario.errors),
             "command_matched": getattr(scenario, "command_matched", None),
             "process_identity_matched": getattr(scenario, "process_identity_matched", None),
@@ -329,8 +333,46 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                 getattr(scenario, "timing_status", None),
             ),
             "timeout_seconds": getattr(scenario, "scenario_timeout_seconds", None),
-            "scenario_timed_out": getattr(scenario, "scenario_timed_out", False),
+            "scenario_timeout_seconds": getattr(
+                scenario, "scenario_timeout_seconds", None
+            ),
+            "scenario_timed_out": getattr(scenario, "scenario_timed_out", None),
             "timed_out": getattr(scenario, "scenario_timed_out", None),
+            "event_alignment_passed": not any(
+                getattr(scenario, field_name, ())
+                for field_name in (
+                    "unexpected_events",
+                    "missing_expected_events",
+                    "event_order_violations",
+                    "foreign_process_events",
+                    "unconsumed_events",
+                )
+            ),
+            "unexpected_event_count": len(
+                getattr(scenario, "unexpected_events", ())
+            ),
+            "missing_expected_event_count": len(
+                getattr(scenario, "missing_expected_events", ())
+            ),
+            "event_order_violation_count": len(
+                getattr(scenario, "event_order_violations", ())
+            ),
+            "foreign_process_event_count": len(
+                getattr(scenario, "foreign_process_events", ())
+            ),
+            "unconsumed_event_count": len(
+                getattr(scenario, "unconsumed_events", ())
+            ),
+            "scenario_started_at": (
+                scenario.scenario_started_at.isoformat()
+                if getattr(scenario, "scenario_started_at", None) is not None
+                else None
+            ),
+            "scenario_completed_at": (
+                scenario.scenario_completed_at.isoformat()
+                if getattr(scenario, "scenario_completed_at", None) is not None
+                else None
+            ),
             "agent_close_required": getattr(scenario, "agent_close_required", False),
             "agent_close_observed": getattr(scenario, "agent_close_observed", False),
             "worker_cleanup_completed": getattr(
