@@ -13,6 +13,20 @@ second ProcessManager. `interrupt` is currently unsupported and is covered by
 the preflight-only negative Suite; Agent `close` and Worker cleanup remain
 separate facts.
 
+`process(action="close")` only closes stdin for a running Process. It is not
+Session cleanup, so the default completed and killed Cases do not call it;
+Worker cleanup independently proves that no live process or background read
+resource remains. The fixture-input Case enables `file` and `terminal`, reads
+`fixtures/process-input.txt` through the public `file` tool before starting the
+Process, and verifies the submitted input by SHA-256, character length, and
+UTF-8 byte length. File observations remain outside the Process event sequence.
+
+Required Process Step timing is explicitly classified as available,
+duration-only, unavailable, or invalid. Missing/invalid required timing fails
+the Process gate; optional timing is not evaluable. Timeout uses the strict
+`duration_ms > timeout_seconds * 1000` rule, and `wait` validates both its real
+Tool Call timeout and the remaining Scenario budget.
+
 The P6.1 closing contracts use an explicit stdin handshake in the short
 Process example, cursor references between incremental reads, at most one
 `process_background` Scenario per Case, and bounded Artifact OutputCheckpoint

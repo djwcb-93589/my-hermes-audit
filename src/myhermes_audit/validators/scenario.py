@@ -10,6 +10,7 @@ from myhermes_audit.contracts import (
     MetricSource,
     MetricStatus,
     ProcessScenarioPlan,
+    ProcessTimingStatus,
     ScenarioExecutionResult,
     ScenarioPlan,
     ScenarioStatus,
@@ -80,6 +81,37 @@ def _boolean_metric(
                 evidence_id=f"{name}.evidence",
                 kind="scenario_observation",
                 description="content-free scenario observation projection",
+            )
+        ],
+        evaluator_version=_EVALUATOR_VERSION,
+        metadata={
+            "scenario_kind": scenario_kind.value,
+            "metric_type": metric_type,
+            "hard_gate": hard_gate,
+        },
+    )
+
+
+def _not_applicable_metric(
+    *,
+    name: str,
+    scenario_kind: E2EScenarioKind,
+    metric_type: str,
+    reason: str,
+    hard_gate: bool,
+) -> MetricResult:
+    return MetricResult(
+        metric_name=name,
+        source=MetricSource.RUNTIME,
+        status=MetricStatus.NOT_APPLICABLE,
+        value=None,
+        passed=None,
+        reason=reason,
+        evidence=[
+            MetricEvidence(
+                evidence_id=f"{name}.evidence",
+                kind="scenario_observation",
+                description="optional Process timing was not evaluable",
             )
         ],
         evaluator_version=_EVALUATOR_VERSION,
@@ -301,11 +333,23 @@ def _evaluate_process(
         for item in required_step_results
     )
     step_timeout_passed = all(
-        item is not None and item.duration_ms is not None and not item.timed_out
+        item is not None
+        and item.timing_status
+        in {
+            ProcessTimingStatus.AVAILABLE,
+            ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
+        }
+        and item.duration_ms is not None
+        and item.timed_out is False
         for item in required_step_results
     )
     required_step_timing_missing = any(
-        item is None or item.duration_ms is None
+        item is None
+        or item.timing_status is ProcessTimingStatus.UNAVAILABLE
+        for item in required_step_results
+    )
+    required_step_timing_invalid = any(
+        item is not None and item.timing_status is ProcessTimingStatus.INVALID
         for item in required_step_results
     )
     required_read_steps = [
@@ -358,10 +402,33 @@ def _evaluate_process(
         for item in plan.checkpoints
         if item.required
     )
+    required_process_status_checkpoints = [
+        item
+        for item in plan.checkpoints
+        if item.required and item.kind.value == "process_status"
+    ]
+    business_status_passed = (
+        observed.final_status is not None
+        and observed.final_status.value != "unknown"
+        and all(
+            observed_checkpoints.get(item.checkpoint_id) is not None
+            and observed_checkpoints[item.checkpoint_id].passed is True
+            for item in required_process_status_checkpoints
+        )
+    )
     status_passed = observed.status is ScenarioStatus.COMPLETED
     command_identity_passed = observed.command_matched is True
     process_identity_passed = observed.process_identity_matched is True
-    input_identity_passed = observed.input_matched is not False
+    required_input_steps = {
+        item.step_id
+        for item in plan.steps
+        if item.required and item.action.value == "send_input"
+    }
+    input_identity_passed = (
+        observed.input_matched is True
+        if required_input_steps
+        else observed.input_matched is not False
+    )
     cursor_passed = all(
         item.cursor_unit == "character"
         and item.cursor_after >= item.cursor_before
@@ -371,8 +438,31 @@ def _evaluate_process(
         for item in observed.incremental_reads
     )
     status_transition_passed = observed.status_transitions_valid is True
-    scenario_timeout_passed = (
-        observed.duration_ms is not None and not observed.scenario_timed_out
+    scenario_timing_passed = (
+        observed.timing_status
+        in {
+            ProcessTimingStatus.AVAILABLE,
+            ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
+        }
+        and observed.duration_ms is not None
+    )
+    scenario_timeout_passed = scenario_timing_passed and observed.scenario_timed_out is False
+    trace_passed = all(
+        any(
+            item.tool_name == requirement.tool_name
+            and item.call_count >= requirement.minimum_calls
+            and item.successful_count >= requirement.minimum_successful_calls
+            for item in observed.tool_calls
+        )
+        for requirement in plan.trace_requirements
+        if requirement.required
+    )
+    fixture_read_required = any(
+        requirement.required and requirement.tool_name == "file"
+        for requirement in plan.trace_requirements
+    )
+    fixture_read_passed = (
+        not fixture_read_required or observed.file_fixture_read_observed
     )
     agent_close_required = any(item.action.value == "close" and item.required for item in plan.steps)
     agent_close_passed = not agent_close_required or observed.agent_close_observed
@@ -380,13 +470,18 @@ def _evaluate_process(
         ("process_command_identity", "command_identity", command_identity_passed, "declared and observed command identity matched"),
         ("process_identity", "process_identity", process_identity_passed, "all public Process calls referenced the start process"),
         ("process_input_identity", "input_identity", input_identity_passed, "fixture input matched the observed public input"),
+        ("process_business_status", "business_status", business_status_passed, "declared Process status and lifecycle outcome were observed"),
         ("process_step_action", "step_action", step_action_passed, "required step actions matched public Tool observations"),
         ("process_cursor_integrity", "cursor_integrity", cursor_passed, "Process log cursor used character units without gaps"),
         ("process_cursor_reference", "cursor_reference_missing", not cursor_reference_missing, "later Process reads referenced the preceding read result"),
         ("process_cursor_chain", "cursor_chain_mismatch", not cursor_chain_mismatch, "Process read cursor references matched the runtime chain"),
         ("process_marker_expectations", "marker_expectations", marker_passed, "required and forbidden output markers were evaluated"),
         ("process_status_transitions", "status_transitions", status_transition_passed, "Process status did not return to active after terminal"),
+        ("process_trace", "process_trace", trace_passed, "required public Tool trace calls were observed"),
+        ("process_fixture_read", "fixture_read", fixture_read_passed, "input fixture was read by the public file tool before submit"),
+        ("process_step_timing", "step_timing", not required_step_timing_missing and not required_step_timing_invalid, "required Process steps supplied reliable timing facts"),
         ("process_step_timeout", "step_timeout", step_timeout_passed, "required steps supplied real duration facts within timeout"),
+        ("process_scenario_timing", "scenario_timing", scenario_timing_passed, "Process scenario timing was available from public observations"),
         ("process_scenario_timeout", "scenario_timeout", scenario_timeout_passed, "scenario stayed within its hard deadline"),
         ("process_agent_close", "agent_close", agent_close_passed, "Agent close expectation was observed independently"),
         ("process_worker_cleanup", "worker_cleanup", cleanup_passed, "Worker cleanup report satisfied its lifecycle expectation"),
@@ -404,23 +499,74 @@ def _evaluate_process(
         passed: bool,
         reason: str,
     ) -> MetricResult:
-        if metric_type == "step_timeout" and required_step_timing_missing:
+        if metric_type == "step_timing" and required_step_timing_missing:
             return _error_metric(
                 name=f"{metric_prefix}.{name}",
                 scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
                 reason="required Process step timing was not present in public Observation facts",
                 hard_gate=plan.required,
                 metric_type=metric_type,
-                error_type=metric_type,
+                error_type="process_step_timing_unavailable",
             )
-        if metric_type == "scenario_timeout" and observed.duration_ms is None:
+        if metric_type == "step_timing" and required_step_timing_invalid:
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="required Process step timing was invalid",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type="process_step_timing_invalid",
+            )
+        if metric_type == "step_timeout" and (
+            required_step_timing_missing or required_step_timing_invalid
+        ):
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="required Process step timeout could not be evaluated without reliable timing",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type=(
+                    "process_step_timing_invalid"
+                    if required_step_timing_invalid
+                    else "process_step_timing_unavailable"
+                ),
+            )
+        if metric_type == "step_timeout" and not passed:
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="a required Process step exceeded its timeout budget",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type="process_step_timeout",
+            )
+        if metric_type == "scenario_timing" and not scenario_timing_passed:
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="Process scenario timing was not reliably available",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type="process_scenario_timing_unavailable",
+            )
+        if metric_type == "scenario_timeout" and not scenario_timing_passed:
             return _error_metric(
                 name=f"{metric_prefix}.{name}",
                 scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
                 reason="Process scenario duration was not present in public Observation facts",
                 hard_gate=plan.required,
                 metric_type=metric_type,
-                error_type=metric_type,
+                error_type="process_scenario_timing_unavailable",
+            )
+        if metric_type == "fixture_read" and not passed:
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="declared input fixture was not proven by the public file tool",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type="process_fixture_read_missing",
             )
         if metric_type == "cursor_reference_missing" and not passed:
             return _error_metric(
@@ -453,6 +599,29 @@ def _evaluate_process(
         _process_metric(name, metric_type, passed, reason)
         for name, metric_type, passed, reason in metric_specs
     ]
+    optional_timing_missing = any(
+        item is not None
+        and item.timing_status
+        in {
+            ProcessTimingStatus.UNAVAILABLE,
+            ProcessTimingStatus.INVALID,
+        }
+        for item in (
+            observed_steps.get(step.step_id)
+            for step in plan.steps
+            if not step.required
+        )
+    )
+    if optional_timing_missing:
+        metrics.append(
+            _not_applicable_metric(
+                name=f"{metric_prefix}.optional_step_timing",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                metric_type="optional_step_timing",
+                reason="optional Process step timeout was not evaluable without reliable timing",
+                hard_gate=False,
+            )
+        )
     metrics.insert(0, _boolean_metric(
         name=f"{metric_prefix}.status",
         scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,

@@ -22,12 +22,15 @@ Worker and public tool observations; Audit never reads a fixture to replace
 Agent work or writes an Artifact on the Agent's behalf.
 
 Process plans use typed `start`, `read_incremental`, `send_input`, `wait`,
-`kill`, `close`, and `assert_status` steps. `interrupt` remains a
-capability-gated action and is documented only by the negative Suite. Worker
-cleanup is a separate scenario-level expectation; it is never represented as
-an Agent Tool step. The current Subject exposes process management through the
-`terminal` Toolset (`process` is its companion declaration), so no synthetic
-`process` Toolset is added.
+`kill`, `close`, and `assert_status` steps. `process(action="close")` closes
+stdin for a still-running process; it does not release a completed Process
+record or perform Session cleanup. The default completion and kill Cases
+therefore do not call `close`. Worker cleanup is a separate scenario-level
+expectation and remains distinct from `agent_close_observed`; it verifies no
+live process, released Session resources, and no background read residue. The
+current Subject exposes process management through the `terminal` Toolset
+(`process` is its companion declaration), so no synthetic `process` Toolset is
+added.
 
 Process output is represented by bounded local log Artifacts. Structured facts
 retain only typed checkpoints, command/input hashes and lengths, character-unit
@@ -42,10 +45,22 @@ only. Statuses are mapped from public Subject results and unknown values remain
 `unknown`. Agent `close` and Worker lifecycle cleanup are recorded separately.
 
 Scenario and step timeouts are hard gates backed by Worker watchdogs and real
-public Observation durations. Missing required timing remains unevaluable (it
-is never represented as a fabricated `duration_ms=0`) and therefore fails the
-required Process timeout gate. Checkpoints are discriminated by `kind` and
-target explicit step IDs; checkpoint ID text is never parsed as a hidden DSL.
+public Observation durations. A Process timing result is explicitly
+`available`, `available_duration_only`, `unavailable`, or `invalid`; missing or
+invalid timing on a required Step fails with a timing diagnostic instead of
+defaulting `timed_out` to false. Optional missing timing is not evaluable for
+the timeout dimension. The timeout comparison is strict: `duration_ms >
+timeout_seconds * 1000` means timed out. A `wait` also proves the real Tool Call
+timeout is within the Step budget, the Step budget is within
+`maximum_wait_seconds`, and that maximum is within the remaining Scenario
+budget. Checkpoints are discriminated by `kind` and target explicit step IDs;
+checkpoint ID text is never parsed as a hidden DSL.
+
+An input fixture is only accepted as Process input when the public `file` Tool
+Call successfully reads the declared `fixtures/...` path before the Process
+submit. The submitted bytes are independently compared with the materialized
+fixture by SHA-256, character length, and UTF-8 byte length. File events remain
+in the global Tool trace and never consume Process event-sequence positions.
 
 An Audit Case currently permits at most one `process_background` Scenario. The
 contract rejects a second Process lifecycle before Sandbox creation, and the

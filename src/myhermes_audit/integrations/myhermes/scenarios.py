@@ -9,9 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
 from myhermes_audit.artifacts import atomic_write_text
 from myhermes_audit.contracts import (
@@ -24,6 +23,7 @@ from myhermes_audit.contracts import (
     ProcessInputObservation,
     ProcessScenarioExecutionResult,
     ProcessOutputCheckpoint,
+    ProcessTimingStatus,
     ScenarioArtifactObservation,
     ScenarioCheckpointResult,
     ScenarioError,
@@ -57,6 +57,14 @@ class _ArtifactProjection:
     content_utf8_bytes: int | None
     truncated: bool
     read_error: bool = False
+
+
+@dataclass(frozen=True)
+class _FixtureReadFacts:
+    observed: bool
+    content_sha256: str | None = None
+    content_char_length: int | None = None
+    content_utf8_bytes: int | None = None
 
 
 def _safe_id(value: object) -> str:
@@ -294,6 +302,19 @@ def _event_status(event: Mapping[str, object] | None) -> ScenarioProcessStatus:
     return _status(result.get("status") or nested_status)
 
 
+def _event_timing(
+    event: Mapping[str, object] | None,
+) -> tuple[int | None, ProcessTimingStatus]:
+    if event is None or "duration_ms" not in event or event.get("duration_ms") is None:
+        return None, ProcessTimingStatus.UNAVAILABLE
+    value = event.get("duration_ms")
+    if type(value) is not int or value < 0:
+        return None, ProcessTimingStatus.INVALID
+    # The public projection currently exposes a duration but no authoritative
+    # start/end pair.  Do not synthesize timestamps from an observation time.
+    return value, ProcessTimingStatus.AVAILABLE_DURATION_ONLY
+
+
 def _event_matches_step(event: Mapping[str, object] | None, step) -> bool:
     """Require the observed public tool operation to match the typed step."""
 
@@ -331,6 +352,105 @@ def _scenario_tool_call_seen(events: Sequence[Mapping[str, object]], expected) -
         ):
             return True
     return False
+
+
+def _trace_tool_call_observations(
+    plan,
+    observations: ObservationBundle,
+) -> list[ScenarioToolCallObservation]:
+    names = list(dict.fromkeys(item.tool_name for item in plan.trace_requirements))
+    return [
+        ScenarioToolCallObservation(
+            tool_name=tool_name,
+            call_count=sum(item.tool_name == tool_name for item in observations.tool_calls),
+            successful_count=sum(
+                item.tool_name == tool_name and item.success
+                for item in observations.tool_calls
+            ),
+        )
+        for tool_name in names
+    ]
+
+
+def _normalized_public_path(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.replace("\\", "/")
+    if normalized.startswith("/") or ":" in normalized.split("/", 1)[0]:
+        return None
+    try:
+        path = PurePosixPath(normalized)
+    except (TypeError, ValueError):
+        return None
+    if any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    return path.as_posix()
+
+
+def _fixture_read_facts(
+    events: Sequence[Mapping[str, object]],
+    *,
+    expected_path: str,
+    before_event_index: int,
+    expected_facts: tuple[str, int, int] | None,
+) -> _FixtureReadFacts:
+    """Prove a fixture read from a successful public ``file`` Tool Call.
+
+    The raw content is used only in-memory to cross-check the materialized
+    fixture.  Only hashes and lengths leave this projection.
+    """
+
+    forbidden_reference = expected_path.replace("/", "\\").lower()
+    forbidden_posix = expected_path.lower()
+    for event in events:
+        if event.get("name") != "terminal":
+            continue
+        command = _event_arguments(event).get("command")
+        if not isinstance(command, str):
+            continue
+        lowered = command.lower().replace("\\", "/")
+        if (
+            forbidden_posix in lowered
+            or forbidden_reference in command.lower()
+        ):
+            return _FixtureReadFacts(observed=False)
+
+    start_event_index = next(
+        (
+            index
+            for index, event in enumerate(events)
+            if event.get("name") == "terminal"
+            and _event_arguments(event).get("background") is True
+        ),
+        before_event_index,
+    )
+    for index, event in enumerate(events):
+        if (
+            index >= min(before_event_index, start_event_index)
+            or event.get("name") != "file"
+        ):
+            continue
+        arguments = _event_arguments(event)
+        if arguments.get("action") != "read":
+            continue
+        if _normalized_public_path(arguments.get("path")) != expected_path:
+            continue
+        result = _event_result(event)
+        content = result.get("content")
+        if result.get("ok") is not True or not isinstance(content, str):
+            continue
+        if result.get("truncated") is True:
+            continue
+        actual = (_hash_text(content), len(content), len(content.encode("utf-8")))
+        if expected_facts is not None and actual != expected_facts:
+            continue
+        return _FixtureReadFacts(
+            observed=True,
+            content_sha256=actual[0],
+            content_char_length=actual[1],
+            content_utf8_bytes=actual[2],
+        )
+    return _FixtureReadFacts(observed=False)
 
 
 def _fixture_text_facts(workspace: Path, hermes_home: Path, relative_path: str) -> tuple[str, int, int] | None:
@@ -596,6 +716,21 @@ def build_scenario_results(
                 log_paths.append(log_path)
             continue
         process_events = [item for item in events if item.get("name") in {"terminal", "process"}]
+        trace_tool_calls = _trace_tool_call_observations(plan, observations)
+        trace_passed = all(
+            any(
+                item.tool_name == requirement.tool_name
+                and item.call_count >= requirement.minimum_calls
+                and item.successful_count >= requirement.minimum_successful_calls
+                for item in trace_tool_calls
+            )
+            for requirement in plan.trace_requirements
+            if requirement.required
+        )
+        fixture_read_required = any(
+            requirement.required and requirement.tool_name == "file"
+            for requirement in plan.trace_requirements
+        )
         event_index = 0
         start_process_id: str | None = None
         safe_process_id: str | None = None
@@ -609,6 +744,7 @@ def build_scenario_results(
         cursor = 0
         cursor_integrity = True
         input_matched: bool | None = None
+        file_fixture_read_observed = False
         command_matched: bool | None = None
         process_identity_matched = True
         status_transitions_valid = True
@@ -617,7 +753,7 @@ def build_scenario_results(
         final_status = ScenarioProcessStatus.UNKNOWN
         agent_close_observed = False
         elapsed_ms = 0
-        scenario_timed_out = False
+        scenario_timed_out: bool | None = None
         for step in plan.steps:
             event = process_events[event_index] if event_index < len(process_events) else None
             event_index += 1
@@ -654,12 +790,28 @@ def build_scenario_results(
                 actual_hash = _hash_text(actual) if actual is not None else None
                 actual_chars = len(actual) if actual is not None else None
                 actual_bytes = len(actual.encode("utf-8")) if actual is not None else None
+                submit_event_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(events)
+                        if candidate is event
+                    ),
+                    len(events),
+                )
+                fixture_read = _fixture_read_facts(
+                    events,
+                    expected_path=step.input_source,
+                    before_event_index=submit_event_index,
+                    expected_facts=expected,
+                ) if fixture_read_required else _FixtureReadFacts(observed=False)
+                file_fixture_read_observed = file_fixture_read_observed or fixture_read.observed
                 input_matched = (
                     expected is not None and actual is not None
                     and expected_hash == actual_hash
                     and expected_chars == actual_chars
                     and expected_bytes == actual_bytes
                     and action_matched and identity_match
+                    and (not fixture_read_required or fixture_read.observed)
                 )
                 input_events.append(ProcessInputObservation(
                     input_source=step.input_source,
@@ -672,6 +824,10 @@ def build_scenario_results(
                     expected_input_utf8_bytes=expected_bytes,
                     actual_input_utf8_bytes=actual_bytes,
                     input_matched=input_matched,
+                    file_fixture_read_observed=(fixture_read.observed if fixture_read_required else None),
+                    file_fixture_read_sha256=(fixture_read.content_sha256 if fixture_read_required else None),
+                    file_fixture_read_char_length=(fixture_read.content_char_length if fixture_read_required else None),
+                    file_fixture_read_utf8_bytes=(fixture_read.content_utf8_bytes if fixture_read_required else None),
                     process_id_safe=event_safe_process_id,
                     process_identity_matched=identity_match,
                     action_matched=action_matched,
@@ -753,34 +909,26 @@ def build_scenario_results(
                     status_transitions_valid = False
                 status_history.append(actual_status)
                 final_status = actual_status
-            duration_raw = event.get("duration_ms") if event else None
-            duration_ms = duration_raw if type(duration_raw) is int and duration_raw >= 0 else None
-            timed_out = duration_ms is not None and duration_ms > step.timeout_seconds * 1000
+            duration_ms, timing_status = _event_timing(event)
+            elapsed_before_ms = elapsed_ms
             elapsed_ms += duration_ms or 0
-            observation_completed_at = event.get("created_at") if event else None
-            if not isinstance(observation_completed_at, datetime):
-                observation_completed_at = None
-            observation_started_at = (
-                observation_completed_at - timedelta(milliseconds=duration_ms)
-                if observation_completed_at is not None and duration_ms is not None
-                else None
+            timed_out = (
+                None
+                if duration_ms is None
+                else duration_ms > step.timeout_seconds * 1000
             )
-            if timed_out:
+            if timed_out is True:
                 scenario_timed_out = True
             if step.action is ProcessAction.WAIT:
-                wait_timeout = arguments.get("timeout", 30)
+                wait_timeout = arguments.get("timeout")
+                scenario_remaining = plan.timeout_seconds - elapsed_before_ms / 1000
                 wait_ok = (
                     isinstance(wait_timeout, (int, float))
                     and not isinstance(wait_timeout, bool)
                     and wait_timeout >= 0
-                    and wait_timeout <= step.maximum_wait_seconds
                     and wait_timeout <= step.timeout_seconds
-                    and wait_timeout <= max(
-                        0,
-                        plan.timeout_seconds
-                        - elapsed_ms / 1000
-                        + (duration_ms or 0) / 1000,
-                    )
+                    and step.timeout_seconds <= step.maximum_wait_seconds
+                    and step.maximum_wait_seconds <= scenario_remaining
                 )
             else:
                 wait_ok = True
@@ -797,10 +945,36 @@ def build_scenario_results(
                 semantic_ok = actual_status is step.expected_status
             else:
                 semantic_ok = True
-            passed = bool(action_matched and (identity_match or step.action is ProcessAction.START) and result_payload.get("ok", True) is not False and semantic_ok and not timed_out)
+            timing_gate = (
+                timing_status in {
+                    ProcessTimingStatus.AVAILABLE,
+                    ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
+                }
+                and timed_out is False
+            ) or (
+                not step.required
+                and timing_status in {
+                    ProcessTimingStatus.UNAVAILABLE,
+                    ProcessTimingStatus.INVALID,
+                }
+            )
+            passed = bool(
+                action_matched
+                and (identity_match or step.action is ProcessAction.START)
+                and result_payload.get("ok", True) is not False
+                and semantic_ok
+                and timing_gate
+            )
             if step.action is ProcessAction.START:
                 passed = passed and actual_status is step.expected_initial_status and bool(command_matched)
             step_error_type = "process-observation-missing" if event is None else "process-step-gate-failed"
+            if not passed and step.required:
+                if timing_status is ProcessTimingStatus.UNAVAILABLE:
+                    step_error_type = "process_step_timing_unavailable"
+                elif timing_status is ProcessTimingStatus.INVALID:
+                    step_error_type = "process_step_timing_invalid"
+                elif timed_out is True:
+                    step_error_type = "process_step_timeout"
             if step.action is ProcessAction.READ_INCREMENTAL:
                 if not read.cursor_reference_matched:
                     step_error_type = "process_cursor_reference_error"
@@ -812,10 +986,11 @@ def build_scenario_results(
                 status=ScenarioStatus.COMPLETED if passed else ScenarioStatus.ERROR,
                 actual_action=str(actual_action) if isinstance(actual_action, str) else None,
                 actual_status=actual_status,
-                started_at=observation_started_at,
-                completed_at=observation_completed_at,
+                started_at=None,
+                completed_at=None,
                 duration_ms=duration_ms,
                 timeout_seconds=step.timeout_seconds,
+                timing_status=timing_status,
                 timed_out=timed_out,
                 observation_refs=[_safe_id(event.get("tool_call_id"))] if event else [],
                 expected_process_id_safe=safe_process_id,
@@ -919,37 +1094,64 @@ def build_scenario_results(
             ))
             if checkpoint_error is not None:
                 checkpoint_errors.append(checkpoint_error)
-        timed_steps = [
-            item for item in step_results
-            if item.started_at is not None and item.completed_at is not None
+        required_step_timing_statuses = [
+            step_result.timing_status
+            for step, step_result in zip(plan.steps, step_results, strict=False)
+            if step.required
         ]
-        scenario_duration_ms: int | None = None
-        if timed_steps:
-            scenario_started_at = timed_steps[0].started_at
-            scenario_completed_at = timed_steps[-1].completed_at
-            if (
-                scenario_started_at is not None
-                and scenario_completed_at is not None
-                and scenario_completed_at >= scenario_started_at
-            ):
-                scenario_duration_ms = max(
-                    0,
-                    round(
-                        (scenario_completed_at - scenario_started_at).total_seconds()
-                        * 1000
-                    ),
+        step_timing_statuses = required_step_timing_statuses
+        if any(item is ProcessTimingStatus.INVALID for item in step_timing_statuses):
+            scenario_timing_status = ProcessTimingStatus.INVALID
+            scenario_duration_ms = None
+            scenario_timed_out = None
+        elif step_timing_statuses and all(
+            item in {
+                ProcessTimingStatus.AVAILABLE,
+                ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
+            }
+            for item in step_timing_statuses
+        ):
+            scenario_timing_status = ProcessTimingStatus.AVAILABLE_DURATION_ONLY
+            scenario_duration_ms = elapsed_ms
+            scenario_timed_out = (
+                scenario_timed_out is True
+                or scenario_duration_ms > plan.timeout_seconds * 1000
+            )
+        else:
+            scenario_timing_status = ProcessTimingStatus.UNAVAILABLE
+            scenario_duration_ms = None
+            scenario_timed_out = None
+        scenario_errors = list(checkpoint_errors)
+        if fixture_read_required and not file_fixture_read_observed:
+            scenario_errors.append(
+                _scenario_error(
+                    "process_fixture_read_missing",
+                    "declared input fixture was not proven by a successful file read before submit",
                 )
-        scenario_timed_out = (
-            scenario_duration_ms is not None
-            and scenario_duration_ms > plan.timeout_seconds * 1000
-        ) or scenario_timed_out
+            )
+        for step_result in step_results:
+            if step_result.error is not None and step_result.error.error_type in {
+                "process_step_timing_unavailable",
+                "process_step_timing_invalid",
+                "process_step_timeout",
+            }:
+                scenario_errors.append(step_result.error)
         scenario_status = ScenarioStatus.COMPLETED if (
             completed and required_steps_ok and cleanup_ok and process_identity_matched
             and bool(command_matched) and (input_matched is not False)
-            and cursor_integrity and status_transitions_valid and not scenario_timed_out
+            and cursor_integrity and status_transitions_valid and trace_passed
+            and (not fixture_read_required or file_fixture_read_observed)
+            and scenario_timed_out is not True
             and scenario_duration_ms is not None
             and all(item.passed is True for item in checkpoint_results if item.required)
         ) else ScenarioStatus.FAILED
+        if not scenario_errors and scenario_status is not ScenarioStatus.COMPLETED:
+            scenario_errors.append(
+                _scenario_error(
+                    "process-gate-failed",
+                    "declared Process lifecycle was incomplete",
+                )
+            )
         result = ProcessScenarioExecutionResult(
             scenario_id=plan.scenario_id,
             status=scenario_status,
@@ -967,18 +1169,21 @@ def build_scenario_results(
             final_status=final_status,
             incremental_reads=incremental,
             input_events=input_events,
+            tool_calls=trace_tool_calls,
             input_matched=input_matched,
+            file_fixture_read_observed=file_fixture_read_observed,
             status_transitions_valid=status_transitions_valid,
             scenario_timeout_seconds=plan.timeout_seconds,
+            timing_status=scenario_timing_status,
             scenario_timed_out=scenario_timed_out,
+            agent_close_required=any(
+                item.action is ProcessAction.CLOSE and item.required
+                for item in plan.steps
+            ),
             agent_close_observed=agent_close_observed,
             worker_cleanup_result=cleanup,
             duration_ms=scenario_duration_ms,
-            errors=(
-                checkpoint_errors
-                if checkpoint_errors
-                else ([] if scenario_status is ScenarioStatus.COMPLETED else [_scenario_error("process-gate-failed", "declared Process lifecycle was incomplete")])
-            ),
+            errors=scenario_errors,
         )
         results.append(result)
         if request.artifact_paths.process_output_logs:

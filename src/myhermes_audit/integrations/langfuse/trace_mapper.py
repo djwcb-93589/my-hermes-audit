@@ -311,9 +311,23 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
             "command_matched": getattr(scenario, "command_matched", None),
             "process_identity_matched": getattr(scenario, "process_identity_matched", None),
             "input_matched": getattr(scenario, "input_matched", None),
+            "file_fixture_read_observed": getattr(scenario, "file_fixture_read_observed", False),
             "cursor_unit": getattr(scenario, "cursor_unit", "character"),
+            "timing_status": getattr(
+                getattr(scenario, "timing_status", None),
+                "value",
+                getattr(scenario, "timing_status", None),
+            ),
+            "timeout_seconds": getattr(scenario, "scenario_timeout_seconds", None),
             "scenario_timed_out": getattr(scenario, "scenario_timed_out", False),
+            "timed_out": getattr(scenario, "scenario_timed_out", None),
+            "agent_close_required": getattr(scenario, "agent_close_required", False),
             "agent_close_observed": getattr(scenario, "agent_close_observed", False),
+            "worker_cleanup_completed": getattr(
+                getattr(scenario, "worker_cleanup_result", None),
+                "complete",
+                None,
+            ),
             "content_omitted": True,
         }
         observation = root.start_observation(
@@ -338,6 +352,11 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                         None if step.actual_status is None else step.actual_status.value
                     ),
                     "timeout_seconds": step.timeout_seconds,
+                    "timing_status": getattr(
+                        getattr(step, "timing_status", None),
+                        "value",
+                        getattr(step, "timing_status", None),
+                    ),
                     "timed_out": step.timed_out,
                     "expected_process_id_safe": step.expected_process_id_safe,
                     "actual_process_id_safe": step.actual_process_id_safe,
@@ -445,6 +464,10 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                         "expected_input_utf8_bytes": event.expected_input_utf8_bytes,
                         "actual_input_utf8_bytes": event.actual_input_utf8_bytes,
                         "input_matched": event.input_matched,
+                        "file_fixture_read_observed": event.file_fixture_read_observed,
+                        "file_fixture_read_sha256": event.file_fixture_read_sha256,
+                        "file_fixture_read_char_length": event.file_fixture_read_char_length,
+                        "file_fixture_read_utf8_bytes": event.file_fixture_read_utf8_bytes,
                         "process_identity_matched": event.process_identity_matched,
                         "bytes_written": event.bytes_written,
                         "content_omitted": True,
@@ -452,6 +475,23 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                     version="p6.1",
                 )
                 input_span.end()
+            for tool in getattr(scenario, "tool_calls", ()):
+                tool_span = observation.start_observation(
+                    name=PROCESS_STEP_NAME,
+                    as_type="event",
+                    input={"content_omitted": True},
+                    output={"content_omitted": True},
+                    metadata={
+                        "scenario_id": scenario.scenario_id,
+                        "action": "tool_trace",
+                        "tool_name": tool.tool_name,
+                        "call_count": tool.call_count,
+                        "successful_count": tool.successful_count,
+                        "content_omitted": True,
+                    },
+                    version="p6.1",
+                )
+                tool_span.end()
             cleanup = getattr(scenario, "worker_cleanup_result", None)
             if cleanup is not None:
                 cleanup_span = observation.start_observation(

@@ -48,6 +48,7 @@ from myhermes_audit.contracts import (
     ProcessAction,
     E2EScenarioKind,
     ProcessScenarioExecutionResult,
+    ProcessTimingStatus,
     ScenarioError,
     ScenarioStatus,
     ToolchainScenarioExecutionResult,
@@ -2836,8 +2837,9 @@ def _fallback_scenario_results(
                 scenario_id=plan.scenario_id,
                 status=ScenarioStatus.FAILED,
                 scenario_timeout_seconds=plan.timeout_seconds,
-                scenario_timed_out=timed_out,
-                duration_ms=duration_ms,
+                timing_status=ProcessTimingStatus.UNAVAILABLE,
+                scenario_timed_out=None,
+                duration_ms=None,
                 errors=[error],
             )
         else:

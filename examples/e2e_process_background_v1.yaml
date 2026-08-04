@@ -2,8 +2,8 @@ schema_version: "1.0"
 suite_id: e2e-process-background-v1
 name: P6.1 synthetic Process and Background scenarios
 description: >-
-  Three bounded cross-platform Python background-process scenarios driven only
-  through the Subject terminal and process public tools.
+  Three bounded cross-platform Python background-process scenarios driven through
+  the Subject file, terminal, and process public tools.
 tags: [e2e, process, background, p6.1, synthetic]
 defaults:
   trials: 1
@@ -14,7 +14,7 @@ defaults:
 cases:
   - case_id: process-short-background
     name: Read a short background task incrementally to completion
-    description: Start, read new output, wait for completion, close the public process handle, and verify worker cleanup.
+    description: Start, read new output, wait for completion, and verify Worker cleanup without an Agent close.
     mode: single_turn
     input:
       message: >-
@@ -23,8 +23,7 @@ cases:
         Use the returned process identity with the public process tool. Read
         the initial output before sending the continue signal from the declared
         fixture, read the final output from the previous cursor, wait for
-        completion, close the public process stdin, and report the observed
-        markers only after worker cleanup.
+        completion, and report the observed markers only after Worker cleanup.
     execution:
       enabled_toolsets: [terminal]
     fixture:
@@ -66,7 +65,7 @@ cases:
             required: true
           - kind: cleanup
             checkpoint_id: cleaned
-            expect_agent_close: true
+            expect_agent_close: false
             expect_worker_cleanup: true
             expect_no_live_processes: true
             required: true
@@ -110,10 +109,6 @@ cases:
             timeout_seconds: 30
             required: true
             expected_status: completed
-          - step_id: close
-            action: close
-            timeout_seconds: 30
-            required: true
     evaluators:
       - evaluator_id: process-short-answer
         kind: deterministic
@@ -125,18 +120,22 @@ cases:
 
   - case_id: process-input-background
     name: Send input to a waiting background task
-    description: Start a stdin task, submit one synthetic line, close the public process handle, then observe completion and cleanup.
+    description: Read a declared input fixture, submit it to a waiting task, then observe completion and Worker cleanup.
     mode: single_turn
     input:
       message: >-
         Start a bounded background Python task with the public terminal tool
         that waits for one line on stdin and prints P6-INPUT-OK. Use the public
-        process tool to observe waiting_for_input, submit the synthetic line
-        from fixtures/process-input.txt, wait for completed, close the public
-        process stdin, and report only the truthful result. Never include the
-        input body in the report.
+        process tool to observe waiting_for_input, submit the exact content
+        returned by the file tool, wait for completed, and report only the
+        truthful result. First use the file tool with action read on
+        fixtures/process-input.txt. Then start the process, submit the content
+        actually returned by that file read, read the result, wait for completed,
+        and verify the final status. Do not read the fixture with cat, type,
+        Get-Content, or any terminal command, and never include the input body in
+        the report.
     execution:
-      enabled_toolsets: [terminal]
+      enabled_toolsets: [file, terminal]
     fixture:
       files:
         - path: workspace/fixtures/process-input.txt
@@ -151,7 +150,11 @@ cases:
         kind: process_background
         timeout_seconds: 120
         required: true
-        required_toolsets: [terminal]
+        required_toolsets: [file, terminal]
+        trace_requirements:
+          - tool_name: file
+            minimum_calls: 1
+            minimum_successful_calls: 1
         cleanup:
           required: true
           expect_no_live_processes: true
@@ -174,7 +177,7 @@ cases:
             required: true
           - kind: cleanup
             checkpoint_id: cleaned
-            expect_agent_close: true
+            expect_agent_close: false
             expect_worker_cleanup: true
             expect_no_live_processes: true
             required: true
@@ -213,10 +216,6 @@ cases:
             minimum_new_output_length: 1
             required_markers: [P6-INPUT-OK]
             forbidden_markers: [P6-WAIT]
-          - step_id: close
-            action: close
-            timeout_seconds: 30
-            required: true
     evaluators:
       - evaluator_id: process-input-answer
         kind: deterministic
@@ -228,16 +227,16 @@ cases:
 
   - case_id: process-kill-cleanup
     name: Kill a bounded long task and clean up the session
-    description: Exercise explicit close and kill, then verify the worker cleanup report independently.
+    description: Exercise kill on a running task, then verify the Worker cleanup report independently.
     mode: single_turn
     input:
       message: >-
         Start a bounded background Python task with the public terminal tool
         that prints P6-LONG and sleeps for ten seconds. Use the public process
         tool to read its initial output, issue kill with a bounded grace period,
-        assert the killed status, optionally close the public process handle,
-        and let the worker report session cleanup. Do not use an OS kill command
-        and do not claim completion from assistant text.
+        assert the killed status and let the Worker report session cleanup. Do
+        not call close after the process is terminal, do not use an OS kill
+        command, and do not claim completion from assistant text.
     execution:
       enabled_toolsets: [terminal]
     fixture:
@@ -277,7 +276,7 @@ cases:
             required: true
           - kind: cleanup
             checkpoint_id: cleaned
-            expect_agent_close: true
+            expect_agent_close: false
             expect_worker_cleanup: true
             expect_no_live_processes: true
             required: true
@@ -306,10 +305,6 @@ cases:
             timeout_seconds: 30
             required: true
             expected_status: killed
-          - step_id: close
-            action: close
-            timeout_seconds: 30
-            required: true
     evaluators:
       - evaluator_id: process-kill-answer
         kind: deterministic

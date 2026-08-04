@@ -42,6 +42,15 @@ class ScenarioStatus(str, Enum):
     ERROR = "error"
 
 
+class ProcessTimingStatus(str, Enum):
+    """Whether a public Process observation supplied reliable timing facts."""
+
+    AVAILABLE = "available"
+    AVAILABLE_DURATION_ONLY = "available_duration_only"
+    UNAVAILABLE = "unavailable"
+    INVALID = "invalid"
+
+
 class ScenarioProcessStatus(str, Enum):
     STARTING = "starting"
     RUNNING = "running"
@@ -180,6 +189,7 @@ class ScenarioPlanBase(ContractModel):
     required: StrictBool = True
     checkpoints: list[ScenarioCheckpoint] = Field(default_factory=list)
     required_toolsets: list[NonEmptyText] = Field(default_factory=list)
+    trace_requirements: list[ScenarioTraceRequirement] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_checkpoints(self) -> "ScenarioPlanBase":
@@ -188,6 +198,9 @@ class ScenarioPlanBase(ContractModel):
             raise ValueError("scenario checkpoint IDs must be unique")
         if len(self.required_toolsets) != len(set(self.required_toolsets)):
             raise ValueError("scenario required_toolsets must be unique")
+        trace_names = [item.tool_name for item in self.trace_requirements]
+        if len(trace_names) != len(set(trace_names)):
+            raise ValueError("scenario trace requirement tool names must be unique")
         allowed_toolsets = {"file", "terminal", "memory", "skill_read"}
         unknown = sorted(set(self.required_toolsets) - allowed_toolsets)
         if unknown:
@@ -204,7 +217,6 @@ class ToolchainScenarioPlan(ScenarioPlanBase):
     forbidden_tool_calls: list[ScenarioToolCall] = Field(default_factory=list)
     input_artifacts: list[FixtureTargetPath] = Field(default_factory=list)
     output_artifacts: list[FixtureTargetPath] = Field(default_factory=list)
-    trace_requirements: list[ScenarioTraceRequirement] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_toolchain(self) -> "ToolchainScenarioPlan":
@@ -216,9 +228,6 @@ class ToolchainScenarioPlan(ScenarioPlanBase):
         forbidden_names = {item.tool_name for item in self.forbidden_tool_calls}
         if required_names & forbidden_names:
             raise ValueError("a tool cannot be both required and forbidden")
-        trace_names = [item.tool_name for item in self.trace_requirements]
-        if len(trace_names) != len(set(trace_names)):
-            raise ValueError("scenario trace requirement tool names must be unique")
         for checkpoint in self.checkpoints:
             if not isinstance(checkpoint, ArtifactOutputCheckpoint):
                 raise ValueError(
@@ -349,8 +358,8 @@ class ProcessScenarioPlan(ScenarioPlanBase):
         for index, step in enumerate(self.steps):
             if step.timeout_seconds > self.timeout_seconds:
                 raise ValueError("Process step timeout cannot exceed scenario timeout")
-            if isinstance(step, ProcessWaitStep) and step.maximum_wait_seconds > step.timeout_seconds:
-                raise ValueError("wait maximum_wait_seconds cannot exceed step timeout")
+            if isinstance(step, ProcessWaitStep) and step.timeout_seconds > step.maximum_wait_seconds:
+                raise ValueError("wait step timeout cannot exceed maximum_wait_seconds")
             if index < start_index and step.action is not ProcessAction.START:
                 raise ValueError("Process start must precede every Process operation")
             if step.process_ref_step_id is not None and step.process_ref_step_id != self.steps[start_index].step_id:
@@ -361,7 +370,19 @@ class ProcessScenarioPlan(ScenarioPlanBase):
         read_step_ids: list[str] = []
         step_indices = {step.step_id: index for index, step in enumerate(self.steps)}
         for index, step in enumerate(self.steps[start_index + 1 :], start=start_index + 1):
+            if step.action is ProcessAction.CLOSE and terminal_seen:
+                raise ValueError(
+                    "Process close must target a running Process before terminal state"
+                )
             if step.action in {ProcessAction.KILL, ProcessAction.INTERRUPT, ProcessAction.CLOSE}:
+                terminal_seen = True
+            elif (
+                isinstance(step, ProcessWaitStep)
+                and step.expected_status in _TERMINAL_PROCESS_STATUSES
+            ) or (
+                isinstance(step, ProcessAssertStatusStep)
+                and step.expected_status in _TERMINAL_PROCESS_STATUSES
+            ):
                 terminal_seen = True
             elif step.action is ProcessAction.SEND_INPUT and terminal_seen:
                 raise ValueError("send_input cannot follow a terminal Process action")
@@ -522,7 +543,8 @@ class ScenarioStepResult(ContractModel):
     completed_at: UtcDatetime | None = None
     duration_ms: NonNegativeInt | None = None
     timeout_seconds: PositiveInt
-    timed_out: StrictBool = False
+    timing_status: ProcessTimingStatus = ProcessTimingStatus.UNAVAILABLE
+    timed_out: StrictBool | None = None
     observation_refs: list[Identifier] = Field(default_factory=list)
     expected_process_id_safe: Identifier | None = None
     actual_process_id_safe: Identifier | None = None
@@ -538,8 +560,29 @@ class ScenarioStepResult(ContractModel):
             and self.completed_at < self.started_at
         ):
             raise ValueError("scenario step completed_at cannot precede started_at")
-        if self.duration_ms is not None and self.timeout_seconds is not None:
-            if self.timed_out != (self.duration_ms > self.timeout_seconds * 1000):
+        if self.timing_status is ProcessTimingStatus.AVAILABLE:
+            if (
+                self.started_at is None
+                or self.completed_at is None
+                or self.duration_ms is None
+            ):
+                raise ValueError("available step timing requires timestamps and duration")
+        elif self.timing_status is ProcessTimingStatus.AVAILABLE_DURATION_ONLY:
+            if self.duration_ms is None:
+                raise ValueError("duration-only timing requires duration")
+            if self.started_at is not None or self.completed_at is not None:
+                raise ValueError("duration-only timing cannot claim timestamps")
+        else:
+            if self.duration_ms is not None:
+                raise ValueError("unavailable or invalid timing cannot claim duration")
+            if self.timed_out is not None:
+                raise ValueError("unavailable or invalid timing cannot claim timeout")
+        if self.timing_status in {
+            ProcessTimingStatus.AVAILABLE,
+            ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
+        }:
+            expected_timeout = self.duration_ms > self.timeout_seconds * 1000
+            if self.timed_out != expected_timeout:
                 raise ValueError("step timed_out must match duration and timeout")
         return self
 
@@ -581,6 +624,10 @@ class ProcessInputObservation(ContractModel):
     expected_input_utf8_bytes: NonNegativeInt | None = None
     actual_input_utf8_bytes: NonNegativeInt | None = None
     input_matched: StrictBool | None = None
+    file_fixture_read_observed: StrictBool | None = None
+    file_fixture_read_sha256: Sha256Digest | None = None
+    file_fixture_read_char_length: NonNegativeInt | None = None
+    file_fixture_read_utf8_bytes: NonNegativeInt | None = None
     process_id_safe: Identifier | None = None
     process_identity_matched: StrictBool | None = None
     action_matched: StrictBool | None = None
@@ -631,16 +678,20 @@ class ProcessScenarioExecutionResult(ContractModel):
     cursor_unit: Literal["character"] = "character"
     incremental_reads: list[IncrementalReadObservation] = Field(default_factory=list)
     input_events: list[ProcessInputObservation] = Field(default_factory=list)
+    tool_calls: list[ScenarioToolCallObservation] = Field(default_factory=list)
     input_matched: StrictBool | None = None
+    file_fixture_read_observed: StrictBool = False
     status_transitions_valid: StrictBool | None = None
     scenario_timeout_seconds: PositiveInt
-    scenario_timed_out: StrictBool = False
+    timing_status: ProcessTimingStatus = ProcessTimingStatus.UNAVAILABLE
+    scenario_timed_out: StrictBool | None = None
+    agent_close_required: StrictBool = False
     agent_close_observed: StrictBool = False
     worker_cleanup_result: ProcessCleanupResult | None = None
     # A Process duration is only present when the public Observation window
-    # supplied enough real timing facts.  ``None`` is deliberately distinct
-    # from a measured zero so validators cannot turn missing timing into a
-    # successful timeout gate.
+    # supplied timing facts classified by ``timing_status``. ``None`` is
+    # deliberately distinct from a measured zero so validators cannot turn
+    # missing timing into a successful timeout gate.
     duration_ms: NonNegativeInt | None = None
     errors: list[ScenarioError] = Field(default_factory=list)
 
@@ -648,12 +699,24 @@ class ProcessScenarioExecutionResult(ContractModel):
     def validate_status_transition(self) -> "ProcessScenarioExecutionResult":
         if self.initial_status in _TERMINAL_PROCESS_STATUSES and self.final_status in _ACTIVE_PROCESS_STATUSES:
             raise ValueError("terminal Process cannot transition back to active")
-        if (
-            self.duration_ms is not None
-            and self.duration_ms > self.scenario_timeout_seconds * 1000
-            and not self.scenario_timed_out
-        ):
-            raise ValueError("scenario_timed_out must reflect the scenario deadline")
+        if self.timing_status is ProcessTimingStatus.AVAILABLE_DURATION_ONLY:
+            if self.duration_ms is None:
+                raise ValueError("duration-only scenario timing requires duration")
+        elif self.timing_status is ProcessTimingStatus.AVAILABLE:
+            if self.duration_ms is None:
+                raise ValueError("available scenario timing requires duration")
+        else:
+            if self.duration_ms is not None:
+                raise ValueError("unavailable or invalid scenario timing cannot claim duration")
+            if self.scenario_timed_out is not None:
+                raise ValueError("unavailable or invalid timing cannot claim timeout")
+        if self.timing_status in {
+            ProcessTimingStatus.AVAILABLE,
+            ProcessTimingStatus.AVAILABLE_DURATION_ONLY,
+        }:
+            expected_timeout = self.duration_ms > self.scenario_timeout_seconds * 1000
+            if self.scenario_timed_out != expected_timeout:
+                raise ValueError("scenario_timed_out must reflect the scenario deadline")
         return self
 
 
@@ -686,6 +749,7 @@ __all__ = (
     "ProcessStatusCheckpoint",
     "ProcessStep",
     "ProcessStepBase",
+    "ProcessTimingStatus",
     "ProcessWaitStep",
     "ScenarioArtifactObservation",
     "ScenarioCheckpoint",

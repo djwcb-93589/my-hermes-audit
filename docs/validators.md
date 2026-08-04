@@ -18,6 +18,18 @@ Toolchain checkpoint diagnostics remain separate: `artifact_missing`,
 distinguish `cursor_reference_missing` from `cursor_chain_mismatch`; both are
 hard-gate facts when declared by a required scenario.
 
+Process validation also keeps independent `command_identity`, `process_identity`,
+`input_identity`, `business_status`, `step_action`, `process_trace`,
+`fixture_read`, `step_timing`, `step_timeout`, `scenario_timing`,
+`scenario_timeout`, and `worker_cleanup` dimensions. A required Step with
+missing or invalid timing emits `process_step_timing_unavailable` or
+`process_step_timing_invalid`; a measured budget overrun emits
+`process_step_timeout`. These are not collapsed into a business-status error.
+The required Process gate is false for any failed timing, trace, fixture, or
+cleanup dimension and flows into the existing `task_success`/`task_passed`
+gate without adding a first-level score. Optional missing timing is represented
+as `NOT_APPLICABLE` for the timeout dimension.
+
 ## P5 Background Review
 
 `background_review` evaluator 只消费 Worker 已持久化的 `BackgroundReviewExecutionResult`、安全 evidence projection、live snapshot 和 observed state diff；它不导入 MyHermes、不重新运行 Review、模型或工具，也不根据 Assistant 文本猜测状态变化。
