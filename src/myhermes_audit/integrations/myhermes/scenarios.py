@@ -24,6 +24,14 @@ from myhermes_audit.contracts import (
     ProcessScenarioExecutionResult,
     ProcessOutputCheckpoint,
     ProcessTimingStatus,
+    ProcessAssertStatusStep,
+    ProcessCloseStep,
+    ProcessInterruptStep,
+    ProcessKillStep,
+    ProcessReadIncrementalStep,
+    ProcessSendInputStep,
+    ProcessStartStep,
+    ProcessWaitStep,
     ScenarioArtifactObservation,
     ScenarioCheckpointResult,
     ScenarioError,
@@ -324,20 +332,43 @@ def _event_matches_step(event: Mapping[str, object] | None, step) -> bool:
     arguments = _event_arguments(event)
     result = _event_result(event)
     observed_action = result.get("action") or arguments.get("action")
-    if step.action is ProcessAction.START:
+    if isinstance(step, ProcessStartStep):
+        if step.action is not ProcessAction.START:
+            return False
         return name == "terminal" and arguments.get("background") is True
     if name != "process":
         return False
-    expected = {
-        ProcessAction.READ_INCREMENTAL: "log",
-        ProcessAction.SEND_INPUT: "submit" if step.submit else "write",
-        ProcessAction.WAIT: "wait",
-        ProcessAction.INTERRUPT: "interrupt",
-        ProcessAction.KILL: "kill",
-        ProcessAction.CLOSE: "close",
-        ProcessAction.ASSERT_STATUS: "poll",
-    }.get(step.action)
-    return expected is not None and observed_action == expected
+    if isinstance(step, ProcessSendInputStep):
+        if step.action is not ProcessAction.SEND_INPUT:
+            return False
+        expected_action = "submit" if step.submit else "write"
+    elif isinstance(step, ProcessReadIncrementalStep):
+        if step.action is not ProcessAction.READ_INCREMENTAL:
+            return False
+        expected_action = "log"
+    elif isinstance(step, ProcessWaitStep):
+        if step.action is not ProcessAction.WAIT:
+            return False
+        expected_action = "wait"
+    elif isinstance(step, ProcessInterruptStep):
+        if step.action is not ProcessAction.INTERRUPT:
+            return False
+        expected_action = "interrupt"
+    elif isinstance(step, ProcessKillStep):
+        if step.action is not ProcessAction.KILL:
+            return False
+        expected_action = "kill"
+    elif isinstance(step, ProcessCloseStep):
+        if step.action is not ProcessAction.CLOSE:
+            return False
+        expected_action = "close"
+    elif isinstance(step, ProcessAssertStatusStep):
+        if step.action is not ProcessAction.ASSERT_STATUS:
+            return False
+        expected_action = "poll"
+    else:
+        return False
+    return observed_action == expected_action
 
 
 def _scenario_tool_call_seen(events: Sequence[Mapping[str, object]], expected) -> bool:
