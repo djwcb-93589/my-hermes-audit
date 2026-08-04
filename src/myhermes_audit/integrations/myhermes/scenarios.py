@@ -1054,13 +1054,12 @@ def build_scenario_results(
             item.runtime_status in {"timeout", "timed_out"}
             for item in turns
         )
-        process_watchdog_enabled = plan.required
-        hard_timeout_source = (
-            ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
-            if process_watchdog_enabled
-            else ProcessHardTimeoutSource.TRIAL_WATCHDOG
-        )
-        hard_timeout_seconds = request.timeout_seconds
+        # The parent Runner computed this disposition and carried it in the
+        # Worker request.  Never infer watchdog scope from plan.required here:
+        # optional Process plans execute under the Trial watchdog.
+        process_watchdog_enabled = request.process_watchdog_enabled
+        hard_timeout_source = request.hard_timeout_source
+        hard_timeout_seconds = request.hard_timeout_seconds
         wait_remaining_budget_status = WaitRemainingBudgetStatus.NOT_APPLICABLE
         wait_elapsed_before_ms: int | None = None
         wait_remaining_seconds: float | int | None = None
@@ -1246,7 +1245,11 @@ def build_scenario_results(
             step_fallback_used: bool | None = None
             if step.action is ProcessAction.WAIT:
                 wait_timeout = arguments.get("timeout")
-                step_fallback_allowed = step.allow_hard_watchdog_fallback
+                step_fallback_allowed = (
+                    step.allow_hard_watchdog_fallback
+                    and hard_timeout_source
+                    is ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
+                )
                 if (
                     process_start_pre_ns is not None
                     and hook_boundaries is not None
@@ -1563,10 +1566,12 @@ def build_scenario_results(
         observation_started_at = None
         observation_completed_at = None
         observation_span_ms = None
-        if (
+        all_observation_timestamps_available = (
             matched_event_count > 0
             and len(matched_observation_times) == matched_event_count
-            and all(
+        )
+        if all_observation_timestamps_available:
+            timestamps_monotonic = all(
                 current >= previous
                 for previous, current in zip(
                     matched_observation_times,
@@ -1574,19 +1579,26 @@ def build_scenario_results(
                     strict=False,
                 )
             )
-        ):
+        else:
+            timestamps_monotonic = None
+        if all_observation_timestamps_available:
             observation_started_at = matched_observation_times[0]
             observation_completed_at = matched_observation_times[-1]
+        if timestamps_monotonic is True:
             observation_span_ms = round(
                 (observation_completed_at - observation_started_at).total_seconds()
                 * 1000
             )
             observation_span_status = ProcessObservationSpanStatus.AVAILABLE
-        elif matched_event_count > 0:
+        elif timestamps_monotonic is False:
             observation_span_status = ProcessObservationSpanStatus.INVALID
         scenario_observation_timing_source = (
             ProcessTimingSource.PUBLIC_OBSERVATION_PERSISTENCE
-            if observation_span_status is ProcessObservationSpanStatus.AVAILABLE
+            if observation_span_status
+            in {
+                ProcessObservationSpanStatus.AVAILABLE,
+                ProcessObservationSpanStatus.INVALID,
+            }
             else ProcessTimingSource.UNAVAILABLE
         )
         pre_hook_values = [
@@ -1737,11 +1749,11 @@ def build_scenario_results(
                     f"scenario={plan.scenario_id}; Worker case watchdog exceeded",
                 )
             )
-        if observation_span_status is not ProcessObservationSpanStatus.AVAILABLE:
+        if observation_span_status is ProcessObservationSpanStatus.INVALID:
             scenario_errors.append(
                 _scenario_error(
-                    "process_scenario_observation_span_unavailable",
-                    f"scenario={plan.scenario_id}; public observation persistence span was unavailable",
+                    "process_scenario_observation_span_invalid",
+                    f"scenario={plan.scenario_id}; public observation persistence timestamps were not ordered",
                 )
             )
         if scenario_observation_span_exceeded is True:
@@ -1758,6 +1770,7 @@ def build_scenario_results(
             and (not fixture_read_required or file_fixture_read_observed)
             and not alignment_diagnostics
             and not hard_timeout_triggered
+            and observation_span_status is not ProcessObservationSpanStatus.INVALID
             and scenario_observation_span_exceeded is not True
             and all(item.passed is True for item in checkpoint_results if item.required)
         ) else ScenarioStatus.FAILED

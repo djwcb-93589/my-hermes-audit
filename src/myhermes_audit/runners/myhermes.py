@@ -934,6 +934,16 @@ class MyHermesTrialRunner:
             if process_watchdog_enabled
             else timeout_seconds
         )
+        hard_timeout_source = (
+            ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
+            if process_watchdog_enabled
+            else ProcessHardTimeoutSource.TRIAL_WATCHDOG
+        )
+        hard_timeout_scenario_id = (
+            required_process_scenarios[0].scenario_id
+            if process_watchdog_enabled
+            else None
+        )
         paths = _worker_artifact_paths(
             sandbox,
             memory_enabled=memory_case,
@@ -1007,6 +1017,10 @@ class MyHermesTrialRunner:
                 ),
                 skill_fixtures=list(case.fixture.skills),
                 scenarios=list(case.scenarios),
+                process_watchdog_enabled=process_watchdog_enabled,
+                hard_timeout_source=hard_timeout_source,
+                hard_timeout_seconds=scenario_timeout,
+                hard_timeout_scenario_id=hard_timeout_scenario_id,
                 timeout_seconds=scenario_timeout,
                 artifact_paths=paths,
             )
@@ -1133,10 +1147,10 @@ class MyHermesTrialRunner:
                         recovered_background_review_errors
                     ),
                     scenarios=case.scenarios,
-                    process_watchdog_enabled=process_watchdog_enabled,
+                    hard_timeout_source=hard_timeout_source,
                     hard_timeout_seconds=request.timeout_seconds,
                     trial_watchdog_timed_out=(
-                        not process_watchdog_enabled
+                        hard_timeout_source is ProcessHardTimeoutSource.TRIAL_WATCHDOG
                         and request.timeout_seconds >= timeout_seconds
                     ),
                 )
@@ -1380,7 +1394,7 @@ class MyHermesTrialRunner:
                     recovered_background_review_errors
                 ),
                 scenarios=case.scenarios,
-                process_watchdog_enabled=process_watchdog_enabled,
+                hard_timeout_source=hard_timeout_source,
                 hard_timeout_seconds=scenario_timeout,
             )
             result, recovered_memory = _redact_memory_facts(
@@ -1437,7 +1451,7 @@ class MyHermesTrialRunner:
                         recovered_background_review_errors
                     ),
                     scenarios=case.scenarios,
-                    process_watchdog_enabled=process_watchdog_enabled,
+                    hard_timeout_source=hard_timeout_source,
                     hard_timeout_seconds=scenario_timeout,
                 )
             return self._outcome_from_result(
@@ -2535,6 +2549,32 @@ def _validate_worker_artifacts(
         item.scenario_id for item in result.scenario_results
     ):
         raise WorkerProtocolError("worker scenario Artifact facts do not match result")
+    for process_result in (
+        item
+        for item in result.scenario_results
+        if item.kind is E2EScenarioKind.PROCESS_BACKGROUND
+    ):
+        if (
+            process_result.hard_timeout_source is not request.hard_timeout_source
+            or process_result.hard_timeout_seconds != request.hard_timeout_seconds
+        ):
+            raise WorkerProtocolError(
+                "Process result watchdog facts do not match Runner disposition"
+            )
+        if request.process_watchdog_enabled and (
+            process_result.scenario_id != request.hard_timeout_scenario_id
+        ):
+            raise WorkerProtocolError(
+                "Process result Scenario does not match watchdog disposition"
+            )
+        if (
+            not request.process_watchdog_enabled
+            and process_result.hard_timeout_source
+            is ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
+        ):
+            raise WorkerProtocolError(
+                "disabled Process watchdog cannot appear in a result"
+            )
     if toolchain_artifact is not None and (
         toolchain_artifact.trial_id != request.trial_id
         or toolchain_artifact.case_id != request.case_id
@@ -2935,7 +2975,9 @@ def _fallback_scenario_results(
     duration_ms: int,
     error_type: str,
     timed_out: bool,
-    process_watchdog_enabled: bool = False,
+    hard_timeout_source: ProcessHardTimeoutSource = (
+        ProcessHardTimeoutSource.TRIAL_WATCHDOG
+    ),
     hard_timeout_seconds: int | None = None,
     trial_watchdog_timed_out: bool = False,
 ) -> tuple[list[object], list[ScenarioError]]:
@@ -2949,10 +2991,9 @@ def _fallback_scenario_results(
             message="Worker did not return a complete scenario observation",
         )
         if plan.kind is E2EScenarioKind.PROCESS_BACKGROUND:
-            hard_timeout_source = (
-                ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
-                if process_watchdog_enabled
-                else ProcessHardTimeoutSource.TRIAL_WATCHDOG
+            process_watchdog_active = (
+                hard_timeout_source
+                is ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
             )
             result = ProcessScenarioExecutionResult(
                 scenario_id=plan.scenario_id,
@@ -2963,10 +3004,14 @@ def _fallback_scenario_results(
                 hard_timeout_triggered=timed_out,
                 trial_watchdog_timed_out=(
                     trial_watchdog_timed_out
-                    or (timed_out and not process_watchdog_enabled)
+                    or (
+                        timed_out
+                        and hard_timeout_source
+                        is ProcessHardTimeoutSource.TRIAL_WATCHDOG
+                    )
                 ),
                 scenario_watchdog_timed_out=(
-                    timed_out and process_watchdog_enabled
+                    timed_out and process_watchdog_active
                 ),
                 duration_ms=None,
                 errors=[error],
@@ -3003,7 +3048,9 @@ def _fallback_worker_result(
         BackgroundReviewExecutionError
     ] = (),
     scenarios: Sequence[object] = (),
-    process_watchdog_enabled: bool = False,
+    hard_timeout_source: ProcessHardTimeoutSource = (
+        ProcessHardTimeoutSource.TRIAL_WATCHDOG
+    ),
     hard_timeout_seconds: int | None = None,
     trial_watchdog_timed_out: bool = False,
 ) -> MyHermesWorkerResult:
@@ -3039,7 +3086,7 @@ def _fallback_worker_result(
         duration_ms=duration_ms,
         error_type=error_type,
         timed_out=error_type == "timeout",
-        process_watchdog_enabled=process_watchdog_enabled,
+        hard_timeout_source=hard_timeout_source,
         hard_timeout_seconds=hard_timeout_seconds,
         trial_watchdog_timed_out=trial_watchdog_timed_out,
     )

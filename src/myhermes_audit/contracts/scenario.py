@@ -54,7 +54,12 @@ class ProcessTimingStatus(str, Enum):
 
 
 class ProcessObservationSpanStatus(str, Enum):
-    """Availability of the persistence-timestamp observation interval."""
+    """Availability of the persistence-timestamp observation interval.
+
+    ``UNAVAILABLE`` is diagnostic when one or more timestamps are missing;
+    ``INVALID`` means the complete timestamp set violates its ordering
+    contract and is therefore a Scenario error.
+    """
 
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
@@ -919,7 +924,9 @@ class ProcessScenarioExecutionResult(ContractModel):
         ):
             raise ValueError("scenario observation timestamps must be paired")
         if (
-            self.scenario_observation_started_at is not None
+            self.scenario_observation_span_status
+            is not ProcessObservationSpanStatus.INVALID
+            and self.scenario_observation_started_at is not None
             and self.scenario_observation_completed_at is not None
             and self.scenario_observation_completed_at
             < self.scenario_observation_started_at
@@ -943,6 +950,17 @@ class ProcessScenarioExecutionResult(ContractModel):
             )
             if computed_ms != self.scenario_observation_span_ms:
                 raise ValueError("observation span must match persistence timestamps")
+        elif self.scenario_observation_span_status is ProcessObservationSpanStatus.INVALID:
+            if (
+                self.scenario_observation_started_at is None
+                or self.scenario_observation_completed_at is None
+                or self.scenario_observation_span_ms is not None
+                or self.scenario_observation_timing_source
+                is not ProcessTimingSource.PUBLIC_OBSERVATION_PERSISTENCE
+            ):
+                raise ValueError(
+                    "invalid observation span requires persistence timestamp facts"
+                )
         else:
             if any(
                 value is not None

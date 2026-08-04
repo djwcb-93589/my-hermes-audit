@@ -26,6 +26,7 @@ from myhermes_audit.contracts import (
     MemorySnapshotPhase,
     MemoryStateChange,
     MemoryStateSnapshot,
+    ProcessHardTimeoutSource,
     RetrievalStrategy,
     RequiredFactExpectation,
     ScenarioError,
@@ -138,6 +139,15 @@ class MyHermesWorkerRequest(ContractModel):
     )
     skill_fixtures: list[SkillFixture] = Field(default_factory=list)
     scenarios: list[ScenarioPlan] = Field(default_factory=list)
+    # The parent Runner is the only component that computes this disposition.
+    # The Worker and Scenario projections consume these explicit facts rather
+    # than inferring a watchdog from the declared Scenario plan.
+    process_watchdog_enabled: StrictBool = False
+    hard_timeout_source: ProcessHardTimeoutSource = (
+        ProcessHardTimeoutSource.TRIAL_WATCHDOG
+    )
+    hard_timeout_seconds: PositiveInt
+    hard_timeout_scenario_id: Identifier | None = None
     timeout_seconds: PositiveInt
     artifact_paths: WorkerArtifactPaths
 
@@ -234,6 +244,38 @@ class MyHermesWorkerRequest(ContractModel):
                 "worker request allows at most one process_background Scenario: "
                 + ", ".join(process_scenario_ids)
             )
+        if self.hard_timeout_seconds != self.timeout_seconds:
+            raise ValueError(
+                "Worker hard timeout disposition must match timeout_seconds"
+            )
+        if self.process_watchdog_enabled:
+            if (
+                self.hard_timeout_source
+                is not ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
+            ):
+                raise ValueError(
+                    "enabled Process watchdog requires its explicit timeout source"
+                )
+            if self.hard_timeout_scenario_id is None:
+                raise ValueError(
+                    "enabled Process watchdog requires a Scenario identity"
+                )
+            if self.hard_timeout_scenario_id not in process_scenario_ids:
+                raise ValueError(
+                    "Process watchdog Scenario must be declared in the request"
+                )
+        else:
+            if (
+                self.hard_timeout_source
+                is not ProcessHardTimeoutSource.TRIAL_WATCHDOG
+            ):
+                raise ValueError(
+                    "disabled Process watchdog must use the Trial watchdog source"
+                )
+            if self.hard_timeout_scenario_id is not None:
+                raise ValueError(
+                    "disabled Process watchdog cannot name a Scenario"
+                )
         scenario_kinds = {item.kind.value for item in self.scenarios}
         if ("toolchain" in scenario_kinds) != (
             self.artifact_paths.toolchain_results is not None

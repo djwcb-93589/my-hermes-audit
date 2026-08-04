@@ -34,8 +34,12 @@ The Scenario exposes a persistence observation span named
 `public_observation_persistence`; this is an interval projection, not exact
 Tool boundaries. PRE and POST hook offsets and sources are separate: PRE is a
 control boundary before dispatch, while POST is emitted after the Observation
-batch is persisted and is not exact handler completion. The effective Worker
-watchdog is carried as either
+batch is persisted and is not exact handler completion. The Runner computes
+the effective watchdog disposition once and carries it in the request as
+`process_watchdog_enabled`, `hard_timeout_source`, `hard_timeout_seconds`, and
+(when enabled) the declared Process Scenario ID. The Worker and Scenario
+projection consume those fields; they do not infer watchdog scope from
+`plan.required`. The effective Worker watchdog is carried as either
 `hard_timeout_source=worker_process_scenario_watchdog` or
 `trial_watchdog`, independent of the observation span. WAIT remaining-budget
 facts use only start-PRE to WAIT-PRE and carry the explicit
@@ -46,8 +50,10 @@ labels, hashed identities, status, reason, and Step IDs. Cleanup timing remains
 a Worker lifecycle fact and is not folded into the foreground Scenario
 timeout. Only relative offsets and safe spans cross the protocol; host-specific
 absolute monotonic nanoseconds do not.
-Missing timestamps make the observation span unavailable rather than
-successful.
+Missing timestamps make the observation span `UNAVAILABLE` rather than
+successful or invalid. A complete timestamp set with an invalid order is
+`INVALID` and contributes a Scenario error; an unavailable span is diagnostic
+only and is not added to Scenario or Process error collections.
 
 Current default: `myhermes-audit-worker-v11`. P6.1 timing fields use the
 explicit observation-span, hook-span, hard-watchdog, and remaining-budget

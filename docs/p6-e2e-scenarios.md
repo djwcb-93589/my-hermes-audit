@@ -130,14 +130,18 @@ hard-watchdog fallback only when its `ProcessWaitStep` explicitly declares
 `wait_timeout_budget_matched: null` with status `fallback_used`; it never
 pretends that exact remaining budget was verified. The persistence observation
 span is diagnostic: unavailable is `NOT_APPLICABLE` and does not alone block
-the Process gate, while `observation_span_exceeded` remains an independent
+the Process gate, while an invalid complete timestamp ordering is `INVALID`
+and is a Scenario error. `observation_span_exceeded` remains an independent
 failure fact.
 
-The hard deadline is either the required Process Scenario watchdog
-(`hard_timeout_source=worker_process_scenario_watchdog`) or the existing Trial
-watchdog (`hard_timeout_source=trial_watchdog`). Only one required
-`process_background` Scenario may tighten the parent Worker timeout. Toolchain
-and optional Process Scenarios retain the Trial budget. The watchdog is
+The Runner computes the hard-deadline disposition once and carries its enabled
+state, source, budget, and Scenario identity in the Worker request. Scenario
+projection, WAIT fallback, and validation consume that disposition; they do
+not derive it from `plan.required`. The hard deadline is either the required
+Process Scenario watchdog (`hard_timeout_source=worker_process_scenario_watchdog`)
+or the existing Trial watchdog (`hard_timeout_source=trial_watchdog`). Only
+one required `process_background` Scenario may tighten the parent Worker
+timeout. Toolchain and optional Process Scenarios retain the Trial budget. The watchdog is
 independent of all after-the-fact timing projections and exposes separate
 `trial_watchdog_timed_out` and `scenario_watchdog_timed_out` booleans.
 `tool_duration_sum_ms` remains diagnostic only. Worker lifecycle cleanup timing

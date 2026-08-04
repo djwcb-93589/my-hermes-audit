@@ -485,21 +485,25 @@ def _evaluate_process(
     scenario_observation_span_exceeded = (
         observed.scenario_observation_span_exceeded is True
     )
-    scenario_observation_span_passed = not scenario_observation_span_exceeded
-    expected_hard_timeout_source = (
-        ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
-        if plan.required
-        else ProcessHardTimeoutSource.TRIAL_WATCHDOG
+    scenario_observation_span_invalid = (
+        observed.scenario_observation_span_status
+        is ProcessObservationSpanStatus.INVALID
     )
+    scenario_observation_span_passed = (
+        not scenario_observation_span_invalid
+        and not scenario_observation_span_exceeded
+    )
+    observed_hard_timeout_source = observed.hard_timeout_source
     scenario_hard_timeout_passed = (
-        observed.hard_timeout_source is expected_hard_timeout_source
+        observed_hard_timeout_source
+        in {
+            ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG,
+            ProcessHardTimeoutSource.TRIAL_WATCHDOG,
+        }
         and observed.hard_timeout_seconds is not None
         and observed.hard_timeout_triggered is False
         and observed.scenario_watchdog_timed_out is False
-        and (
-            plan.required
-            or observed.trial_watchdog_timed_out is False
-        )
+        and observed.trial_watchdog_timed_out is False
     )
     wait_results = [
         item
@@ -672,6 +676,7 @@ def _evaluate_process(
         if (
             metric_type == "scenario_observation_span_gate"
             and not scenario_observation_span_available
+            and not scenario_observation_span_invalid
             and not scenario_observation_span_exceeded
         ):
             return _not_applicable_metric(
@@ -680,6 +685,18 @@ def _evaluate_process(
                 metric_type=metric_type,
                 reason="public persistence observation span was unavailable; this is diagnostic only",
                 hard_gate=False,
+            )
+        if (
+            metric_type == "scenario_observation_span_gate"
+            and scenario_observation_span_invalid
+        ):
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="public persistence observation timestamps were invalid",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type="process_scenario_observation_span_invalid",
             )
         if metric_type == "scenario_observation_span_gate" and not passed:
             return _error_metric(
@@ -699,7 +716,8 @@ def _evaluate_process(
                 metric_type=metric_type,
                 error_type=(
                     "process_scenario_watchdog_timeout"
-                    if plan.required
+                    if observed_hard_timeout_source
+                    is ProcessHardTimeoutSource.WORKER_PROCESS_SCENARIO_WATCHDOG
                     else "trial_watchdog_timeout"
                 ),
             )
