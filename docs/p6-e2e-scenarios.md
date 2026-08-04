@@ -42,7 +42,15 @@ The Worker uses the observed `cursor_after` from that reference rather than a
 timing-derived constant. `read_incremental` validates
 `cursor_after - cursor_before == len(output)`; UTF-8 byte length is diagnostic
 only. Statuses are mapped from public Subject results and unknown values remain
-`unknown`. Agent `close` and Worker lifecycle cleanup are recorded separately.
+`unknown`. The current MyHermes public `ProcessStatus` values are projected by
+the capability probe (`starting`, `running`, `exited`, `killed`, `lost`, and
+`failed_start`). A process blocked on stdin remains publicly `running`; the
+input Case therefore requires a `running` status checkpoint and independently
+requires the incremental `P6-WAIT` output marker. Audit never changes that
+status based on a marker or infers `waiting_for_input` from `readline()`.
+`waiting_for_input` remains a future, capability-gated status and is not used
+by the default Suite. Agent `close` and Worker lifecycle cleanup are recorded
+separately.
 
 Scenario and step timeouts are hard gates backed by Worker watchdogs and real
 public Observation durations. A Process timing result is explicitly

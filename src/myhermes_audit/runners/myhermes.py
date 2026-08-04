@@ -454,6 +454,12 @@ class MyHermesTrialRunner:
                 if not _capability_available(report, name)
             ]
             if not missing:
+                if scenario.kind.value == "process_background":
+                    _preflight_process_statuses(
+                        case_id=case.case_id,
+                        scenario=scenario,
+                        report=report,
+                    )
                 continue
             requested_action = next(
                 (
@@ -2179,6 +2185,90 @@ _FOREGROUND_TOOLSET_CAPABILITIES = (
 def _capability_available(report: SubjectCapabilityReport, name: str) -> bool:
     capability = report.capability(name)
     return capability is not None and capability.available
+
+
+_PROCESS_STATUS_CANDIDATES = {
+    "completed": ("completed", "exited"),
+    "failed": ("failed", "failed_start", "lost"),
+    "interrupted": ("interrupted",),
+    "timed_out": ("timed_out",),
+}
+
+
+def _status_candidates(status: object) -> tuple[str, ...]:
+    value = getattr(status, "value", status)
+    if not isinstance(value, str) or not value:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            (value, *_PROCESS_STATUS_CANDIDATES.get(value, ()))
+        )
+    )
+
+
+def _required_process_status_requests(scenario: object) -> list[tuple[str, str]]:
+    requests: list[tuple[str, str]] = []
+    for checkpoint in getattr(scenario, "checkpoints", ()):
+        if not getattr(checkpoint, "required", False):
+            continue
+        expected = getattr(checkpoint, "expected_process_status", None)
+        if expected is not None:
+            value = getattr(expected, "value", expected)
+            if isinstance(value, str) and value:
+                requests.append((f"checkpoint:{checkpoint.checkpoint_id}", value))
+    for step in getattr(scenario, "steps", ()):
+        if not getattr(step, "required", False):
+            continue
+        for field_name in (
+            "expected_initial_status",
+            "expected_status",
+            "expected_terminal_status",
+        ):
+            expected = getattr(step, field_name, None)
+            if expected is None:
+                continue
+            value = getattr(expected, "value", expected)
+            if isinstance(value, str) and value:
+                requests.append((f"step:{step.step_id}", value))
+            break
+    return requests
+
+
+def _preflight_process_statuses(
+    *,
+    case_id: str,
+    scenario: object,
+    report: SubjectCapabilityReport,
+) -> None:
+    supported = set(report.supported_process_statuses)
+    for location, requested in _required_process_status_requests(scenario):
+        if supported.intersection(_status_candidates(requested)):
+            continue
+        supported_display = ",".join(report.supported_process_statuses) or "<none>"
+        raise SubjectCapabilityError(
+            (
+                f"case={case_id}, scenario={scenario.scenario_id}, "
+                f"location={location}: requested_process_status={requested}; "
+                f"supported_process_statuses={supported_display}; "
+                "missing public capability=supported_process_statuses"
+            ),
+            case_id=case_id,
+            scenario_id=scenario.scenario_id,
+            step_id=(
+                location.removeprefix("step:")
+                if location.startswith("step:")
+                else None
+            ),
+            checkpoint_id=(
+                location.removeprefix("checkpoint:")
+                if location.startswith("checkpoint:")
+                else None
+            ),
+            requested_process_status=requested,
+            supported_process_statuses=list(report.supported_process_statuses),
+            missing_capability="supported_process_statuses",
+            capability_name="process_status_enum",
+        )
 
 
 def _supported_foreground_toolsets(

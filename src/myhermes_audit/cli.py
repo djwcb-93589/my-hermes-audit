@@ -390,6 +390,10 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
         )
     )
     print(f"Memory provider: {report.memory_provider or 'unavailable'}")
+    print(
+        "Process statuses: "
+        + (", ".join(report.supported_process_statuses) or "none")
+    )
     for label, capability_name in (
         ("Short-term context", "short_term_context"),
         ("Long-term memory", "long_term_memory"),

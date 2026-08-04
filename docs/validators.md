@@ -30,6 +30,12 @@ cleanup dimension and flows into the existing `task_success`/`task_passed`
 gate without adding a first-level score. Optional missing timing is represented
 as `NOT_APPLICABLE` for the timeout dimension.
 
+Process status checkpoints and incremental output checkpoints are independent
+metrics. The input Case passes its waiting phase only when the public status is
+`running` and the new output contains `P6-WAIT`; a marker never rewrites a
+status, and a status never substitutes for missing output. The current public
+status set is validated by capability preflight before Sandbox creation.
+
 ## P5 Background Review
 
 `background_review` evaluator 只消费 Worker 已持久化的 `BackgroundReviewExecutionResult`、安全 evidence projection、live snapshot 和 observed state diff；它不导入 MyHermes、不重新运行 Review、模型或工具，也不根据 Assistant 文本猜测状态变化。

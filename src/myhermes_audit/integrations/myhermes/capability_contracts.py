@@ -22,8 +22,8 @@ from myhermes_audit.contracts.memory import MemoryKind, RetrievalStrategy
 from myhermes_audit.contracts.background_review import ReviewKind
 
 
-CAPABILITY_PROTOCOL_VERSION = "5.0"
-CapabilityProtocolVersion = Literal["5.0"]
+CAPABILITY_PROTOCOL_VERSION = "5.1"
+CapabilityProtocolVersion = Literal["5.1"]
 
 
 class SubjectCapabilityProbeRequest(ContractModel):
@@ -74,10 +74,11 @@ class SubjectCapabilityReport(ContractModel):
     supported_compression_modes: list[CompressionMode] = Field(
         default_factory=list
     )
-    # Process capabilities are projected exclusively from the public Tool
-    # declaration enum.  These fields intentionally contain no handler or
-    # ProcessManager implementation details.
+    # Process actions are projected from the public Tool declaration enum and
+    # statuses from the public ProcessStatus enum. These fields intentionally
+    # contain no handler or ProcessManager implementation details.
     supported_process_actions: list[NonEmptyText] = Field(default_factory=list)
+    supported_process_statuses: list[NonEmptyText] = Field(default_factory=list)
     process_toolset: NonEmptyText | None = None
     process_start_via_terminal: StrictBool = False
     process_log: StrictBool = False
@@ -144,6 +145,10 @@ class SubjectCapabilityReport(ContractModel):
             set(self.supported_process_actions)
         ):
             raise ValueError("supported_process_actions must not repeat")
+        if len(self.supported_process_statuses) != len(
+            set(self.supported_process_statuses)
+        ):
+            raise ValueError("supported_process_statuses must not repeat")
         action_set = set(self.supported_process_actions)
         if (self.process_toolset is None) != (not action_set):
             raise ValueError(
@@ -164,6 +169,10 @@ class SubjectCapabilityReport(ContractModel):
                 raise ValueError(f"{field_name} must match supported_process_actions")
         if self.process_start_via_terminal and self.process_toolset is None:
             raise ValueError("terminal Process start requires the public process toolset")
+        if self.process_toolset is None and self.supported_process_statuses:
+            raise ValueError(
+                "supported_process_statuses require the public process toolset"
+            )
         if len(self.compression_configuration_paths) != len(
             set(self.compression_configuration_paths)
         ):

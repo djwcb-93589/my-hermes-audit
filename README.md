@@ -27,6 +27,14 @@ the Process gate; optional timing is not evaluable. Timeout uses the strict
 `duration_ms > timeout_seconds * 1000` rule, and `wait` validates both its real
 Tool Call timeout and the remaining Scenario budget.
 
+Process status expectations are capability-driven from the public
+`ProcessStatus` enum. The current Subject exposes `starting`, `running`,
+`exited`, `killed`, `lost`, and `failed_start`; a process blocked on stdin
+remains `running`. The default input Case independently gates the `running`
+status and the `P6-WAIT` incremental output marker. It never infers
+`waiting_for_input` from output or Python `readline()` behavior; that status is
+reserved for a future Subject capability and preflight.
+
 The P6.1 closing contracts use an explicit stdin handshake in the short
 Process example, cursor references between incremental reads, at most one
 `process_background` Scenario per Case, and bounded Artifact OutputCheckpoint

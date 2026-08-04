@@ -192,6 +192,8 @@ class ValidatorResultsArtifact(ContractModel):
                     "process_identity",
                     "input_identity",
                     "business_status",
+                    "process_status_checkpoint",
+                    "process_output_checkpoint",
                     "step_action",
                     "cursor_integrity",
                     "cursor_reference_missing",

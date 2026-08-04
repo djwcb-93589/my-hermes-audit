@@ -301,7 +301,17 @@ def _publish_turns(
 def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
     """Replay only local scenario facts; never restart a process or a Validator."""
     trial = request.trial
+    scenario_plans = {item.scenario_id: item for item in request.case.scenarios}
     for scenario in trial.scenario_results:
+        scenario_plan = scenario_plans.get(scenario.scenario_id)
+        step_plans = {
+            item.step_id: item
+            for item in getattr(scenario_plan, "steps", ())
+        }
+        checkpoint_plans = {
+            item.checkpoint_id: item
+            for item in getattr(scenario_plan, "checkpoints", ())
+        }
         common = {
             "scenario_id": scenario.scenario_id,
             "scenario_kind": scenario.kind.value,
@@ -341,6 +351,20 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
         try:
             steps = getattr(scenario, "steps", ())
             for step in steps:
+                step_plan = step_plans.get(step.step_id)
+                expected_step_status = next(
+                    (
+                        getattr(step_plan, field_name, None)
+                        for field_name in (
+                            "expected_initial_status",
+                            "expected_status",
+                            "expected_terminal_status",
+                        )
+                        if getattr(step_plan, field_name, None) is not None
+                    ),
+                    None,
+                )
+                actual_step_status = step.actual_status
                 step_metadata = {
                     "scenario_id": scenario.scenario_id,
                     "step_id": step.step_id,
@@ -348,8 +372,18 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                     "status": step.status.value,
                     "duration_ms": step.duration_ms,
                     "actual_action": step.actual_action,
+                    "expected_process_status": (
+                        None
+                        if expected_step_status is None
+                        else expected_step_status.value
+                    ),
                     "actual_status": (
-                        None if step.actual_status is None else step.actual_status.value
+                        None if actual_step_status is None else actual_step_status.value
+                    ),
+                    "process_status_matched": (
+                        None
+                        if expected_step_status is None or actual_step_status is None
+                        else expected_step_status is actual_step_status
                     ),
                     "timeout_seconds": step.timeout_seconds,
                     "timing_status": getattr(
@@ -374,6 +408,14 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                 )
                 child.end()
             for checkpoint in getattr(scenario, "checkpoints", ()):
+                checkpoint_plan = checkpoint_plans.get(checkpoint.checkpoint_id)
+                expected_process_status = getattr(
+                    checkpoint_plan,
+                    "expected_process_status",
+                    None,
+                )
+                actual_process_status = checkpoint.observed_process_status
+                is_output_checkpoint = checkpoint.kind.value == "output"
                 checkpoint_span = observation.start_observation(
                     name=PROCESS_STEP_NAME,
                     as_type="event",
@@ -386,6 +428,22 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                         "required": checkpoint.required,
                         "passed": checkpoint.passed,
                         "kind": checkpoint.kind.value,
+                        "expected_process_status": (
+                            None
+                            if expected_process_status is None
+                            else expected_process_status.value
+                        ),
+                        "actual_process_status": (
+                            None
+                            if actual_process_status is None
+                            else actual_process_status.value
+                        ),
+                        "process_status_matched": (
+                            None
+                            if expected_process_status is None
+                            or actual_process_status is None
+                            else expected_process_status is actual_process_status
+                        ),
                         "target_step_id": checkpoint.target_step_id,
                         "target_artifact_id": getattr(checkpoint, "target_artifact_id", None),
                         "observed_step_status": (
@@ -408,6 +466,9 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                         "required_marker_count": getattr(checkpoint, "required_marker_count", 0),
                         "missing_required_marker_count": getattr(checkpoint, "missing_required_marker_count", 0),
                         "forbidden_marker_count": getattr(checkpoint, "forbidden_marker_count", 0),
+                        "output_checkpoint_passed": (
+                            checkpoint.passed if is_output_checkpoint else None
+                        ),
                         "truncated": getattr(checkpoint, "truncated", None),
                         "content_omitted": True,
                     },

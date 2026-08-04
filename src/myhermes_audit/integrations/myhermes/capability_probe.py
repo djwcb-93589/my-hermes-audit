@@ -7,8 +7,9 @@ import importlib
 import inspect
 import json
 import re
-from pathlib import Path
 from collections.abc import Mapping
+from enum import Enum
+from pathlib import Path
 from typing import Callable, Sequence
 
 from pydantic import ValidationError
@@ -893,6 +894,29 @@ def _process_action_names(value: object) -> tuple[str, ...]:
     return names if len(names) == len(set(names)) else ()
 
 
+def _process_status_surface(value: object) -> bool:
+    """Validate only the public ProcessStatus enum surface."""
+
+    if not isinstance(value, type) or not issubclass(value, Enum):
+        return False
+    members = getattr(value, "__members__", {})
+    if not isinstance(members, Mapping) or not members:
+        return False
+    values = [getattr(item, "value", None) for item in members.values()]
+    return all(isinstance(item, str) and item for item in values) and len(
+        values
+    ) == len(set(values))
+
+
+def _process_status_names(value: object) -> tuple[str, ...]:
+    """Read stable values from the public ProcessStatus enum only."""
+
+    if not _process_status_surface(value):
+        return ()
+    members = getattr(value, "__members__", {})
+    return tuple(item.value for item in members.values())
+
+
 def _terminal_supports_background(value: object) -> bool:
     if not _terminal_declaration_surface(value):
         return False
@@ -1184,9 +1208,21 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         _process_declaration_surface,
         required=False,
     )
+    process_status_declaration = builder.check(
+        "process_status_enum",
+        "hermes.processes",
+        "ProcessStatus",
+        _process_status_surface,
+        required=False,
+    )
     # The handler is deliberately not inspected as a source of foreground
     # capability.  Public Process action support comes only from the schema.
     process_actions = _process_action_names(process_declaration)
+    supported_process_statuses = (
+        _process_status_names(process_status_declaration)
+        if process_actions
+        else ()
+    )
     process_toolset = (
         getattr(process_declaration[0], "toolset", None)
         if process_actions and process_declaration
@@ -1686,6 +1722,7 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
             "process_projection": {
                 "toolset": process_toolset,
                 "supported_actions": list(process_actions),
+                "supported_statuses": list(supported_process_statuses),
                 "start_via_terminal": process_start_via_terminal,
             },
         }
@@ -1733,6 +1770,7 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         ),
         compression_observation_supported=compression_observation is not None,
         supported_process_actions=list(process_actions),
+        supported_process_statuses=list(supported_process_statuses),
         process_toolset=process_toolset,
         process_start_via_terminal=process_start_via_terminal,
         process_log="log" in process_actions,

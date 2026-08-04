@@ -407,6 +407,23 @@ def _evaluate_process(
         for item in plan.checkpoints
         if item.required and item.kind.value == "process_status"
     ]
+    required_process_output_checkpoints = [
+        item
+        for item in plan.checkpoints
+        if item.required and item.kind.value == "output"
+    ]
+    process_status_checkpoint_passed = all(
+        observed_checkpoints.get(item.checkpoint_id) is not None
+        and observed_checkpoints[item.checkpoint_id].kind.value == "process_status"
+        and observed_checkpoints[item.checkpoint_id].passed is True
+        for item in required_process_status_checkpoints
+    )
+    process_output_checkpoint_passed = all(
+        observed_checkpoints.get(item.checkpoint_id) is not None
+        and observed_checkpoints[item.checkpoint_id].kind.value == "output"
+        and observed_checkpoints[item.checkpoint_id].passed is True
+        for item in required_process_output_checkpoints
+    )
     business_status_passed = (
         observed.final_status is not None
         and observed.final_status.value != "unknown"
@@ -471,6 +488,8 @@ def _evaluate_process(
         ("process_identity", "process_identity", process_identity_passed, "all public Process calls referenced the start process"),
         ("process_input_identity", "input_identity", input_identity_passed, "fixture input matched the observed public input"),
         ("process_business_status", "business_status", business_status_passed, "declared Process status and lifecycle outcome were observed"),
+        ("process_status_checkpoint", "process_status_checkpoint", process_status_checkpoint_passed, "required public Process status checkpoints matched"),
+        ("process_output_checkpoint", "process_output_checkpoint", process_output_checkpoint_passed, "required incremental Process output checkpoints matched"),
         ("process_step_action", "step_action", step_action_passed, "required step actions matched public Tool observations"),
         ("process_cursor_integrity", "cursor_integrity", cursor_passed, "Process log cursor used character units without gaps"),
         ("process_cursor_reference", "cursor_reference_missing", not cursor_reference_missing, "later Process reads referenced the preceding read result"),

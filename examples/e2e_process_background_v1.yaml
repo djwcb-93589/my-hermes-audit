@@ -126,14 +126,17 @@ cases:
       message: >-
         Start a bounded background Python task with the public terminal tool
         that waits for one line on stdin and prints P6-INPUT-OK. Use the public
-        process tool to observe waiting_for_input, submit the exact content
+        process tool to confirm that the background process remains running
+        after the new log contains P6-WAIT, then submit the exact content
         returned by the file tool, wait for completed, and report only the
         truthful result. First use the file tool with action read on
-        fixtures/process-input.txt. Then start the process, submit the content
-        actually returned by that file read, read the result, wait for completed,
-        and verify the final status. Do not read the fixture with cat, type,
-        Get-Content, or any terminal command, and never include the input body in
-        the report.
+        fixtures/process-input.txt. Then start the process, confirm status
+        running and the P6-WAIT output marker, submit the content actually
+        returned by that file read, read the result, wait for completed, and
+        verify the final status. Do not interpret P6-WAIT as a new Process
+        status, do not request waiting_for_input, do not read the fixture with
+        cat, type, Get-Content, or any terminal command, and never include the
+        input body in the report.
     execution:
       enabled_toolsets: [file, terminal]
     fixture:
@@ -163,7 +166,14 @@ cases:
           - kind: process_status
             checkpoint_id: waiting
             target_step_id: read-wait
-            expected_process_status: waiting_for_input
+            expected_process_status: running
+            required: true
+          - kind: output
+            checkpoint_id: input-wait-output
+            target_step_id: read-wait
+            required_markers: [P6-WAIT]
+            forbidden_markers: [P6-INPUT-OK]
+            minimum_new_output_length: 1
             required: true
           - kind: step_status
             checkpoint_id: input-submitted
