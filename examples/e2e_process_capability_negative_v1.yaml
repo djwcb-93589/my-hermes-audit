@@ -1,0 +1,62 @@
+schema_version: "1.0"
+suite_id: e2e-process-capability-negative-v1
+name: P6.1 negative Process capability checks
+description: >-
+  Capability-gated scenarios document public Process actions that the current
+  Subject does not expose. The interrupt case must fail in preflight before a
+  Sandbox or Agent Trial is created.
+tags: [e2e, process, capability-negative, p6.1, synthetic]
+defaults:
+  trials: 1
+  timeout_seconds: 60
+  preserve_sandbox: false
+  metadata:
+    data_classification: synthetic
+cases:
+  - case_id: process-interrupt-unsupported
+    name: Reject unsupported public interrupt action
+    description: The public process action schema has no interrupt action.
+    mode: single_turn
+    input:
+      message: >-
+        Do not start a process. This negative capability case requests the
+        unsupported public process interrupt action and must be rejected during
+        Audit preflight before a Sandbox or model call.
+    execution:
+      enabled_toolsets: [terminal]
+    fixture:
+      files: []
+    expected:
+      texts: []
+    scenarios:
+      - scenario_id: process-interrupt-unsupported
+        kind: process_background
+        timeout_seconds: 30
+        required: true
+        required_toolsets: [terminal]
+        cleanup:
+          required: false
+          expect_no_live_processes: true
+          expect_session_resources_released: true
+        checkpoints:
+          - kind: process_status
+            checkpoint_id: interrupt-terminal
+            target_step_id: interrupt
+            expected_process_status: interrupted
+            required: true
+        steps:
+          - step_id: start
+            action: start
+            timeout_seconds: 10
+            required: true
+            command: python -c "print('never-run', flush=True)"
+            expected_initial_status: running
+          - step_id: interrupt
+            action: interrupt
+            timeout_seconds: 10
+            required: true
+            expected_terminal_status: interrupted
+    evaluators:
+      - evaluator_id: process-interrupt-capability
+        kind: scenario
+        required: true

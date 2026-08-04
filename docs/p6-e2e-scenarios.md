@@ -19,15 +19,26 @@ observations; Audit never reads a fixture to replace Agent work or writes an
 Artifact on the Agent's behalf.
 
 Process plans use typed `start`, `read_incremental`, `send_input`, `wait`,
-`interrupt`, `kill`, `assert_status`, and `cleanup_session` steps. The current
-Subject exposes process management through the `terminal` Toolset (`process` is
-its companion declaration), so no synthetic `process` Toolset is added.
+`kill`, `close`, and `assert_status` steps. `interrupt` remains a
+capability-gated action and is documented only by the negative Suite. Worker
+cleanup is a separate scenario-level expectation; it is never represented as
+an Agent Tool step. The current Subject exposes process management through the
+`terminal` Toolset (`process` is its companion declaration), so no synthetic
+`process` Toolset is added.
 
 Process output is represented by bounded local log Artifacts. Structured facts
-retain only checkpoints, hashes, lengths, offsets, marker matches, truncation
-and safe identities. `read_incremental` offsets are monotonic; repeated reads
-with no new bytes report a zero-length delta. Statuses are mapped from public
-Subject results and unknown values remain `unknown`.
+retain only typed checkpoints, command/input hashes and lengths, character-unit
+cursors, UTF-8 byte diagnostics, marker matches, truncation, timing and safe
+identities. `read_incremental` validates
+`cursor_after - cursor_before == len(output)`; UTF-8 byte length is diagnostic
+only. Statuses are mapped from public Subject results and unknown values remain
+`unknown`. Agent `close` and Worker lifecycle cleanup are recorded separately.
+
+Scenario and step timeouts are hard gates backed by Worker watchdogs and real
+public Observation durations. Missing required timing remains unevaluable (it
+is never represented as a fabricated `duration_ms=0`) and therefore fails the
+required Process timeout gate. Checkpoints are discriminated by `kind` and
+target explicit step IDs; checkpoint ID text is never parsed as a hidden DSL.
 
 The required scenario evaluator contributes hard gates to `task_success` and
 `task_passed`; it does not create a fourth first-level score. With no required
@@ -35,8 +46,10 @@ Process scenario, `process_gate_passed` is `null`.
 
 The default synthetic declarations are
 `examples/e2e_toolchain_v1.yaml` and
-`examples/e2e_process_background_v1.yaml`. They use bounded Python commands,
-no network, no fixed ports, and no OS-specific shell.
+`examples/e2e_process_background_v1.yaml`. The capability-negative declaration
+is `examples/e2e_process_capability_negative_v1.yaml`; it must stop at
+preflight for `interrupt`. They use bounded Python commands, no network, no
+fixed ports, and no OS-specific shell.
 
 P6.2 Cron/Delegate, P6.3 DOCX/Dashboard, and P6.4 full Background Review
 closure are intentionally outside this stage.

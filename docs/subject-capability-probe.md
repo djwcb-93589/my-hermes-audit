@@ -2,22 +2,25 @@
 
 ## P6.1 Process projection
 
-The optional public checks include `process_toolset`, `process_start`,
-`process_read_incremental`, `process_send_input`, `process_wait`,
-`process_interrupt`, `process_kill`, `process_status`,
-`process_session_cleanup`, and the derived `background_process_supported`.
-Checks inspect declarations, public `ProcessManager` method signatures, and
-the public process handler only. They never instantiate a manager, create a
-Session, start a command, read a user's process, or call a model/network.
+Process capability is read only from the public `process.action` enum in the
+`terminal` Tool declaration. The report includes
+`supported_process_actions`, `process_toolset`, `process_start_via_terminal`,
+and explicit `process_log`, `process_poll`, `process_wait`, `process_write`,
+`process_submit`, `process_kill`, `process_close`, and `process_interrupt`
+flags. No `ProcessManager` method name, handler implementation, commit, or
+version is used as foreground capability evidence. The probe never executes a
+Tool, creates a Session, starts a command, reads a user's process, or calls a
+model/network.
 
 In the current Subject, the `process` declaration is a companion of the
-`terminal` Toolset. `interrupt` is reported unavailable when the public
-manager does not expose it; a scenario that explicitly requires it fails
-before Sandbox creation with Case ID, scenario ID and safe capability names.
+`terminal` Toolset. `interrupt` is reported unavailable because it is absent
+from the public enum; a scenario that explicitly requires it fails before
+Sandbox creation with Case ID, scenario ID, requested action and safe
+capability names. Worker cleanup is a lifecycle fact, not an Agent capability.
 
 ## P5 Background Review capability projection
 
-Capability protocol `4.0` adds optional P5 public-surface checks without turning a Probe into a Review run. It binds only public module exports and safe call signatures for:
+Capability protocol `5.0` adds the P6.1 public Process action projection without turning a Probe into a Process run. It binds only public module exports and safe call signatures for:
 
 - Background Review coordinator/runtime, `ReviewClaim`, Driver Registry, Driver lifecycle, `ReviewAgentLoop`, executor shutdown and ReviewRunSpec evidence window;
 - `ToolPolicy`/`ToolRegistry` policy resolution, including the public Background Review execution environment;
@@ -67,7 +70,7 @@ Background Review.
 
 `SubjectCapabilityReport` records the protocol version, Subject commit,
 individual checks, missing capabilities, bounded warnings, and a public API
-fingerprint. Capability protocol `4.0` distinguishes baseline-required checks
+fingerprint. Capability protocol `5.0` distinguishes baseline-required checks
 from optional P3/P5 capabilities, so a Subject without Memory or Background
 Review support can still run an old non-Memory/non-Review Suite. The fingerprint uses only module names, public object
 names, availability, safe call signatures, the stable Memory

@@ -78,7 +78,7 @@ stale 不能根据“没有变化”猜测。它必须由 Subject 公共 claim v
 
 ## Artifacts、Langfuse 与示例
 
-Worker v5 为 P5 输出 `background-review-results.json`、`background-review-evidence.json` 与 `background-review-snapshots.json`，并通过既有同目录原子写入发布。它们只含结构化、安全事实；v5 同时承载 P6.1 scenario 计划与安全结果。
+Worker v6 为 P5 输出 `background-review-results.json`、`background-review-evidence.json` 与 `background-review-snapshots.json`，并通过既有同目录原子写入发布。它们只含结构化、安全事实；v6 同时承载 P6.1 scenario 计划与安全结果。
 
 Langfuse 只回放持久化的 `TrialResult`，不重新运行 Review、模型或工具。即使未启用 `--langfuse-no-content`，P5 evidence、Review Prompt、Memory、Skill 和工具正文都不会上传；`sensitive` 同样强制无正文投影。Background Review evaluator 的安全 decision 投影只增加动作枚举与布尔事实：`expected_action`、`allowed_actions`、`actual_action` 和 `action_matched`。
 

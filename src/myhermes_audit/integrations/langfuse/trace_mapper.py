@@ -308,6 +308,12 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
             "status": scenario.status.value,
             "duration_ms": scenario.duration_ms,
             "error_count": len(scenario.errors),
+            "command_matched": getattr(scenario, "command_matched", None),
+            "process_identity_matched": getattr(scenario, "process_identity_matched", None),
+            "input_matched": getattr(scenario, "input_matched", None),
+            "cursor_unit": getattr(scenario, "cursor_unit", "character"),
+            "scenario_timed_out": getattr(scenario, "scenario_timed_out", False),
+            "agent_close_observed": getattr(scenario, "agent_close_observed", False),
             "content_omitted": True,
         }
         observation = root.start_observation(
@@ -327,6 +333,15 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                     "action": step.action.value,
                     "status": step.status.value,
                     "duration_ms": step.duration_ms,
+                    "actual_action": step.actual_action,
+                    "actual_status": (
+                        None if step.actual_status is None else step.actual_status.value
+                    ),
+                    "timeout_seconds": step.timeout_seconds,
+                    "timed_out": step.timed_out,
+                    "expected_process_id_safe": step.expected_process_id_safe,
+                    "actual_process_id_safe": step.actual_process_id_safe,
+                    "process_identity_matched": step.process_identity_matched,
                     "observation_ref_count": len(step.observation_refs),
                     "content_omitted": True,
                 }
@@ -351,11 +366,19 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                         "checkpoint_id": checkpoint.checkpoint_id,
                         "required": checkpoint.required,
                         "passed": checkpoint.passed,
-                        "observed_status": (
-                            None
-                            if checkpoint.observed_status is None
-                            else checkpoint.observed_status.value
+                        "kind": checkpoint.kind.value,
+                        "target_step_id": checkpoint.target_step_id,
+                        "artifact_scope": checkpoint.artifact_scope,
+                        "observed_step_status": (
+                            None if checkpoint.observed_step_status is None
+                            else checkpoint.observed_step_status.value
                         ),
+                        "observed_process_status": (
+                            None if checkpoint.observed_process_status is None
+                            else checkpoint.observed_process_status.value
+                        ),
+                        "agent_close_observed": checkpoint.agent_close_observed,
+                        "worker_cleanup_completed": checkpoint.worker_cleanup_completed,
                         "content_omitted": True,
                     },
                     version="p6.1",
@@ -371,9 +394,11 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                         "scenario_id": scenario.scenario_id,
                         "action": "read_incremental",
                         "read_index": read.read_index,
-                        "offset_before": read.offset_before,
-                        "offset_after": read.offset_after,
-                        "new_output_length": read.new_output_length,
+                        "cursor_unit": read.cursor_unit,
+                        "cursor_before": read.cursor_before,
+                        "cursor_after": read.cursor_after,
+                        "new_output_char_length": read.new_output_char_length,
+                        "new_output_utf8_bytes": read.new_output_utf8_bytes,
                         "content_sha256": read.content_sha256,
                         "required_markers_found": read.required_markers_found,
                         "required_markers_missing": read.required_markers_missing,
@@ -395,13 +420,21 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                         "action": "send_input",
                         "submitted": event.submitted,
                         "accepted": event.accepted,
+                        "expected_input_sha256": event.expected_input_sha256,
+                        "actual_input_sha256": event.actual_input_sha256,
+                        "expected_input_char_length": event.expected_input_char_length,
+                        "actual_input_char_length": event.actual_input_char_length,
+                        "expected_input_utf8_bytes": event.expected_input_utf8_bytes,
+                        "actual_input_utf8_bytes": event.actual_input_utf8_bytes,
+                        "input_matched": event.input_matched,
+                        "process_identity_matched": event.process_identity_matched,
                         "bytes_written": event.bytes_written,
                         "content_omitted": True,
                     },
                     version="p6.1",
                 )
                 input_span.end()
-            cleanup = getattr(scenario, "cleanup_result", None)
+            cleanup = getattr(scenario, "worker_cleanup_result", None)
             if cleanup is not None:
                 cleanup_span = observation.start_observation(
                     name=PROCESS_STEP_NAME,
@@ -410,8 +443,11 @@ def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
                     output={"content_omitted": True},
                     metadata={
                         "scenario_id": scenario.scenario_id,
-                        "action": "cleanup_session",
+                        "action": "worker_cleanup",
                         "gate": cleanup.complete,
+                        "session_cleanup_completed": cleanup.session_cleanup_completed,
+                        "live_process_count_before": cleanup.live_process_count_before,
+                        "live_process_count_after": cleanup.live_process_count_after,
                         "attempted_count": len(cleanup.attempted_process_ids),
                         "completed_count": len(cleanup.completed_process_ids),
                         "unresolved_count": len(cleanup.unresolved_process_ids),

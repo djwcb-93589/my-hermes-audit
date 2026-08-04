@@ -45,6 +45,12 @@ from myhermes_audit.contracts import (
     ReviewError,
     ReviewOutcome,
     ReviewStatus,
+    ProcessAction,
+    E2EScenarioKind,
+    ProcessScenarioExecutionResult,
+    ScenarioError,
+    ScenarioStatus,
+    ToolchainScenarioExecutionResult,
 )
 from myhermes_audit.ablation import (
     applicable_checkpoints,
@@ -415,12 +421,32 @@ class MyHermesTrialRunner:
                 for name in _SCENARIO_TOOLSET_CAPABILITIES.get(toolset, ())
             )
             if scenario.kind.value == "process_background":
-                required.extend(_PROCESS_SCENARIO_CAPABILITIES)
-                actions = {step.action.value for step in scenario.steps}
-                if "interrupt" not in actions:
-                    required.remove("process_interrupt")
-                if "send_input" not in actions:
-                    required.remove("process_send_input")
+                required.append("process_toolset_actions")
+                required.append("process_start_via_terminal")
+                for step in scenario.steps:
+                    action = step.action
+                    if action is ProcessAction.READ_INCREMENTAL:
+                        required.append("process_log")
+                    elif action is ProcessAction.SEND_INPUT:
+                        required.append(
+                            "process_submit" if step.submit else "process_write"
+                        )
+                    elif action is ProcessAction.WAIT:
+                        required.append("process_wait")
+                    elif action is ProcessAction.INTERRUPT:
+                        required.append("process_interrupt")
+                    elif action is ProcessAction.KILL:
+                        required.append("process_kill")
+                    elif action is ProcessAction.CLOSE:
+                        required.append("process_close")
+                    elif action is ProcessAction.ASSERT_STATUS:
+                        required.append("process_poll")
+                if scenario.cleanup is not None and scenario.cleanup.required:
+                    # Worker cleanup is a lifecycle fact, not a foreground
+                    # Process action.  The worker already exposes the public
+                    # session cleanup report; no ProcessManager method is
+                    # treated as an Agent capability here.
+                    required.append("session_resource_cleanup")
             missing = [
                 name
                 for name in dict.fromkeys(required)
@@ -428,21 +454,39 @@ class MyHermesTrialRunner:
             ]
             if not missing:
                 continue
+            requested_action = next(
+                (
+                    step.action.value
+                    for step in getattr(scenario, "steps", ())
+                    if step.action is ProcessAction.INTERRUPT
+                    and not _capability_available(report, "process_interrupt")
+                ),
+                None,
+            )
             supported = ",".join(
                 item.name
                 for item in report.capabilities
                 if item.available and item.name.startswith("process_")
             ) or "<none>"
+            supported_actions = ",".join(report.supported_process_actions) or "<none>"
             raise SubjectCapabilityError(
                 (
                     f"case={case.case_id}, scenario={scenario.scenario_id}: "
-                    f"missing public capability={missing[0]}; supported process "
-                    f"capabilities={supported}"
+                    + (
+                        f"requested_action={requested_action}; "
+                        if requested_action is not None
+                        else ""
+                    )
+                    + f"missing public capability={missing[0]}; "
+                    + f"supported_process_actions={supported_actions}; "
+                    + f"supported process capabilities={supported}"
                 ),
                 case_id=case.case_id,
                 scenario_id=scenario.scenario_id,
                 missing_capability=missing[0],
                 missing_capabilities=missing,
+                requested_action=requested_action,
+                supported_process_actions=list(report.supported_process_actions),
                 supported_toolsets=_supported_foreground_toolsets(report),
             )
 
@@ -829,6 +873,15 @@ class MyHermesTrialRunner:
         timeout_seconds: int,
         variant: AblationVariant | None = None,
     ) -> TrialRunnerOutcome:
+        for scenario in case.scenarios:
+            if scenario.timeout_seconds > timeout_seconds:
+                raise SubjectPreflightError(
+                    "scenario timeout exceeds the Trial watchdog budget",
+                    case_id=case.case_id,
+                    scenario_id=scenario.scenario_id,
+                    scenario_timeout_seconds=scenario.timeout_seconds,
+                    trial_timeout_seconds=timeout_seconds,
+                )
         configuration = None
         if variant is not None:
             if case.ablation is None:
@@ -1059,6 +1112,7 @@ class MyHermesTrialRunner:
                     recovered_background_review_errors=(
                         recovered_background_review_errors
                     ),
+                    scenarios=case.scenarios,
                 )
                 result, recovered_memory = _redact_memory_facts(
                     result,
@@ -1087,6 +1141,8 @@ class MyHermesTrialRunner:
                     background_review_plans=case.fixture.background_review_plans,
                     background_review_results=result.background_review_results,
                     background_review_errors=result.background_review_errors,
+                    scenarios=case.scenarios,
+                    scenario_results=result.scenario_results,
                 )
                 return self._outcome_from_result(
                     result,
@@ -1297,6 +1353,7 @@ class MyHermesTrialRunner:
                 recovered_background_review_errors=(
                     recovered_background_review_errors
                 ),
+                scenarios=case.scenarios,
             )
             result, recovered_memory = _redact_memory_facts(
                 result,
@@ -1326,6 +1383,8 @@ class MyHermesTrialRunner:
                     background_review_plans=case.fixture.background_review_plans,
                     background_review_results=result.background_review_results,
                     background_review_errors=result.background_review_errors,
+                    scenarios=case.scenarios,
+                    scenario_results=result.scenario_results,
                 )
             except Exception as artifact_exc:
                 worker_warnings.append(
@@ -1349,6 +1408,7 @@ class MyHermesTrialRunner:
                     recovered_background_review_errors=(
                         recovered_background_review_errors
                     ),
+                    scenarios=case.scenarios,
                 )
             return self._outcome_from_result(
                 result,
@@ -2087,15 +2147,16 @@ _SKILL_READ_CAPABILITIES = (
 )
 
 _PROCESS_SCENARIO_CAPABILITIES = (
-    "process_toolset",
-    "process_start",
-    "process_read_incremental",
-    "process_send_input",
+    "process_toolset_actions",
+    "process_start_via_terminal",
+    "process_log",
+    "process_poll",
+    "process_write",
+    "process_submit",
     "process_wait",
     "process_interrupt",
     "process_kill",
-    "process_status",
-    "process_session_cleanup",
+    "process_close",
     "background_process_supported",
 )
 
@@ -2754,6 +2815,43 @@ def _merge_recovered_background_review_errors(
     return merged
 
 
+def _fallback_scenario_results(
+    scenarios: Sequence[object],
+    *,
+    duration_ms: int,
+    error_type: str,
+    timed_out: bool,
+) -> tuple[list[object], list[ScenarioError]]:
+    """Preserve declared P6.1 coverage when the Worker envelope is lost."""
+
+    results: list[object] = []
+    errors: list[ScenarioError] = []
+    for plan in scenarios:
+        error = ScenarioError(
+            error_type=error_type.replace("_", "-"),
+            message="Worker did not return a complete scenario observation",
+        )
+        if plan.kind is E2EScenarioKind.PROCESS_BACKGROUND:
+            result = ProcessScenarioExecutionResult(
+                scenario_id=plan.scenario_id,
+                status=ScenarioStatus.FAILED,
+                scenario_timeout_seconds=plan.timeout_seconds,
+                scenario_timed_out=timed_out,
+                duration_ms=duration_ms,
+                errors=[error],
+            )
+        else:
+            result = ToolchainScenarioExecutionResult(
+                scenario_id=plan.scenario_id,
+                status=ScenarioStatus.FAILED,
+                duration_ms=duration_ms,
+                errors=[error],
+            )
+        results.append(result)
+        errors.append(error)
+    return results, errors
+
+
 def _fallback_worker_result(
     paths: WorkerArtifactPaths,
     *,
@@ -2773,7 +2871,9 @@ def _fallback_worker_result(
     recovered_background_review_errors: Sequence[
         BackgroundReviewExecutionError
     ] = (),
+    scenarios: Sequence[object] = (),
 ) -> MyHermesWorkerResult:
+    safe_error_type = error_type.replace("_", "-")
     protocol_errors = (
         []
         if memory_strategy is None
@@ -2800,10 +2900,17 @@ def _fallback_worker_result(
         recovered_background_review_errors,
         background_review_results,
     )
+    scenario_results, process_errors = _fallback_scenario_results(
+        scenarios,
+        duration_ms=duration_ms,
+        error_type=error_type,
+        timed_out=error_type == "timeout",
+    )
+    scenario_kinds = {item.kind.value for item in scenario_results}
     return MyHermesWorkerResult(
         worker_status=WorkerStatus.FAILED,
         runtime_status=error_type,
-        error_type=error_type,
+        error_type=safe_error_type,
         fatal=True,
         retryable=False,
         duration_ms=duration_ms,
@@ -2863,8 +2970,26 @@ def _fallback_worker_result(
         ),
         background_review_results=background_review_results,
         background_review_errors=background_review_errors,
+        scenario_results=scenario_results,
+        process_errors=process_errors,
+        toolchain_results_artifact=(
+            None
+            if "toolchain" not in scenario_kinds or paths.toolchain_results is None
+            else f"artifacts/{paths.toolchain_results.name}"
+        ),
+        process_scenario_results_artifact=(
+            None
+            if "process_background" not in scenario_kinds
+            or paths.process_scenario_results is None
+            else f"artifacts/{paths.process_scenario_results.name}"
+        ),
+        process_cleanup_artifact=(
+            None
+            if "process_background" not in scenario_kinds or paths.process_cleanup is None
+            else f"artifacts/{paths.process_cleanup.name}"
+        ),
         warnings=list(warnings),
-        error=WorkerError(error_type=error_type, message=message),
+        error=WorkerError(error_type=safe_error_type, message=message),
     )
 
 
@@ -2894,6 +3019,8 @@ def _ensure_empty_worker_artifacts(
     background_review_plans: Sequence[BackgroundReviewPlan] = (),
     background_review_results: Sequence[BackgroundReviewExecutionResult] = (),
     background_review_errors: Sequence[BackgroundReviewExecutionError] = (),
+    scenarios: Sequence[object] = (),
+    scenario_results: Sequence[object] = (),
 ) -> None:
     if not paths.observations.exists():
         atomic_write_json(paths.observations, ObservationBundle())
@@ -2966,6 +3093,36 @@ def _ensure_empty_worker_artifacts(
                 results=results,
             ),
         )
+    scenario_kinds = {item.kind.value for item in scenarios}
+    result_items = list(scenario_results)
+    if "toolchain" in scenario_kinds and paths.toolchain_results is not None:
+        atomic_write_json(
+            paths.toolchain_results,
+            ToolchainScenarioArtifact(
+                trial_id=trial_id,
+                case_id=case_id,
+                results=[item for item in result_items if item.kind is E2EScenarioKind.TOOLCHAIN],
+            ),
+        )
+    if "process_background" in scenario_kinds:
+        if paths.process_scenario_results is not None:
+            atomic_write_json(
+                paths.process_scenario_results,
+                ProcessScenarioArtifact(
+                    trial_id=trial_id,
+                    case_id=case_id,
+                    results=[item for item in result_items if item.kind is E2EScenarioKind.PROCESS_BACKGROUND],
+                ),
+            )
+        if paths.process_cleanup is not None and not paths.process_cleanup.exists():
+            atomic_write_json(
+                paths.process_cleanup,
+                ProcessCleanupArtifact(
+                    trial_id=trial_id,
+                    case_id=case_id,
+                    reports=[],
+                ),
+            )
 
 
 def _recover_parent_memory_artifact(

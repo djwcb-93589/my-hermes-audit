@@ -43,12 +43,13 @@ from myhermes_audit.contracts.common import (
     NonNegativeInt,
     PositiveInt,
     SafeRelativePath,
+    UtcDatetime,
 )
 
 
-WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v5"
-LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v4"
-WorkerProtocolVersion = Literal["myhermes-audit-worker-v5"]
+WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v6"
+LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v5"
+WorkerProtocolVersion = Literal["myhermes-audit-worker-v6"]
 
 
 class WorkerMode(str, Enum):
@@ -307,6 +308,10 @@ class ToolObservationRecord(ContractModel):
     success: StrictBool
     error_type: Identifier | None = None
     duration_ms: NonNegativeInt
+    # Public observation creation time is safe timing metadata.  It lets the
+    # P6.1 projection derive bounded step start/end timestamps from the real
+    # observation duration without retaining arguments or tool output.
+    created_at: UtcDatetime | None = None
 
 
 class ObservationBundle(ContractModel):

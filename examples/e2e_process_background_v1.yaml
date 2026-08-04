@@ -14,15 +14,16 @@ defaults:
 cases:
   - case_id: process-short-background
     name: Read a short background task incrementally to completion
-    description: Start, read new output, wait for completion, and clean up.
+    description: Start, read new output, wait for completion, close the public process handle, and verify worker cleanup.
     mode: single_turn
     input:
       message: >-
         Use the public terminal tool to start this bounded background Python
-        command: python -c "import time; print('P6-BEGIN', flush=True); time.sleep(0.2); print('P6-END', flush=True)".
+        command: python -c "import time; print('P6-BEGIN', flush=True); print('P6-中文', flush=True); time.sleep(0.2); print('P6-END', flush=True)".
         Use the returned process identity with the public process tool. Read
-        output incrementally (without repeating old bytes), wait for completed,
-        and report the observed markers only after cleanup.
+        output incrementally with character cursors, wait for completed, close
+        the public process stdin, and report the observed markers only after
+        worker cleanup.
     execution:
       enabled_toolsets: [terminal]
     fixture:
@@ -38,39 +39,60 @@ cases:
         timeout_seconds: 120
         required: true
         required_toolsets: [terminal]
+        cleanup:
+          required: true
+          expect_no_live_processes: true
+          expect_session_resources_released: true
         checkpoints:
-          - checkpoint_id: started
+          - kind: step_status
+            checkpoint_id: started
+            target_step_id: start
+            expected_step_status: completed
             required: true
-          - checkpoint_id: incrementally-read
+          - kind: output
+            checkpoint_id: incrementally-read
+            target_step_id: read-first
+            required_markers: [P6-BEGIN]
+            forbidden_markers: []
+            minimum_new_output_length: 1
             required: true
-          - checkpoint_id: completed
+          - kind: process_status
+            checkpoint_id: completed
+            target_step_id: wait-completed
+            expected_process_status: completed
             required: true
-          - checkpoint_id: cleaned
+          - kind: cleanup
+            checkpoint_id: cleaned
+            expect_agent_close: true
+            expect_worker_cleanup: true
+            expect_no_live_processes: true
             required: true
         steps:
           - step_id: start
             action: start
             timeout_seconds: 30
             required: true
-            command: python -c "import time; print('P6-BEGIN', flush=True); time.sleep(0.2); print('P6-END', flush=True)"
+            command: python -c "import time; print('P6-BEGIN', flush=True); print('P6-中文', flush=True); time.sleep(0.2); print('P6-END', flush=True)"
             expected_initial_status: running
           - step_id: read-first
             action: read_incremental
             timeout_seconds: 30
             required: true
+            cursor_before: 0
             minimum_new_output_length: 1
-            required_markers: [P6-BEGIN]
+            required_markers: [P6-BEGIN, P6-中文]
             forbidden_markers: []
           - step_id: wait-completed
             action: wait
             timeout_seconds: 30
             required: true
             expected_status: completed
-            maximum_wait_seconds: 60
+            maximum_wait_seconds: 30
           - step_id: read-final
             action: read_incremental
             timeout_seconds: 30
             required: true
+            cursor_before: 15
             minimum_new_output_length: 1
             required_markers: [P6-END]
             forbidden_markers: []
@@ -79,11 +101,10 @@ cases:
             timeout_seconds: 30
             required: true
             expected_status: completed
-          - step_id: cleanup
-            action: cleanup_session
+          - step_id: close
+            action: close
             timeout_seconds: 30
             required: true
-            expect_no_live_processes: true
     evaluators:
       - evaluator_id: process-short-answer
         kind: deterministic
@@ -95,15 +116,16 @@ cases:
 
   - case_id: process-input-background
     name: Send input to a waiting background task
-    description: Start a stdin task, submit one synthetic line, then observe completion.
+    description: Start a stdin task, submit one synthetic line, close the public process handle, then observe completion and cleanup.
     mode: single_turn
     input:
       message: >-
         Start a bounded background Python task with the public terminal tool
         that waits for one line on stdin and prints P6-INPUT-OK. Use the public
         process tool to observe waiting_for_input, submit the synthetic line
-        from fixtures/process-input.txt, wait for completed, and clean
-        up. Never include the input body in the report.
+        from fixtures/process-input.txt, wait for completed, close the public
+        process stdin, and report only the truthful result. Never include the
+        input body in the report.
     execution:
       enabled_toolsets: [terminal]
     fixture:
@@ -121,14 +143,31 @@ cases:
         timeout_seconds: 120
         required: true
         required_toolsets: [terminal]
+        cleanup:
+          required: true
+          expect_no_live_processes: true
+          expect_session_resources_released: true
         checkpoints:
-          - checkpoint_id: waiting
+          - kind: process_status
+            checkpoint_id: waiting
+            target_step_id: read-wait
+            expected_process_status: waiting_for_input
             required: true
-          - checkpoint_id: input-submitted
+          - kind: step_status
+            checkpoint_id: input-submitted
+            target_step_id: send
+            expected_step_status: completed
             required: true
-          - checkpoint_id: input-completed
+          - kind: process_status
+            checkpoint_id: input-completed
+            target_step_id: wait
+            expected_process_status: completed
             required: true
-          - checkpoint_id: cleaned
+          - kind: cleanup
+            checkpoint_id: cleaned
+            expect_agent_close: true
+            expect_worker_cleanup: true
+            expect_no_live_processes: true
             required: true
         steps:
           - step_id: start
@@ -141,6 +180,7 @@ cases:
             action: read_incremental
             timeout_seconds: 30
             required: true
+            cursor_before: 0
             minimum_new_output_length: 1
             required_markers: [P6-WAIT]
             forbidden_markers: []
@@ -155,19 +195,19 @@ cases:
             timeout_seconds: 30
             required: true
             expected_status: completed
-            maximum_wait_seconds: 60
+            maximum_wait_seconds: 30
           - step_id: read-result
             action: read_incremental
             timeout_seconds: 30
             required: true
+            cursor_before: 8
             minimum_new_output_length: 1
             required_markers: [P6-INPUT-OK]
             forbidden_markers: []
-          - step_id: cleanup
-            action: cleanup_session
+          - step_id: close
+            action: close
             timeout_seconds: 30
             required: true
-            expect_no_live_processes: true
     evaluators:
       - evaluator_id: process-input-answer
         kind: deterministic
@@ -179,16 +219,16 @@ cases:
 
   - case_id: process-kill-cleanup
     name: Kill a bounded long task and clean up the session
-    description: Exercise explicit kill and verify the final terminal state is retained.
+    description: Exercise explicit close and kill, then verify the worker cleanup report independently.
     mode: single_turn
     input:
       message: >-
         Start a bounded background Python task with the public terminal tool
         that prints P6-LONG and sleeps for ten seconds. Use the public process
-        tool to read its initial output, issue kill with a bounded grace period,
-        observe killed or another truthful terminal status, and run session
-        cleanup. Do not use an OS kill command and do not claim completion from
-        assistant text.
+        tool to read its initial output, close the public process handle, issue
+        kill with a bounded grace period, observe killed or another truthful
+        terminal status, and let the worker report session cleanup. Do not use an
+        OS kill command and do not claim completion from assistant text.
     execution:
       enabled_toolsets: [terminal]
     fixture:
@@ -204,12 +244,33 @@ cases:
         timeout_seconds: 120
         required: true
         required_toolsets: [terminal]
+        cleanup:
+          required: true
+          expect_no_live_processes: true
+          expect_session_resources_released: true
         checkpoints:
-          - checkpoint_id: started
+          - kind: step_status
+            checkpoint_id: started
+            target_step_id: start
+            expected_step_status: completed
             required: true
-          - checkpoint_id: killed
+          - kind: output
+            checkpoint_id: initial-output
+            target_step_id: read
+            required_markers: [P6-LONG]
+            forbidden_markers: []
+            minimum_new_output_length: 1
             required: true
-          - checkpoint_id: cleaned
+          - kind: process_status
+            checkpoint_id: killed
+            target_step_id: kill
+            expected_process_status: killed
+            required: true
+          - kind: cleanup
+            checkpoint_id: cleaned
+            expect_agent_close: true
+            expect_worker_cleanup: true
+            expect_no_live_processes: true
             required: true
         steps:
           - step_id: start
@@ -222,9 +283,14 @@ cases:
             action: read_incremental
             timeout_seconds: 30
             required: true
+            cursor_before: 0
             minimum_new_output_length: 1
             required_markers: [P6-LONG]
             forbidden_markers: []
+          - step_id: close
+            action: close
+            timeout_seconds: 30
+            required: true
           - step_id: kill
             action: kill
             timeout_seconds: 30
@@ -235,11 +301,6 @@ cases:
             timeout_seconds: 30
             required: true
             expected_status: killed
-          - step_id: cleanup
-            action: cleanup_session
-            timeout_seconds: 30
-            required: true
-            expect_no_live_processes: true
     evaluators:
       - evaluator_id: process-kill-answer
         kind: deterministic

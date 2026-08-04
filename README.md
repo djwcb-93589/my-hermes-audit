@@ -7,7 +7,11 @@ scenario contracts. See [`docs/p6-e2e-scenarios.md`](docs/p6-e2e-scenarios.md),
 [`examples/e2e_toolchain_v1.yaml`](examples/e2e_toolchain_v1.yaml), and
 [`examples/e2e_process_background_v1.yaml`](examples/e2e_process_background_v1.yaml).
 Process lifecycle facts come from the Subject's public terminal/process tools;
-Audit does not start commands directly or create a second ProcessManager.
+the capability probe reads the public `process.action` schema (not
+`ProcessManager` methods). Audit does not start commands directly or create a
+second ProcessManager. `interrupt` is currently unsupported and is covered by
+the preflight-only negative Suite; Agent `close` and Worker cleanup remain
+separate facts.
 
 ## P5 Background Review 评测
 

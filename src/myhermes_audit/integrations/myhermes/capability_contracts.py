@@ -22,8 +22,8 @@ from myhermes_audit.contracts.memory import MemoryKind, RetrievalStrategy
 from myhermes_audit.contracts.background_review import ReviewKind
 
 
-CAPABILITY_PROTOCOL_VERSION = "4.0"
-CapabilityProtocolVersion = Literal["4.0"]
+CAPABILITY_PROTOCOL_VERSION = "5.0"
+CapabilityProtocolVersion = Literal["5.0"]
 
 
 class SubjectCapabilityProbeRequest(ContractModel):
@@ -74,6 +74,20 @@ class SubjectCapabilityReport(ContractModel):
     supported_compression_modes: list[CompressionMode] = Field(
         default_factory=list
     )
+    # Process capabilities are projected exclusively from the public Tool
+    # declaration enum.  These fields intentionally contain no handler or
+    # ProcessManager implementation details.
+    supported_process_actions: list[NonEmptyText] = Field(default_factory=list)
+    process_toolset: NonEmptyText | None = None
+    process_start_via_terminal: StrictBool = False
+    process_log: StrictBool = False
+    process_poll: StrictBool = False
+    process_wait: StrictBool = False
+    process_write: StrictBool = False
+    process_submit: StrictBool = False
+    process_kill: StrictBool = False
+    process_close: StrictBool = False
+    process_interrupt: StrictBool = False
     compression_control: CompressionControl = CompressionControl.UNAVAILABLE
     compression_configuration_paths: list[NonEmptyText] = Field(
         default_factory=list
@@ -126,6 +140,30 @@ class SubjectCapabilityReport(ContractModel):
             set(self.supported_compression_modes)
         ):
             raise ValueError("supported_compression_modes must not repeat")
+        if len(self.supported_process_actions) != len(
+            set(self.supported_process_actions)
+        ):
+            raise ValueError("supported_process_actions must not repeat")
+        action_set = set(self.supported_process_actions)
+        if (self.process_toolset is None) != (not action_set):
+            raise ValueError(
+                "process_toolset must be present exactly when public process actions exist"
+            )
+        process_flags = {
+            "process_log": "log",
+            "process_poll": "poll",
+            "process_wait": "wait",
+            "process_write": "write",
+            "process_submit": "submit",
+            "process_kill": "kill",
+            "process_close": "close",
+            "process_interrupt": "interrupt",
+        }
+        for field_name, action in process_flags.items():
+            if getattr(self, field_name) != (action in action_set):
+                raise ValueError(f"{field_name} must match supported_process_actions")
+        if self.process_start_via_terminal and self.process_toolset is None:
+            raise ValueError("terminal Process start requires the public process toolset")
         if len(self.compression_configuration_paths) != len(
             set(self.compression_configuration_paths)
         ):

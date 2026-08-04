@@ -145,14 +145,6 @@ def _bind_skill_handler(signature: inspect.Signature) -> None:
     signature.bind(_BIND_PLACEHOLDER)
 
 
-def _bind_process_handler(signature: inspect.Signature) -> None:
-    signature.bind(
-        _BIND_PLACEHOLDER,
-        process_manager=_BIND_PLACEHOLDER,
-        session_key=_BIND_PLACEHOLDER,
-    )
-
-
 def _bind_skill_register(signature: inspect.Signature) -> None:
     signature.bind(_BIND_PLACEHOLDER)
 
@@ -689,54 +681,6 @@ class _ProbeBuilder:
         )
         return available
 
-    def method_check(
-        self,
-        name: str,
-        module_name: str,
-        class_name: str,
-        method_name: str,
-        *,
-        required: bool = False,
-    ) -> bool:
-        available = False
-        signature: str | None = None
-        failure_type: str | None = None
-        try:
-            module = importlib.import_module(module_name)
-            owner = getattr(module, class_name)
-            method = getattr(owner, method_name)
-            if not callable(method):
-                raise TypeError("public method is not callable")
-            signature = _safe_signature(inspect.signature(method))
-            available = True
-        except AttributeError:
-            failure_type = "symbol_missing"
-        except (TypeError, ValueError):
-            failure_type = "signature_unavailable"
-        except Exception:
-            failure_type = "capability_check_failed"
-        self.checks.append(
-            SubjectCapabilityCheck(
-                name=name,
-                required=required,
-                available=available,
-                module=module_name,
-                public_object=f"{class_name}.{method_name}",
-                signature=signature,
-                failure_type=failure_type,
-            )
-        )
-        self.api_entries.append(
-            {
-                "module": module_name,
-                "object": f"{class_name}.{method_name}",
-                "signature": signature,
-                "available": "yes" if available else "no",
-            }
-        )
-        return available
-
-
 def _has_parameters(*names: str) -> Callable[[object], bool]:
     def predicate(value: object) -> bool:
         parameters = inspect.signature(value).parameters
@@ -922,12 +866,42 @@ def _skill_read_declaration_surface(value: object) -> bool:
 
 
 def _process_declaration_surface(value: object) -> bool:
-    """The current Subject exposes the process companion through terminal."""
+    """Validate only the public process Tool declaration and schema."""
     return _tool_declaration_surface(
         value,
         expected_toolsets=frozenset({"terminal"}),
         expected_names=frozenset({"process"}),
     )
+
+
+def _process_action_names(value: object) -> tuple[str, ...]:
+    """Read the public ``process.action`` enum without importing handlers."""
+
+    if not _process_declaration_surface(value):
+        return ()
+    declaration = value[0]
+    schema = getattr(declaration, "schema", {})
+    parameters = schema.get("parameters", {}) if isinstance(schema, Mapping) else {}
+    properties = parameters.get("properties", {}) if isinstance(parameters, Mapping) else {}
+    action = properties.get("action", {}) if isinstance(properties, Mapping) else {}
+    enum = action.get("enum", ()) if isinstance(action, Mapping) else ()
+    if not isinstance(action, Mapping) or action.get("type") != "string":
+        return ()
+    if not isinstance(enum, (tuple, list)):
+        return ()
+    names = tuple(item for item in enum if isinstance(item, str) and item)
+    return names if len(names) == len(set(names)) else ()
+
+
+def _terminal_supports_background(value: object) -> bool:
+    if not _terminal_declaration_surface(value):
+        return False
+    declaration = value[0]
+    schema = getattr(declaration, "schema", {})
+    parameters = schema.get("parameters", {}) if isinstance(schema, Mapping) else {}
+    properties = parameters.get("properties", {}) if isinstance(parameters, Mapping) else {}
+    background = properties.get("background") if isinstance(properties, Mapping) else None
+    return isinstance(background, Mapping) and background.get("type") == "boolean"
 
 
 def _validate_subject_origin(request: SubjectCapabilityProbeRequest) -> bool:
@@ -1197,7 +1171,7 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         "TOOL_DECLARATIONS",
         _file_declaration_surface,
     )
-    builder.check(
+    terminal_declaration = builder.check(
         "terminal_tool_declaration",
         "hermes.tool_declarations.terminal",
         "TOOL_DECLARATIONS",
@@ -1210,87 +1184,49 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         _process_declaration_surface,
         required=False,
     )
-    process_handler = builder.check(
-        "process_handler",
-        "hermes.tools.process",
-        "run_process",
-        callable,
-        signature_validator=_bind_process_handler,
-        required=False,
+    # The handler is deliberately not inspected as a source of foreground
+    # capability.  Public Process action support comes only from the schema.
+    process_actions = _process_action_names(process_declaration)
+    process_toolset = (
+        getattr(process_declaration[0], "toolset", None)
+        if process_actions and process_declaration
+        else None
     )
-    process_start = builder.method_check(
-        "process_start",
-        "hermes.processes",
-        "ProcessManager",
-        "spawn",
-        required=False,
+    process_start_via_terminal = bool(process_actions) and _terminal_supports_background(
+        terminal_declaration
     )
-    process_read_incremental = builder.method_check(
-        "process_read_incremental",
-        "hermes.processes",
-        "ProcessManager",
-        "log",
-        required=False,
+    for action, capability_name in (
+        ("log", "process_log"),
+        ("poll", "process_poll"),
+        ("wait", "process_wait"),
+        ("write", "process_write"),
+        ("submit", "process_submit"),
+        ("kill", "process_kill"),
+        ("close", "process_close"),
+        ("interrupt", "process_interrupt"),
+    ):
+        builder.derived_check(
+            capability_name,
+            available=action in process_actions,
+            public_object=f"process.action={action}",
+        )
+    builder.derived_check(
+        "process_start_via_terminal",
+        available=process_start_via_terminal,
+        public_object="terminal.background",
     )
-    process_send_input = builder.method_check(
-        "process_send_input",
-        "hermes.processes",
-        "ProcessManager",
-        "write_stdin",
-        required=False,
-    )
-    process_wait = builder.method_check(
-        "process_wait",
-        "hermes.processes",
-        "ProcessManager",
-        "wait",
-        required=False,
-    )
-    process_interrupt = builder.method_check(
-        "process_interrupt",
-        "hermes.processes",
-        "ProcessManager",
-        "interrupt",
-        required=False,
-    )
-    process_kill = builder.method_check(
-        "process_kill",
-        "hermes.processes",
-        "ProcessManager",
-        "kill",
-        required=False,
-    )
-    process_status = builder.method_check(
-        "process_status",
-        "hermes.processes",
-        "ProcessManager",
-        "poll",
-        required=False,
-    )
-    process_session_cleanup = builder.method_check(
-        "process_session_cleanup",
-        "hermes.processes",
-        "ProcessManager",
-        "cleanup_session",
-        required=False,
+    builder.derived_check(
+        "process_toolset_actions",
+        available=bool(process_actions),
+        public_object="terminal.process.action enum",
     )
     builder.derived_check(
         "background_process_supported",
-        available=all(
-            item is not None
-            for item in (
-                process_declaration,
-                process_handler,
-                process_start,
-                process_read_incremental,
-                process_send_input,
-                process_wait,
-                process_kill,
-                process_status,
-                process_session_cleanup,
-            )
+        available=(
+            process_start_via_terminal
+            and {"log", "wait", "kill"}.issubset(process_actions)
         ),
-        public_object="terminal process declaration+ProcessManager lifecycle",
+        public_object="terminal.background + process.action enum",
     )
     skill_read_declaration = builder.check(
         "skill_read_toolset",
@@ -1747,6 +1683,11 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
                 ),
                 "compression_observation": compression_observation is not None,
             },
+            "process_projection": {
+                "toolset": process_toolset,
+                "supported_actions": list(process_actions),
+                "start_via_terminal": process_start_via_terminal,
+            },
         }
     )
     error = (
@@ -1791,6 +1732,17 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
             emergency_compression_disable is not None
         ),
         compression_observation_supported=compression_observation is not None,
+        supported_process_actions=list(process_actions),
+        process_toolset=process_toolset,
+        process_start_via_terminal=process_start_via_terminal,
+        process_log="log" in process_actions,
+        process_poll="poll" in process_actions,
+        process_wait="wait" in process_actions,
+        process_write="write" in process_actions,
+        process_submit="submit" in process_actions,
+        process_kill="kill" in process_actions,
+        process_close="close" in process_actions,
+        process_interrupt="interrupt" in process_actions,
         warnings=builder.warnings,
         public_api_fingerprint=fingerprint,
         error=error,

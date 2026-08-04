@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from myhermes_audit.integrations.myhermes.contracts import (
@@ -130,6 +131,10 @@ def read_observations(
                     success=item.success,
                     error_type=item.error_type,
                     duration_ms=item.duration_ms,
+                    created_at=datetime.fromtimestamp(
+                        item.created_at,
+                        tz=timezone.utc,
+                    ),
                 )
             )
     return ObservationBundle(

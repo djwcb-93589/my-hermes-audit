@@ -187,8 +187,18 @@ class ValidatorResultsArtifact(ContractModel):
                 {
                     "process_gate",
                     "process_steps",
-                    "process_cleanup",
                     "process_checkpoints",
+                    "command_identity",
+                    "process_identity",
+                    "input_identity",
+                    "step_action",
+                    "cursor_integrity",
+                    "marker_expectations",
+                    "status_transitions",
+                    "step_timeout",
+                    "scenario_timeout",
+                    "agent_close",
+                    "worker_cleanup",
                 }
             ),
         )

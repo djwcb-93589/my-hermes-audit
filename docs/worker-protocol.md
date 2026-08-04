@@ -1,10 +1,10 @@
 # Worker 文件协议
 
-## P5 Worker and P6.1 Worker v5
+## P5 Worker and P6.1 Worker v6
 
-## P6.1 Worker v5
+## P6.1 Worker v6
 
-`myhermes-audit-worker-v5` adds strict `scenarios` plans to the request and
+`myhermes-audit-worker-v6` adds strict `scenarios` plans to the request and
 content-free `scenario_results`, `process_errors`, and scenario Artifact refs
 to the result. Parent and Worker reject a version mismatch. Existing P0-P5
 Suites remain valid because their scenario list is empty and they continue to
@@ -21,7 +21,7 @@ The protocol carries no command text, stdin body, credentials, environment
 values, or unbounded stdout. Subject-owned ProcessManager cleanup remains in
 the existing Worker lifecycle; Audit does not create a second manager.
 
-默认协议升级为 `myhermes-audit-worker-v5`。P5 request/result、P6.1 scenario Artifact 必须使用 v5，父子进程会严格拒绝不兼容版本或不完整的 Artifact 引用。当前 Worker 仍可执行没有 P5/P6.1 Plan 的 P0–P4 Suite；它们不初始化 Review 或 Process 场景运行时，也不会携带对应结果。遗留 v4 envelope 不会被静默降级。
+默认协议升级为 `myhermes-audit-worker-v6`。P5 request/result、P6.1 scenario Artifact 必须使用 v6，父子进程会严格拒绝不兼容版本或不完整的 Artifact 引用。当前 Worker 仍可执行没有 P5/P6.1 Plan 的 P0–P5 Suite；它们不初始化 Review 或 Process 场景运行时，也不会携带对应结果。遗留 v5 envelope 不会被静默降级。
 
 P5 request 增加严格的 `background_review_plans` 与 Skill Fixture 投影；result 增加 `background_review_results`、`background_review_errors`。`review_gate_passed` 属于父进程 Validator/Orchestrator 的最终 Trial 事实，Worker 不得自行伪造它。每个有 P5 Plan 的 Trial 固定写入并交叉校验：
 
@@ -48,7 +48,7 @@ Worker 不使用 stdout 传结构化结果。每个 Trial 的 `artifacts/` 固�
 - P4 Variant 才有的 `ablation.json`
 - P5 Review Plan 才有的 `background-review-results.json`、`background-review-evidence.json`、`background-review-snapshots.json`
 
-请求和结果都使用严格 Pydantic 合同、明确的协议版本、未知字段拒绝、非负计数与有限数值。P3 因 turns 增加逻辑 `session_id`，并增加 strategy、Memory Fixture、稳定 query plan 与 Memory Artifact，协议从 v1 显式升级为 `myhermes-audit-worker-v2`；P4 升级为 v3；P5 因 Review Plan、执行结果与三份安全 Artifact 升级为 v4；P6.1 因 typed scenario 计划、结果与安全 Artifact 升级为当前默认 v5。请求不携带环境快照或凭据。
+请求和结果都使用严格 Pydantic 合同、明确的协议版本、未知字段拒绝、非负计数与有限数值。P3 因 turns 增加逻辑 `session_id`，并增加 strategy、Memory Fixture、稳定 query plan 与 Memory Artifact，协议从 v1 显式升级为 `myhermes-audit-worker-v2`；P4 升级为 v3；P5 因 Review Plan、执行结果与三份安全 Artifact 升级为 v4；P6.1 因 typed scenario 计划、结果与安全 Artifact 首次升级为 v5，本轮因 Process 结果合同、字符 cursor、身份和 cleanup 事实变化显式升级为当前默认 v6。请求不携带环境快照或凭据。
 
 结果只保存安全运行投影：状态、逐 turn 输出、run ID、有限的计数/token/duration、Artifact 相对路径、稳定错误类别与安全摘要。它不序列化 MyHermes 对象、完整 Prompt、模型隐藏推理、完整工具参数或完整工具结果。
 

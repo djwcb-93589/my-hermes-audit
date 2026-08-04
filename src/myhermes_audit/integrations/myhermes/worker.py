@@ -1002,13 +1002,13 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         except Exception as exc:
             process_errors.append(
                 ScenarioError(
-                    error_type="scenario_artifact_error",
+                    error_type="scenario-artifact-error",
                     message="scenario observations could not be persisted",
                 )
             )
             lifecycle_warnings.append(_worker_warning("scenario_artifact_error", exc))
             failed_status = failed_status or "scenario_artifact_error"
-            failed_error_type = failed_error_type or "scenario_artifact_error"
+            failed_error_type = failed_error_type or "scenario-artifact-error"
             failed_fatal = True
     duration_ms = max(0, round((time.perf_counter() - started) * 1000))
     prompt_tokens = _complete_optional_sum(

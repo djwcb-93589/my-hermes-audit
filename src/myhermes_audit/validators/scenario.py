@@ -27,6 +27,7 @@ def _error_metric(
     scenario_kind: E2EScenarioKind,
     reason: str,
     hard_gate: bool,
+    metric_type: str = "scenario_error",
 ) -> MetricResult:
     return MetricResult(
         metric_name=name,
@@ -50,7 +51,7 @@ def _error_metric(
         ),
         metadata={
             "scenario_kind": scenario_kind.value,
-            "metric_type": "scenario_error",
+            "metric_type": metric_type,
             "hard_gate": hard_gate,
         },
     )
@@ -106,12 +107,18 @@ def evaluate_scenario_plan(
 ) -> list[MetricResult]:
     observed = _result_for(context, plan.scenario_id)
     if observed is None:
+        metric_type = (
+            "process_gate"
+            if plan.kind is E2EScenarioKind.PROCESS_BACKGROUND
+            else "toolchain_gate"
+        )
         return [
             _error_metric(
                 name=f"{metric_prefix}.status",
                 scenario_kind=E2EScenarioKind(plan.kind.value),
                 reason="Worker did not produce the declared scenario result",
                 hard_gate=plan.required,
+                metric_type=metric_type,
             )
         ]
     if plan.kind is E2EScenarioKind.TOOLCHAIN:
@@ -140,6 +147,7 @@ def _evaluate_toolchain(
                 scenario_kind=E2EScenarioKind.TOOLCHAIN,
                 reason="Worker scenario kind does not match the declared plan",
                 hard_gate=plan.required,
+                metric_type="toolchain_gate",
             )
         ]
     checkpoints = {item.checkpoint_id: item for item in observed.checkpoints}
@@ -211,6 +219,7 @@ def _evaluate_process(
                 scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
                 reason="Worker scenario kind does not match the declared plan",
                 hard_gate=plan.required,
+                metric_type="process_gate",
             )
         ]
     required_steps = {item.step_id for item in plan.steps if item.required}
@@ -221,15 +230,38 @@ def _evaluate_process(
         and observed_steps[step_id].error is None
         for step_id in required_steps
     )
-    cleanup_required = any(
-        item.action.value == "cleanup_session" and item.required
-        for item in plan.steps
+    required_step_results = [
+        observed_steps.get(step.step_id)
+        for step in plan.steps
+        if step.required
+    ]
+    step_action_passed = all(
+        item is not None and item.action_matched is True
+        for item in required_step_results
     )
+    step_timeout_passed = all(
+        item is not None and item.duration_ms is not None and not item.timed_out
+        for item in required_step_results
+    )
+    required_step_timing_missing = any(
+        item is None or item.duration_ms is None
+        for item in required_step_results
+    )
+    marker_passed = all(
+        item is not None and item.status is ScenarioStatus.COMPLETED
+        for item in required_step_results
+        if item is not None and item.action.value == "read_incremental"
+    )
+    cleanup_required = plan.cleanup is not None and plan.cleanup.required
     cleanup_passed = (
         not cleanup_required
         or (
-            observed.cleanup_result is not None
-            and observed.cleanup_result.complete
+            observed.worker_cleanup_result is not None
+            and observed.worker_cleanup_result.complete
+            and (
+                not plan.cleanup.expect_no_live_processes
+                or observed.worker_cleanup_result.live_process_count_after == 0
+            )
         )
     )
     observed_checkpoints = {
@@ -242,44 +274,102 @@ def _evaluate_process(
         if item.required
     )
     status_passed = observed.status is ScenarioStatus.COMPLETED
-    return [
-        _boolean_metric(
-            name=f"{metric_prefix}.status",
-            scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-            metric_type="process_gate",
-            passed=status_passed,
-            reason="Process scenario completed" if status_passed else "Process scenario did not complete",
-            hard_gate=plan.required,
-        ),
-        _boolean_metric(
-            name=f"{metric_prefix}.steps",
-            scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-            metric_type="process_steps",
-            passed=steps_passed,
-            reason="required Process steps passed" if steps_passed else "a required Process step failed",
-            hard_gate=plan.required,
-        ),
-        _boolean_metric(
-            name=f"{metric_prefix}.cleanup",
-            scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-            metric_type="process_cleanup",
-            passed=cleanup_passed,
-            reason="Process cleanup completed" if cleanup_passed else "Process cleanup is incomplete",
-            hard_gate=plan.required,
-        ),
-        _boolean_metric(
-            name=f"{metric_prefix}.checkpoints",
-            scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-            metric_type="process_checkpoints",
-            passed=checkpoints_passed,
-            reason=(
-                "required Process checkpoints passed"
-                if checkpoints_passed
-                else "a required Process checkpoint failed"
-            ),
-            hard_gate=plan.required,
-        ),
+    command_identity_passed = observed.command_matched is True
+    process_identity_passed = observed.process_identity_matched is True
+    input_identity_passed = observed.input_matched is not False
+    cursor_passed = all(
+        item.cursor_unit == "character"
+        and item.cursor_after >= item.cursor_before
+        and item.new_output_char_length == item.cursor_after - item.cursor_before
+        for item in observed.incremental_reads
+    )
+    status_transition_passed = observed.status_transitions_valid is True
+    scenario_timeout_passed = (
+        observed.duration_ms is not None and not observed.scenario_timed_out
+    )
+    agent_close_required = any(item.action.value == "close" and item.required for item in plan.steps)
+    agent_close_passed = not agent_close_required or observed.agent_close_observed
+    metric_specs = [
+        ("process_command_identity", "command_identity", command_identity_passed, "declared and observed command identity matched"),
+        ("process_identity", "process_identity", process_identity_passed, "all public Process calls referenced the start process"),
+        ("process_input_identity", "input_identity", input_identity_passed, "fixture input matched the observed public input"),
+        ("process_step_action", "step_action", step_action_passed, "required step actions matched public Tool observations"),
+        ("process_cursor_integrity", "cursor_integrity", cursor_passed, "Process log cursor used character units without gaps"),
+        ("process_marker_expectations", "marker_expectations", marker_passed, "required and forbidden output markers were evaluated"),
+        ("process_status_transitions", "status_transitions", status_transition_passed, "Process status did not return to active after terminal"),
+        ("process_step_timeout", "step_timeout", step_timeout_passed, "required steps supplied real duration facts within timeout"),
+        ("process_scenario_timeout", "scenario_timeout", scenario_timeout_passed, "scenario stayed within its hard deadline"),
+        ("process_agent_close", "agent_close", agent_close_passed, "Agent close expectation was observed independently"),
+        ("process_worker_cleanup", "worker_cleanup", cleanup_passed, "Worker cleanup report satisfied its lifecycle expectation"),
     ]
+    process_gate = (
+        status_passed
+        and steps_passed
+        and checkpoints_passed
+        and all(item[2] for item in metric_specs)
+    )
+    metrics = [
+        (
+            _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason=(
+                    "required Process step timing was not present in public "
+                    "Observation facts"
+                ),
+                hard_gate=plan.required,
+                metric_type=metric_type,
+            )
+            if metric_type == "step_timeout" and required_step_timing_missing
+            else (
+                _error_metric(
+                    name=f"{metric_prefix}.{name}",
+                    scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                    reason=(
+                        "Process scenario duration was not present in public "
+                        "Observation facts"
+                    ),
+                    hard_gate=plan.required,
+                    metric_type=metric_type,
+                )
+                if metric_type == "scenario_timeout" and observed.duration_ms is None
+                else _boolean_metric(
+                    name=f"{metric_prefix}.{name}",
+                    scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                    metric_type=metric_type,
+                    passed=passed,
+                    reason=reason if passed else f"{reason} was not proven",
+                    hard_gate=plan.required,
+                )
+            )
+        )
+        for name, metric_type, passed, reason in metric_specs
+    ]
+    metrics.insert(0, _boolean_metric(
+        name=f"{metric_prefix}.status",
+        scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+        metric_type="process_gate",
+        passed=process_gate,
+        reason="all required Process gates passed" if process_gate else "one or more required Process gates failed",
+        hard_gate=plan.required,
+    ))
+    metrics.append(_boolean_metric(
+        name=f"{metric_prefix}.steps",
+        scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+        metric_type="process_steps",
+        passed=steps_passed,
+        reason="required Process steps passed" if steps_passed else "a required Process step failed",
+        hard_gate=plan.required,
+    ))
+    metrics.append(_boolean_metric(
+        name=f"{metric_prefix}.checkpoints",
+        scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+        metric_type="process_checkpoints",
+        passed=checkpoints_passed,
+        reason="required Process checkpoints passed" if checkpoints_passed else "a required Process checkpoint failed",
+        hard_gate=plan.required,
+    ))
+    return metrics
 
 
 __all__ = ("evaluate_scenario_plan",)

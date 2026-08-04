@@ -119,8 +119,8 @@ def _scenario_summary(result: AuditRunResult) -> list[str]:
     if not scenarios:
         return []
     process = [item for item in scenarios if item.kind.value == "process_background"]
-    output_bytes = sum(
-        read.new_output_length
+    output_chars = sum(
+        read.new_output_char_length
         for item in process
         for read in item.incremental_reads
     )
@@ -131,11 +131,11 @@ def _scenario_summary(result: AuditRunResult) -> list[str]:
         + _gate_or_missing(next((trial.process_gate_passed for trial in result.trials if trial.process_gate_passed is not None), None)),
         "Final process status:  "
         + (process[-1].final_status.value if process and process[-1].final_status is not None else "not evaluated"),
-        f"Incremental output bytes: {output_bytes}",
+        f"Incremental output chars: {output_chars}",
         "Process cleanup:      "
         + _gate_or_missing(
-            all(item.cleanup_result.complete for item in process if item.cleanup_result is not None)
-            if process and all(item.cleanup_result is not None for item in process)
+            all(item.worker_cleanup_result.complete for item in process if item.worker_cleanup_result is not None)
+            if process and all(item.worker_cleanup_result is not None for item in process)
             else None
         ),
     ]

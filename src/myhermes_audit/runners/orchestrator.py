@@ -36,7 +36,12 @@ from myhermes_audit.contracts import (
 )
 from myhermes_audit.contracts.common import CURRENT_SCHEMA_VERSION
 from myhermes_audit.datasets.fixtures import materialize_fixtures
-from myhermes_audit.errors import AuditError, SandboxError, UnsupportedCaseError
+from myhermes_audit.errors import (
+    AuditError,
+    SandboxError,
+    SubjectPreflightError,
+    UnsupportedCaseError,
+)
 from myhermes_audit.fingerprint import (
     build_audit_fingerprint,
     read_subject_fingerprint,
@@ -107,6 +112,16 @@ class AuditOrchestrator:
         # before the first Sandbox or worker process is created.
         self.judge_service.preflight(selected)
         self.runner.preflight(selected)
+        for case in selected:
+            for scenario in case.scenarios:
+                if scenario.timeout_seconds > suite.defaults.timeout_seconds:
+                    raise SubjectPreflightError(
+                        "scenario timeout exceeds the Trial watchdog budget",
+                        case_id=case.case_id,
+                        scenario_id=scenario.scenario_id,
+                        scenario_timeout_seconds=scenario.timeout_seconds,
+                        trial_timeout_seconds=suite.defaults.timeout_seconds,
+                    )
         subject_fingerprint = read_subject_fingerprint(self.subject_repo)
 
         audit_started = datetime.now(timezone.utc)

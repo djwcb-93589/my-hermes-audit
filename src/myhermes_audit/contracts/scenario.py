@@ -1,8 +1,8 @@
 """Strict P6.1 end-to-end scenario contracts.
 
-The scenario models deliberately describe intent and safe observations rather
-than an executable command DSL.  Commands and input bodies are never copied
-into execution results; only bounded, content-free projections are retained.
+Scenario plans describe public observations, never an executable Process DSL.
+Commands, input bodies and raw output are deliberately absent from result
+contracts; only bounded hashes, lengths and safe identifiers are retained.
 """
 
 from __future__ import annotations
@@ -79,13 +79,63 @@ class ProcessAction(str, Enum):
     WAIT = "wait"
     INTERRUPT = "interrupt"
     KILL = "kill"
+    CLOSE = "close"
     ASSERT_STATUS = "assert_status"
-    CLEANUP_SESSION = "cleanup_session"
 
 
-class ScenarioCheckpoint(ContractModel):
+class ScenarioCheckpointKind(str, Enum):
+    STEP_STATUS = "step_status"
+    PROCESS_STATUS = "process_status"
+    OUTPUT = "output"
+    CLEANUP = "cleanup"
+
+
+class ScenarioCheckpointBase(ContractModel):
     checkpoint_id: Identifier
     required: StrictBool = True
+
+
+class StepStatusCheckpoint(ScenarioCheckpointBase):
+    kind: Literal[ScenarioCheckpointKind.STEP_STATUS] = ScenarioCheckpointKind.STEP_STATUS
+    target_step_id: Identifier
+    expected_step_status: ScenarioStatus
+
+
+class ProcessStatusCheckpoint(ScenarioCheckpointBase):
+    kind: Literal[ScenarioCheckpointKind.PROCESS_STATUS] = ScenarioCheckpointKind.PROCESS_STATUS
+    target_step_id: Identifier
+    expected_process_status: ScenarioProcessStatus
+
+
+class OutputCheckpoint(ScenarioCheckpointBase):
+    kind: Literal[ScenarioCheckpointKind.OUTPUT] = ScenarioCheckpointKind.OUTPUT
+    target_step_id: Identifier
+    artifact_scope: Literal["input", "output"] | None = None
+    required_markers: list[NonEmptyText] = Field(default_factory=list)
+    forbidden_markers: list[NonEmptyText] = Field(default_factory=list)
+    minimum_new_output_length: NonNegativeInt = 0
+
+    @model_validator(mode="after")
+    def validate_markers(self) -> "OutputCheckpoint":
+        if set(self.required_markers) & set(self.forbidden_markers):
+            raise ValueError("checkpoint required and forbidden markers must be disjoint")
+        return self
+
+
+class CleanupCheckpoint(ScenarioCheckpointBase):
+    kind: Literal[ScenarioCheckpointKind.CLEANUP] = ScenarioCheckpointKind.CLEANUP
+    expect_agent_close: StrictBool = False
+    expect_worker_cleanup: StrictBool = True
+    expect_no_live_processes: StrictBool = True
+
+
+ScenarioCheckpoint = Annotated[
+    StepStatusCheckpoint
+    | ProcessStatusCheckpoint
+    | OutputCheckpoint
+    | CleanupCheckpoint,
+    Field(discriminator="kind"),
+]
 
 
 class ScenarioToolCall(ContractModel):
@@ -102,9 +152,7 @@ class ScenarioTraceRequirement(ContractModel):
     @model_validator(mode="after")
     def validate_counts(self) -> "ScenarioTraceRequirement":
         if self.minimum_successful_calls > self.minimum_calls:
-            raise ValueError(
-                "minimum_successful_calls cannot exceed minimum_calls"
-            )
+            raise ValueError("minimum_successful_calls cannot exceed minimum_calls")
         return self
 
 
@@ -121,7 +169,7 @@ class ScenarioPlanBase(ContractModel):
         if len(checkpoint_ids) != len(set(checkpoint_ids)):
             raise ValueError("scenario checkpoint IDs must be unique")
         if len(self.required_toolsets) != len(set(self.required_toolsets)):
-            raise ValueError("scenario required toolsets must be unique")
+            raise ValueError("scenario required_toolsets must be unique")
         allowed_toolsets = {"file", "terminal", "memory", "skill_read"}
         unknown = sorted(set(self.required_toolsets) - allowed_toolsets)
         if unknown:
@@ -153,6 +201,9 @@ class ToolchainScenarioPlan(ScenarioPlanBase):
         trace_names = [item.tool_name for item in self.trace_requirements]
         if len(trace_names) != len(set(trace_names)):
             raise ValueError("scenario trace requirement tool names must be unique")
+        for checkpoint in self.checkpoints:
+            if isinstance(checkpoint, OutputCheckpoint) and checkpoint.artifact_scope is None:
+                raise ValueError("Toolchain output checkpoints require artifact_scope")
         return self
 
 
@@ -160,6 +211,7 @@ class ProcessStepBase(ContractModel):
     step_id: Identifier
     required: StrictBool = True
     timeout_seconds: ScenarioStepTimeout = 30
+    process_ref_step_id: Identifier | None = None
 
 
 class ProcessStartStep(ProcessStepBase):
@@ -171,11 +223,14 @@ class ProcessStartStep(ProcessStepBase):
     def validate_initial_status(self) -> "ProcessStartStep":
         if self.expected_initial_status not in _ACTIVE_PROCESS_STATUSES:
             raise ValueError("Process start must expect an active status")
+        if self.process_ref_step_id is not None:
+            raise ValueError("Process start cannot reference another process step")
         return self
 
 
 class ProcessReadIncrementalStep(ProcessStepBase):
     action: Literal[ProcessAction.READ_INCREMENTAL] = ProcessAction.READ_INCREMENTAL
+    cursor_before: NonNegativeInt = 0
     minimum_new_output_length: NonNegativeInt = 0
     required_markers: list[NonEmptyText] = Field(default_factory=list)
     forbidden_markers: list[NonEmptyText] = Field(default_factory=list)
@@ -221,14 +276,13 @@ class ProcessKillStep(ProcessStepBase):
         return self
 
 
+class ProcessCloseStep(ProcessStepBase):
+    action: Literal[ProcessAction.CLOSE] = ProcessAction.CLOSE
+
+
 class ProcessAssertStatusStep(ProcessStepBase):
     action: Literal[ProcessAction.ASSERT_STATUS] = ProcessAction.ASSERT_STATUS
     expected_status: ScenarioProcessStatus
-
-
-class ProcessCleanupSessionStep(ProcessStepBase):
-    action: Literal[ProcessAction.CLEANUP_SESSION] = ProcessAction.CLEANUP_SESSION
-    expect_no_live_processes: StrictBool = True
 
 
 ProcessStep = Annotated[
@@ -238,17 +292,22 @@ ProcessStep = Annotated[
     | ProcessWaitStep
     | ProcessInterruptStep
     | ProcessKillStep
-    | ProcessAssertStatusStep
-    | ProcessCleanupSessionStep,
+    | ProcessCloseStep
+    | ProcessAssertStatusStep,
     Field(discriminator="action"),
 ]
 
 
+class ProcessCleanupExpectation(ContractModel):
+    required: StrictBool = True
+    expect_no_live_processes: StrictBool = True
+    expect_session_resources_released: StrictBool = True
+
+
 class ProcessScenarioPlan(ScenarioPlanBase):
-    kind: Literal[E2EScenarioKind.PROCESS_BACKGROUND] = (
-        E2EScenarioKind.PROCESS_BACKGROUND
-    )
+    kind: Literal[E2EScenarioKind.PROCESS_BACKGROUND] = E2EScenarioKind.PROCESS_BACKGROUND
     steps: list[ProcessStep] = Field(min_length=1)
+    cleanup: ProcessCleanupExpectation | None = None
 
     @model_validator(mode="after")
     def validate_steps(self) -> "ProcessScenarioPlan":
@@ -257,6 +316,52 @@ class ProcessScenarioPlan(ScenarioPlanBase):
             raise ValueError("Process scenario step IDs must be unique")
         if not any(item.required for item in self.steps):
             raise ValueError("Process scenario requires at least one required step")
+        starts = [index for index, item in enumerate(self.steps) if item.action is ProcessAction.START]
+        if len(starts) != 1:
+            raise ValueError("Process scenario requires exactly one start step")
+        start_index = starts[0]
+        for index, step in enumerate(self.steps):
+            if step.timeout_seconds > self.timeout_seconds:
+                raise ValueError("Process step timeout cannot exceed scenario timeout")
+            if isinstance(step, ProcessWaitStep) and step.maximum_wait_seconds > step.timeout_seconds:
+                raise ValueError("wait maximum_wait_seconds cannot exceed step timeout")
+            if index < start_index and step.action is not ProcessAction.START:
+                raise ValueError("Process start must precede every Process operation")
+            if step.process_ref_step_id is not None and step.process_ref_step_id != self.steps[start_index].step_id:
+                raise ValueError("Process steps may reference only the start step")
+            if index > start_index and step.process_ref_step_id == self.steps[start_index].step_id:
+                continue
+        terminal_seen = False
+        previous_cursor = 0
+        for step in self.steps[start_index + 1 :]:
+            if step.action in {ProcessAction.KILL, ProcessAction.INTERRUPT, ProcessAction.CLOSE}:
+                terminal_seen = True
+            elif step.action is ProcessAction.SEND_INPUT and terminal_seen:
+                raise ValueError("send_input cannot follow a terminal Process action")
+            if isinstance(step, ProcessReadIncrementalStep):
+                if step.cursor_before < previous_cursor:
+                    raise ValueError("read cursor declarations must be monotonic")
+                previous_cursor = step.cursor_before
+        known_steps = set(step_ids)
+        has_close_step = any(item.action is ProcessAction.CLOSE for item in self.steps)
+        for checkpoint in self.checkpoints:
+            target = getattr(checkpoint, "target_step_id", None)
+            if target is not None and target not in known_steps:
+                raise ValueError("checkpoint target_step_id must reference a declared step")
+            if isinstance(checkpoint, OutputCheckpoint) and checkpoint.artifact_scope is not None:
+                raise ValueError("Process output checkpoints cannot set artifact_scope")
+            if (
+                isinstance(checkpoint, CleanupCheckpoint)
+                and (checkpoint.expect_worker_cleanup or checkpoint.expect_no_live_processes)
+                and (self.cleanup is None or not self.cleanup.required)
+            ):
+                raise ValueError(
+                    "cleanup checkpoint requiring Worker cleanup needs a cleanup expectation"
+                )
+            if isinstance(checkpoint, CleanupCheckpoint) and checkpoint.expect_agent_close and not has_close_step:
+                raise ValueError(
+                    "cleanup checkpoint requiring Agent close needs a close step"
+                )
         return self
 
 
@@ -275,9 +380,15 @@ class ScenarioError(ContractModel):
 
 class ScenarioCheckpointResult(ContractModel):
     checkpoint_id: Identifier
+    kind: ScenarioCheckpointKind
     required: StrictBool
+    target_step_id: Identifier | None = None
+    artifact_scope: Literal["input", "output"] | None = None
     passed: StrictBool | None = None
-    observed_status: ScenarioStatus | None = None
+    observed_step_status: ScenarioStatus | None = None
+    observed_process_status: ScenarioProcessStatus | None = None
+    agent_close_observed: StrictBool | None = None
+    worker_cleanup_completed: StrictBool | None = None
     error: ScenarioError | None = None
 
 
@@ -325,10 +436,18 @@ class ScenarioStepResult(ContractModel):
     step_id: Identifier
     action: ProcessAction
     status: ScenarioStatus
+    actual_action: NonEmptyText | None = None
+    actual_status: ScenarioProcessStatus | None = None
     started_at: UtcDatetime | None = None
     completed_at: UtcDatetime | None = None
-    duration_ms: NonNegativeInt = 0
+    duration_ms: NonNegativeInt | None = None
+    timeout_seconds: PositiveInt
+    timed_out: StrictBool = False
     observation_refs: list[Identifier] = Field(default_factory=list)
+    expected_process_id_safe: Identifier | None = None
+    actual_process_id_safe: Identifier | None = None
+    process_identity_matched: StrictBool | None = None
+    action_matched: StrictBool | None = None
     error: ScenarioError | None = None
 
     @model_validator(mode="after")
@@ -339,14 +458,19 @@ class ScenarioStepResult(ContractModel):
             and self.completed_at < self.started_at
         ):
             raise ValueError("scenario step completed_at cannot precede started_at")
+        if self.duration_ms is not None and self.timeout_seconds is not None:
+            if self.timed_out != (self.duration_ms > self.timeout_seconds * 1000):
+                raise ValueError("step timed_out must match duration and timeout")
         return self
 
 
 class IncrementalReadObservation(ContractModel):
     read_index: NonNegativeInt
-    offset_before: NonNegativeInt
-    offset_after: NonNegativeInt
-    new_output_length: NonNegativeInt
+    cursor_unit: Literal["character"] = "character"
+    cursor_before: NonNegativeInt
+    cursor_after: NonNegativeInt
+    new_output_char_length: NonNegativeInt
+    new_output_utf8_bytes: NonNegativeInt
     content_sha256: Sha256Digest | None = None
     required_markers_found: list[Identifier] = Field(default_factory=list)
     required_markers_missing: list[Identifier] = Field(default_factory=list)
@@ -354,11 +478,11 @@ class IncrementalReadObservation(ContractModel):
     truncated: StrictBool = False
 
     @model_validator(mode="after")
-    def validate_offsets(self) -> "IncrementalReadObservation":
-        if self.offset_after < self.offset_before:
-            raise ValueError("incremental read offsets must be monotonic")
-        if self.new_output_length != self.offset_after - self.offset_before:
-            raise ValueError("incremental read length must match offset delta")
+    def validate_cursors(self) -> "IncrementalReadObservation":
+        if self.cursor_after < self.cursor_before:
+            raise ValueError("incremental read cursors must be monotonic")
+        if self.new_output_char_length != self.cursor_after - self.cursor_before:
+            raise ValueError("incremental read length must match character cursor delta")
         return self
 
 
@@ -366,43 +490,86 @@ class ProcessInputObservation(ContractModel):
     input_source: SafeRelativePath
     submitted: StrictBool
     accepted: StrictBool
+    expected_input_sha256: Sha256Digest | None = None
+    actual_input_sha256: Sha256Digest | None = None
+    expected_input_char_length: NonNegativeInt | None = None
+    actual_input_char_length: NonNegativeInt | None = None
+    expected_input_utf8_bytes: NonNegativeInt | None = None
+    actual_input_utf8_bytes: NonNegativeInt | None = None
+    input_matched: StrictBool | None = None
+    process_id_safe: Identifier | None = None
+    process_identity_matched: StrictBool | None = None
+    action_matched: StrictBool | None = None
     bytes_written: NonNegativeInt | None = None
 
 
 class ProcessCleanupResult(ContractModel):
+    required: StrictBool = True
+    expect_no_live_processes: StrictBool = True
+    expect_session_resources_released: StrictBool = True
+    live_process_count_before: NonNegativeInt | None = None
+    live_process_count_after: NonNegativeInt | None = None
+    session_cleanup_completed: StrictBool = False
+    cleanup_errors: list[Identifier] = Field(default_factory=list)
     attempted_process_ids: list[Identifier] = Field(default_factory=list)
     completed_process_ids: list[Identifier] = Field(default_factory=list)
     unresolved_process_ids: list[Identifier] = Field(default_factory=list)
 
     @property
     def complete(self) -> bool:
-        return not self.unresolved_process_ids
+        if not self.required:
+            return True
+        if self.unresolved_process_ids or self.cleanup_errors:
+            return False
+        if self.expect_no_live_processes and self.live_process_count_after != 0:
+            return False
+        if self.expect_session_resources_released and not self.session_cleanup_completed:
+            return False
+        return True
 
 
 class ProcessScenarioExecutionResult(ContractModel):
     scenario_id: Identifier
-    kind: Literal[E2EScenarioKind.PROCESS_BACKGROUND] = (
-        E2EScenarioKind.PROCESS_BACKGROUND
-    )
+    kind: Literal[E2EScenarioKind.PROCESS_BACKGROUND] = E2EScenarioKind.PROCESS_BACKGROUND
     status: ScenarioStatus
     checkpoints: list[ScenarioCheckpointResult] = Field(default_factory=list)
     steps: list[ScenarioStepResult] = Field(default_factory=list)
+    declared_command_sha256: Sha256Digest | None = None
+    actual_command_sha256: Sha256Digest | None = None
+    declared_command_length: NonNegativeInt | None = None
+    actual_command_length: NonNegativeInt | None = None
+    command_matched: StrictBool | None = None
     process_id_safe: Identifier | None = None
-    session_id_safe: Identifier | None = None
+    expected_process_id_safe: Identifier | None = None
+    process_identity_matched: StrictBool | None = None
     initial_status: ScenarioProcessStatus | None = None
     final_status: ScenarioProcessStatus | None = None
+    cursor_unit: Literal["character"] = "character"
     incremental_reads: list[IncrementalReadObservation] = Field(default_factory=list)
     input_events: list[ProcessInputObservation] = Field(default_factory=list)
-    interrupt_requested: StrictBool = False
-    kill_requested: StrictBool = False
-    cleanup_result: ProcessCleanupResult | None = None
-    duration_ms: NonNegativeInt = 0
+    input_matched: StrictBool | None = None
+    status_transitions_valid: StrictBool | None = None
+    scenario_timeout_seconds: PositiveInt
+    scenario_timed_out: StrictBool = False
+    agent_close_observed: StrictBool = False
+    worker_cleanup_result: ProcessCleanupResult | None = None
+    # A Process duration is only present when the public Observation window
+    # supplied enough real timing facts.  ``None`` is deliberately distinct
+    # from a measured zero so validators cannot turn missing timing into a
+    # successful timeout gate.
+    duration_ms: NonNegativeInt | None = None
     errors: list[ScenarioError] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_status_transition(self) -> "ProcessScenarioExecutionResult":
         if self.initial_status in _TERMINAL_PROCESS_STATUSES and self.final_status in _ACTIVE_PROCESS_STATUSES:
             raise ValueError("terminal Process cannot transition back to active")
+        if (
+            self.duration_ms is not None
+            and self.duration_ms > self.scenario_timeout_seconds * 1000
+            and not self.scenario_timed_out
+        ):
+            raise ValueError("scenario_timed_out must reflect the scenario deadline")
         return self
 
 
@@ -413,12 +580,15 @@ ScenarioExecutionResult = Annotated[
 
 
 __all__ = (
+    "CleanupCheckpoint",
     "E2EScenarioKind",
     "IncrementalReadObservation",
+    "OutputCheckpoint",
     "ProcessAction",
     "ProcessAssertStatusStep",
+    "ProcessCleanupExpectation",
     "ProcessCleanupResult",
-    "ProcessCleanupSessionStep",
+    "ProcessCloseStep",
     "ProcessInputObservation",
     "ProcessInterruptStep",
     "ProcessKillStep",
@@ -427,10 +597,14 @@ __all__ = (
     "ProcessScenarioPlan",
     "ProcessSendInputStep",
     "ProcessStartStep",
+    "ProcessStatusCheckpoint",
     "ProcessStep",
+    "ProcessStepBase",
     "ProcessWaitStep",
     "ScenarioArtifactObservation",
     "ScenarioCheckpoint",
+    "ScenarioCheckpointBase",
+    "ScenarioCheckpointKind",
     "ScenarioCheckpointResult",
     "ScenarioError",
     "ScenarioExecutionResult",
@@ -441,6 +615,7 @@ __all__ = (
     "ScenarioToolCall",
     "ScenarioToolCallObservation",
     "ScenarioTraceRequirement",
+    "StepStatusCheckpoint",
     "ToolchainScenarioExecutionResult",
     "ToolchainScenarioPlan",
 )

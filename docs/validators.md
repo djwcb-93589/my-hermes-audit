@@ -3,8 +3,10 @@
 ## P6.1 scenario evaluator
 
 The `scenario` evaluator consumes only Worker-produced Toolchain and Process
-observations. It emits independent metrics for status, trace/steps, Artifact
-presence, checkpoints, and cleanup. Required scenario metrics are hard gates;
+observations. It emits independent Process metrics for command identity,
+process identity, input identity, action, character cursor integrity, marker
+expectations, status transitions, step/scenario timeout, Agent close, Worker
+cleanup, and typed checkpoints. Required scenario metrics are hard gates;
 the aggregate is exposed as `toolchain_gate_passed` or
 `process_gate_passed` and flows into the existing task gate. No fourth
 first-level score is introduced, and missing observations are errors rather
