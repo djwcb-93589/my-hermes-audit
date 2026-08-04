@@ -13,6 +13,12 @@ second ProcessManager. `interrupt` is currently unsupported and is covered by
 the preflight-only negative Suite; Agent `close` and Worker cleanup remain
 separate facts.
 
+The P6.1 closing contracts use an explicit stdin handshake in the short
+Process example, cursor references between incremental reads, at most one
+`process_background` Scenario per Case, and bounded Artifact OutputCheckpoint
+projections. Toolchain checkpoint results contain only hashes, lengths, marker
+IDs, truncation, and pass/fail facts; Artifact text is never sent to Langfuse.
+
 ## P5 Background Review 评测
 
 P5 把 MyHermes 的公开 Memory/Skill Background Review 生命周期接入隔离 Trial Worker。仅声明 `fixture.background_review_plans` 的 Case 才创建 trial-local Driver Registry、Review Agent Loop 与受限 Review ToolPolicy；旧 P0–P4 Case 不初始化任何 Review 组件。P5 记录真实 foreground evidence、Subject `prepare_run()` 证据窗口、before/after live snapshot、独立的 `observed_changes`、重复 claim 事实和安全错误投影，并由六个确定性 Review 维度形成 required Review gate。它评测同步、可收口的单 Review 生命周期，不实现异步队列、并行调度或完整后台闭环；后者留给 P6。

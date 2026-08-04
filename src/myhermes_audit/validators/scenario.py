@@ -14,6 +14,7 @@ from myhermes_audit.contracts import (
     ScenarioPlan,
     ScenarioStatus,
     ToolchainScenarioPlan,
+    ProcessReadIncrementalStep,
 )
 from myhermes_audit.validators.base import ValidationContext
 
@@ -28,6 +29,7 @@ def _error_metric(
     reason: str,
     hard_gate: bool,
     metric_type: str = "scenario_error",
+    error_type: str = "scenario_result_unavailable",
 ) -> MetricResult:
     return MetricResult(
         metric_name=name,
@@ -45,7 +47,7 @@ def _error_metric(
         ],
         evaluator_version=_EVALUATOR_VERSION,
         error=MetricError(
-            error_type="scenario_result_unavailable",
+            error_type=error_type,
             message=reason,
             details={"scenario_kind": scenario_kind.value},
         ),
@@ -170,6 +172,64 @@ def _evaluate_toolchain(
         item.exists
         for item in [*observed.input_artifacts, *observed.output_artifacts]
     )
+    checkpoint_metrics: list[MetricResult] = []
+    checkpoint_error_types = {
+        "artifact_missing": "artifact_missing",
+        "toolchain_artifact_target_error": "toolchain_artifact_target_error",
+        "toolchain_artifact_read_error": "toolchain_artifact_read_error",
+        "toolchain_required_marker_missing": "required_marker_missing",
+        "toolchain_forbidden_marker_present": "forbidden_marker_present",
+        "toolchain_minimum_length_error": "minimum_length_not_met",
+    }
+    for checkpoint in plan.checkpoints:
+        if not checkpoint.required:
+            continue
+        result = checkpoints.get(checkpoint.checkpoint_id)
+        if result is None:
+            checkpoint_metrics.append(_error_metric(
+                name=f"{metric_prefix}.checkpoint.{checkpoint.checkpoint_id}",
+                scenario_kind=E2EScenarioKind.TOOLCHAIN,
+                reason="required Toolchain checkpoint result is missing",
+                hard_gate=plan.required,
+                metric_type="toolchain_artifact_target_error",
+                error_type="toolchain_artifact_target_error",
+            ))
+            continue
+        if result.passed is not True:
+            error_type = (
+                None if result.error is None
+                else checkpoint_error_types.get(
+                    result.error.error_type,
+                    result.error.error_type,
+                )
+            )
+            if error_type is not None:
+                checkpoint_metrics.append(_error_metric(
+                    name=f"{metric_prefix}.checkpoint.{checkpoint.checkpoint_id}",
+                    scenario_kind=E2EScenarioKind.TOOLCHAIN,
+                    reason=result.error.message if result.error is not None else "required Toolchain checkpoint failed",
+                    hard_gate=plan.required,
+                    metric_type=error_type,
+                    error_type=error_type,
+                ))
+            else:
+                checkpoint_metrics.append(_boolean_metric(
+                    name=f"{metric_prefix}.checkpoint.{checkpoint.checkpoint_id}",
+                    scenario_kind=E2EScenarioKind.TOOLCHAIN,
+                    metric_type="toolchain_checkpoint",
+                    passed=False,
+                    reason="required Toolchain checkpoint failed",
+                    hard_gate=plan.required,
+                ))
+        else:
+            checkpoint_metrics.append(_boolean_metric(
+                name=f"{metric_prefix}.checkpoint.{checkpoint.checkpoint_id}",
+                scenario_kind=E2EScenarioKind.TOOLCHAIN,
+                metric_type="toolchain_checkpoint",
+                passed=True,
+                reason="required Toolchain checkpoint passed",
+                hard_gate=plan.required,
+            ))
     return [
         _boolean_metric(
             name=f"{metric_prefix}.status",
@@ -203,6 +263,7 @@ def _evaluate_toolchain(
             reason="required Toolchain checkpoints passed" if checkpoint_passed else "a required Toolchain checkpoint failed",
             hard_gate=plan.required,
         ),
+        *checkpoint_metrics,
     ]
 
 
@@ -247,6 +308,30 @@ def _evaluate_process(
         item is None or item.duration_ms is None
         for item in required_step_results
     )
+    required_read_steps = [
+        item
+        for item in plan.steps
+        if isinstance(item, ProcessReadIncrementalStep) and item.required
+    ]
+    observed_reads = {item.step_id: item for item in observed.incremental_reads}
+    cursor_reference_missing = any(
+        item.cursor_source_step_id is not None
+        and (
+            observed_reads.get(item.step_id) is None
+            or observed_reads[item.step_id].cursor_source_step_id
+            != item.cursor_source_step_id
+            or observed_reads[item.step_id].cursor_reference_matched is not True
+        )
+        for item in required_read_steps
+    )
+    cursor_chain_mismatch = any(
+        item.cursor_source_step_id is not None
+        and (
+            observed_reads.get(item.step_id) is None
+            or observed_reads[item.step_id].cursor_chain_matched is not True
+        )
+        for item in required_read_steps
+    )
     marker_passed = all(
         item is not None and item.status is ScenarioStatus.COMPLETED
         for item in required_step_results
@@ -281,6 +366,8 @@ def _evaluate_process(
         item.cursor_unit == "character"
         and item.cursor_after >= item.cursor_before
         and item.new_output_char_length == item.cursor_after - item.cursor_before
+        and (item.cursor_reference_matched is not False)
+        and (item.cursor_chain_matched is not False)
         for item in observed.incremental_reads
     )
     status_transition_passed = observed.status_transitions_valid is True
@@ -295,6 +382,8 @@ def _evaluate_process(
         ("process_input_identity", "input_identity", input_identity_passed, "fixture input matched the observed public input"),
         ("process_step_action", "step_action", step_action_passed, "required step actions matched public Tool observations"),
         ("process_cursor_integrity", "cursor_integrity", cursor_passed, "Process log cursor used character units without gaps"),
+        ("process_cursor_reference", "cursor_reference_missing", not cursor_reference_missing, "later Process reads referenced the preceding read result"),
+        ("process_cursor_chain", "cursor_chain_mismatch", not cursor_chain_mismatch, "Process read cursor references matched the runtime chain"),
         ("process_marker_expectations", "marker_expectations", marker_passed, "required and forbidden output markers were evaluated"),
         ("process_status_transitions", "status_transitions", status_transition_passed, "Process status did not return to active after terminal"),
         ("process_step_timeout", "step_timeout", step_timeout_passed, "required steps supplied real duration facts within timeout"),
@@ -308,41 +397,60 @@ def _evaluate_process(
         and checkpoints_passed
         and all(item[2] for item in metric_specs)
     )
-    metrics = [
-        (
-            _error_metric(
+
+    def _process_metric(
+        name: str,
+        metric_type: str,
+        passed: bool,
+        reason: str,
+    ) -> MetricResult:
+        if metric_type == "step_timeout" and required_step_timing_missing:
+            return _error_metric(
                 name=f"{metric_prefix}.{name}",
                 scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-                reason=(
-                    "required Process step timing was not present in public "
-                    "Observation facts"
-                ),
+                reason="required Process step timing was not present in public Observation facts",
                 hard_gate=plan.required,
                 metric_type=metric_type,
+                error_type=metric_type,
             )
-            if metric_type == "step_timeout" and required_step_timing_missing
-            else (
-                _error_metric(
-                    name=f"{metric_prefix}.{name}",
-                    scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-                    reason=(
-                        "Process scenario duration was not present in public "
-                        "Observation facts"
-                    ),
-                    hard_gate=plan.required,
-                    metric_type=metric_type,
-                )
-                if metric_type == "scenario_timeout" and observed.duration_ms is None
-                else _boolean_metric(
-                    name=f"{metric_prefix}.{name}",
-                    scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
-                    metric_type=metric_type,
-                    passed=passed,
-                    reason=reason if passed else f"{reason} was not proven",
-                    hard_gate=plan.required,
-                )
+        if metric_type == "scenario_timeout" and observed.duration_ms is None:
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="Process scenario duration was not present in public Observation facts",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type=metric_type,
             )
+        if metric_type == "cursor_reference_missing" and not passed:
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="a required Process read cursor reference was missing or mismatched",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type=metric_type,
+            )
+        if metric_type == "cursor_chain_mismatch" and not passed:
+            return _error_metric(
+                name=f"{metric_prefix}.{name}",
+                scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+                reason="a required Process read cursor chain did not match",
+                hard_gate=plan.required,
+                metric_type=metric_type,
+                error_type=metric_type,
+            )
+        return _boolean_metric(
+            name=f"{metric_prefix}.{name}",
+            scenario_kind=E2EScenarioKind.PROCESS_BACKGROUND,
+            metric_type=metric_type,
+            passed=passed,
+            reason=reason if passed else f"{reason} was not proven",
+            hard_gate=plan.required,
         )
+
+    metrics = [
+        _process_metric(name, metric_type, passed, reason)
         for name, metric_type, passed, reason in metric_specs
     ]
     metrics.insert(0, _boolean_metric(

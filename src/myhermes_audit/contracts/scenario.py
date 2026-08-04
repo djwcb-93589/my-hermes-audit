@@ -107,19 +107,35 @@ class ProcessStatusCheckpoint(ScenarioCheckpointBase):
     expected_process_status: ScenarioProcessStatus
 
 
-class OutputCheckpoint(ScenarioCheckpointBase):
+class _MarkerCheckpoint(ScenarioCheckpointBase):
     kind: Literal[ScenarioCheckpointKind.OUTPUT] = ScenarioCheckpointKind.OUTPUT
-    target_step_id: Identifier
-    artifact_scope: Literal["input", "output"] | None = None
     required_markers: list[NonEmptyText] = Field(default_factory=list)
     forbidden_markers: list[NonEmptyText] = Field(default_factory=list)
-    minimum_new_output_length: NonNegativeInt = 0
 
     @model_validator(mode="after")
-    def validate_markers(self) -> "OutputCheckpoint":
+    def validate_markers(self) -> "_MarkerCheckpoint":
         if set(self.required_markers) & set(self.forbidden_markers):
             raise ValueError("checkpoint required and forbidden markers must be disjoint")
         return self
+
+
+class ProcessOutputCheckpoint(_MarkerCheckpoint):
+    """A checkpoint over one Process read step's incremental output."""
+
+    target_step_id: Identifier
+    minimum_new_output_length: NonNegativeInt = 0
+
+
+class ArtifactOutputCheckpoint(_MarkerCheckpoint):
+    """A checkpoint over one explicitly declared Toolchain Artifact."""
+
+    target_artifact_id: FixtureTargetPath
+    minimum_content_char_length: NonNegativeInt = 0
+
+
+# Keep the public name used by existing Process integrations while making the
+# two output domains explicit in the ScenarioCheckpoint union.
+OutputCheckpoint = ProcessOutputCheckpoint
 
 
 class CleanupCheckpoint(ScenarioCheckpointBase):
@@ -129,13 +145,15 @@ class CleanupCheckpoint(ScenarioCheckpointBase):
     expect_no_live_processes: StrictBool = True
 
 
-ScenarioCheckpoint = Annotated[
+# Both output checkpoint classes intentionally retain ``kind: output``. Strict
+# ``extra=forbid`` makes the union unambiguous without guessing from IDs.
+ScenarioCheckpoint = (
     StepStatusCheckpoint
     | ProcessStatusCheckpoint
-    | OutputCheckpoint
-    | CleanupCheckpoint,
-    Field(discriminator="kind"),
-]
+    | ProcessOutputCheckpoint
+    | ArtifactOutputCheckpoint
+    | CleanupCheckpoint
+)
 
 
 class ScenarioToolCall(ContractModel):
@@ -202,8 +220,15 @@ class ToolchainScenarioPlan(ScenarioPlanBase):
         if len(trace_names) != len(set(trace_names)):
             raise ValueError("scenario trace requirement tool names must be unique")
         for checkpoint in self.checkpoints:
-            if isinstance(checkpoint, OutputCheckpoint) and checkpoint.artifact_scope is None:
-                raise ValueError("Toolchain output checkpoints require artifact_scope")
+            if not isinstance(checkpoint, ArtifactOutputCheckpoint):
+                raise ValueError(
+                    "Toolchain scenarios require ArtifactOutputCheckpoint checkpoints"
+                )
+            if checkpoint.target_artifact_id not in set(self.output_artifacts):
+                raise ValueError(
+                    "Toolchain output checkpoint target_artifact_id must reference "
+                    "a declared output Artifact"
+                )
         return self
 
 
@@ -230,7 +255,8 @@ class ProcessStartStep(ProcessStepBase):
 
 class ProcessReadIncrementalStep(ProcessStepBase):
     action: Literal[ProcessAction.READ_INCREMENTAL] = ProcessAction.READ_INCREMENTAL
-    cursor_before: NonNegativeInt = 0
+    cursor_before: NonNegativeInt | None = None
+    cursor_source_step_id: Identifier | None = None
     minimum_new_output_length: NonNegativeInt = 0
     required_markers: list[NonEmptyText] = Field(default_factory=list)
     forbidden_markers: list[NonEmptyText] = Field(default_factory=list)
@@ -332,24 +358,47 @@ class ProcessScenarioPlan(ScenarioPlanBase):
             if index > start_index and step.process_ref_step_id == self.steps[start_index].step_id:
                 continue
         terminal_seen = False
-        previous_cursor = 0
-        for step in self.steps[start_index + 1 :]:
+        read_step_ids: list[str] = []
+        step_indices = {step.step_id: index for index, step in enumerate(self.steps)}
+        for index, step in enumerate(self.steps[start_index + 1 :], start=start_index + 1):
             if step.action in {ProcessAction.KILL, ProcessAction.INTERRUPT, ProcessAction.CLOSE}:
                 terminal_seen = True
             elif step.action is ProcessAction.SEND_INPUT and terminal_seen:
                 raise ValueError("send_input cannot follow a terminal Process action")
             if isinstance(step, ProcessReadIncrementalStep):
-                if step.cursor_before < previous_cursor:
-                    raise ValueError("read cursor declarations must be monotonic")
-                previous_cursor = step.cursor_before
+                if (step.cursor_before is None) == (step.cursor_source_step_id is None):
+                    raise ValueError(
+                        "Process read must declare exactly one of cursor_before or "
+                        "cursor_source_step_id"
+                    )
+                if step.cursor_source_step_id is not None:
+                    reference_index = step_indices.get(step.cursor_source_step_id)
+                    if reference_index is None or reference_index >= index:
+                        raise ValueError(
+                            "Process cursor_source_step_id must reference a prior read step"
+                        )
+                    referenced = self.steps[reference_index]
+                    if not isinstance(referenced, ProcessReadIncrementalStep):
+                        raise ValueError(
+                            "Process cursor_source_step_id must reference a read_incremental step"
+                        )
+                    if not read_step_ids or read_step_ids[-1] != step.cursor_source_step_id:
+                        raise ValueError(
+                            "Process cursor_source_step_id must reference the previous read step"
+                        )
+                elif step.cursor_before != 0 or read_step_ids:
+                    raise ValueError(
+                        "only the first Process read may declare initial cursor_before=0"
+                    )
+                read_step_ids.append(step.step_id)
         known_steps = set(step_ids)
         has_close_step = any(item.action is ProcessAction.CLOSE for item in self.steps)
         for checkpoint in self.checkpoints:
             target = getattr(checkpoint, "target_step_id", None)
             if target is not None and target not in known_steps:
                 raise ValueError("checkpoint target_step_id must reference a declared step")
-            if isinstance(checkpoint, OutputCheckpoint) and checkpoint.artifact_scope is not None:
-                raise ValueError("Process output checkpoints cannot set artifact_scope")
+            if isinstance(checkpoint, ArtifactOutputCheckpoint):
+                raise ValueError("Process scenarios require ProcessOutputCheckpoint")
             if (
                 isinstance(checkpoint, CleanupCheckpoint)
                 and (checkpoint.expect_worker_cleanup or checkpoint.expect_no_live_processes)
@@ -383,13 +432,41 @@ class ScenarioCheckpointResult(ContractModel):
     kind: ScenarioCheckpointKind
     required: StrictBool
     target_step_id: Identifier | None = None
-    artifact_scope: Literal["input", "output"] | None = None
+    target_artifact_id: FixtureTargetPath | None = None
     passed: StrictBool | None = None
     observed_step_status: ScenarioStatus | None = None
     observed_process_status: ScenarioProcessStatus | None = None
     agent_close_observed: StrictBool | None = None
     worker_cleanup_completed: StrictBool | None = None
+    artifact_exists: StrictBool | None = None
+    content_sha256: Sha256Digest | None = None
+    content_char_length: NonNegativeInt | None = None
+    content_utf8_bytes: NonNegativeInt | None = None
+    required_markers_found: list[Identifier] = Field(default_factory=list)
+    missing_required_markers: list[Identifier] = Field(default_factory=list)
+    forbidden_markers_found: list[Identifier] = Field(default_factory=list)
+    required_marker_count: NonNegativeInt = 0
+    missing_required_marker_count: NonNegativeInt = 0
+    forbidden_marker_count: NonNegativeInt = 0
+    truncated: StrictBool | None = None
     error: ScenarioError | None = None
+
+    @model_validator(mode="after")
+    def validate_target(self) -> "ScenarioCheckpointResult":
+        if self.kind is ScenarioCheckpointKind.OUTPUT:
+            if (self.target_step_id is None) == (self.target_artifact_id is None):
+                raise ValueError(
+                    "output checkpoint result must identify exactly one step or Artifact"
+                )
+        elif self.target_artifact_id is not None:
+            raise ValueError("non-output checkpoint result cannot identify an Artifact")
+        if self.required_marker_count != len(self.required_markers_found):
+            raise ValueError("required_marker_count must match marker facts")
+        if self.missing_required_marker_count != len(self.missing_required_markers):
+            raise ValueError("missing_required_marker_count must match marker facts")
+        if self.forbidden_marker_count != len(self.forbidden_markers_found):
+            raise ValueError("forbidden_marker_count must match marker facts")
+        return self
 
 
 class ScenarioArtifactObservation(ContractModel):
@@ -397,6 +474,9 @@ class ScenarioArtifactObservation(ContractModel):
     exists: StrictBool
     sha256: Sha256Digest | None = None
     size_bytes: NonNegativeInt = 0
+    content_char_length: NonNegativeInt | None = None
+    content_utf8_bytes: NonNegativeInt | None = None
+    truncated: StrictBool = False
 
     @model_validator(mode="after")
     def validate_artifact(self) -> "ScenarioArtifactObservation":
@@ -465,10 +545,14 @@ class ScenarioStepResult(ContractModel):
 
 
 class IncrementalReadObservation(ContractModel):
+    step_id: Identifier
     read_index: NonNegativeInt
     cursor_unit: Literal["character"] = "character"
     cursor_before: NonNegativeInt
     cursor_after: NonNegativeInt
+    cursor_source_step_id: Identifier | None = None
+    cursor_reference_matched: StrictBool | None = None
+    cursor_chain_matched: StrictBool | None = None
     new_output_char_length: NonNegativeInt
     new_output_utf8_bytes: NonNegativeInt
     content_sha256: Sha256Digest | None = None
@@ -581,9 +665,11 @@ ScenarioExecutionResult = Annotated[
 
 __all__ = (
     "CleanupCheckpoint",
+    "ArtifactOutputCheckpoint",
     "E2EScenarioKind",
     "IncrementalReadObservation",
     "OutputCheckpoint",
+    "ProcessOutputCheckpoint",
     "ProcessAction",
     "ProcessAssertStatusStep",
     "ProcessCleanupExpectation",

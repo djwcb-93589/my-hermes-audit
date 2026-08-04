@@ -12,6 +12,12 @@ the aggregate is exposed as `toolchain_gate_passed` or
 first-level score is introduced, and missing observations are errors rather
 than fabricated success.
 
+Toolchain checkpoint diagnostics remain separate: `artifact_missing`,
+`toolchain_artifact_read_error`, `required_marker_missing`,
+`forbidden_marker_present`, and `minimum_length_not_met`. Process diagnostics
+distinguish `cursor_reference_missing` from `cursor_chain_mismatch`; both are
+hard-gate facts when declared by a required scenario.
+
 ## P5 Background Review
 
 `background_review` evaluator 只消费 Worker 已持久化的 `BackgroundReviewExecutionResult`、安全 evidence projection、live snapshot 和 observed state diff；它不导入 MyHermes、不重新运行 Review、模型或工具，也不根据 Assistant 文本猜测状态变化。

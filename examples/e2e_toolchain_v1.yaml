@@ -61,20 +61,11 @@ cases:
             required: true
         checkpoints:
           - kind: output
-            checkpoint_id: text-input-read
-            target_step_id: input-artifact
-            artifact_scope: input
-            required_markers: []
-            forbidden_markers: []
-            minimum_new_output_length: 0
-            required: true
-          - kind: output
             checkpoint_id: text-output-written
-            target_step_id: output-artifact
-            artifact_scope: output
-            required_markers: []
-            forbidden_markers: []
-            minimum_new_output_length: 0
+            target_artifact_id: workspace/exports/toolchain-text-output.txt
+            required_markers: [green]
+            forbidden_markers: [forbidden synthetic marker]
+            minimum_content_char_length: 1
             required: true
     evaluators:
       - evaluator_id: toolchain-text-deterministic
@@ -145,20 +136,11 @@ cases:
             required: true
         checkpoints:
           - kind: output
-            checkpoint_id: json-input-read
-            target_step_id: input-artifact
-            artifact_scope: input
-            required_markers: []
-            forbidden_markers: []
-            minimum_new_output_length: 0
-            required: true
-          - kind: output
             checkpoint_id: json-output-written
-            target_step_id: output-artifact
-            artifact_scope: output
-            required_markers: []
+            target_artifact_id: workspace/exports/toolchain-json-output.json
+            required_markers: [ready]
             forbidden_markers: []
-            minimum_new_output_length: 0
+            minimum_content_char_length: 1
             required: true
     evaluators:
       - evaluator_id: toolchain-json-deterministic

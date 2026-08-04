@@ -588,7 +588,27 @@ class AuditCase(ContractModel):
             raise ValueError("case tags must not repeat")
         scenario_ids = [item.scenario_id for item in self.scenarios]
         if len(scenario_ids) != len(set(scenario_ids)):
-            raise ValueError("scenario_id must be unique within an AuditCase")
+            duplicates = sorted(
+                {
+                    scenario_id
+                    for scenario_id in scenario_ids
+                    if scenario_ids.count(scenario_id) > 1
+                }
+            )
+            raise ValueError(
+                f"case {self.case_id} repeats scenario IDs: {', '.join(duplicates)}"
+            )
+        process_scenario_ids = [
+            item.scenario_id
+            for item in self.scenarios
+            if item.kind.value == "process_background"
+        ]
+        if len(process_scenario_ids) > 1:
+            raise ValueError(
+                f"case {self.case_id} allows at most one process_background "
+                "Scenario; declared Scenario IDs: "
+                + ", ".join(process_scenario_ids)
+            )
         checkpoint_ids = [
             checkpoint.checkpoint_id
             for scenario in self.scenarios

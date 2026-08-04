@@ -47,9 +47,9 @@ from myhermes_audit.contracts.common import (
 )
 
 
-WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v6"
-LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v5"
-WorkerProtocolVersion = Literal["myhermes-audit-worker-v6"]
+WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v7"
+LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v6"
+WorkerProtocolVersion = Literal["myhermes-audit-worker-v7"]
 
 
 class WorkerMode(str, Enum):
@@ -224,6 +224,16 @@ class MyHermesWorkerRequest(ContractModel):
         scenario_ids = [item.scenario_id for item in self.scenarios]
         if len(scenario_ids) != len(set(scenario_ids)):
             raise ValueError("P6 scenario IDs must not repeat")
+        process_scenario_ids = [
+            item.scenario_id
+            for item in self.scenarios
+            if item.kind.value == "process_background"
+        ]
+        if len(process_scenario_ids) > 1:
+            raise ValueError(
+                "worker request allows at most one process_background Scenario: "
+                + ", ".join(process_scenario_ids)
+            )
         scenario_kinds = {item.kind.value for item in self.scenarios}
         if ("toolchain" in scenario_kinds) != (
             self.artifact_paths.toolchain_results is not None

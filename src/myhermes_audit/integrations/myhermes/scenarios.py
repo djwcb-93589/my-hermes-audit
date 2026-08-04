@@ -11,17 +11,19 @@ import json
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
+from dataclasses import dataclass
 
 from myhermes_audit.artifacts import atomic_write_text
 from myhermes_audit.contracts import (
     CleanupCheckpoint,
+    ArtifactOutputCheckpoint,
     E2EScenarioKind,
     IncrementalReadObservation,
-    OutputCheckpoint,
     ProcessAction,
     ProcessCleanupResult,
     ProcessInputObservation,
     ProcessScenarioExecutionResult,
+    ProcessOutputCheckpoint,
     ScenarioArtifactObservation,
     ScenarioCheckpointResult,
     ScenarioError,
@@ -42,7 +44,19 @@ from myhermes_audit.security import redact_text
 
 
 _MAX_PROCESS_LOG_BYTES = 256 * 1024
+_MAX_TOOLCHAIN_ARTIFACT_BYTES = 256 * 1024
 _TRUNCATION_MARKER = "\n...[truncated by my-hermes-audit]...\n"
+
+
+@dataclass(frozen=True)
+class _ArtifactProjection:
+    exists: bool
+    content: str | None
+    content_sha256: str | None
+    content_char_length: int | None
+    content_utf8_bytes: int | None
+    truncated: bool
+    read_error: bool = False
 
 
 def _safe_id(value: object) -> str:
@@ -159,19 +173,70 @@ def _relative_target(workspace: Path, hermes_home: Path, relative_path: str) -> 
     return candidate
 
 
-def _artifact_observation(workspace: Path, hermes_home: Path, relative_path: str) -> ScenarioArtifactObservation:
-    target = _relative_target(workspace, hermes_home, relative_path)
+def _artifact_projection(
+    workspace: Path,
+    hermes_home: Path,
+    relative_path: str,
+) -> _ArtifactProjection:
     try:
+        target = _relative_target(workspace, hermes_home, relative_path)
         if not target.is_file() or target.is_symlink():
-            return ScenarioArtifactObservation(relative_path=relative_path, exists=False)
-        payload = target.read_bytes()
-    except OSError:
-        return ScenarioArtifactObservation(relative_path=relative_path, exists=False)
+            return _ArtifactProjection(False, None, None, None, None, False)
+        with target.open("rb") as stream:
+            payload = stream.read(_MAX_TOOLCHAIN_ARTIFACT_BYTES + 1)
+    except (OSError, ValueError):
+        return _ArtifactProjection(False, None, None, None, None, False, True)
+    truncated = len(payload) > _MAX_TOOLCHAIN_ARTIFACT_BYTES
+    if truncated:
+        payload = payload[:_MAX_TOOLCHAIN_ARTIFACT_BYTES]
+    content_sha256 = hashlib.sha256(payload).hexdigest()
+    content_utf8_bytes = len(payload)
+    try:
+        content = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        if truncated:
+            content = payload.decode("utf-8", errors="ignore")
+            return _ArtifactProjection(
+                True,
+                content,
+                content_sha256,
+                len(content),
+                content_utf8_bytes,
+                True,
+            )
+        return _ArtifactProjection(
+            True,
+            None,
+            content_sha256,
+            None,
+            content_utf8_bytes,
+            truncated,
+            True,
+        )
+    return _ArtifactProjection(
+        True,
+        content,
+        content_sha256,
+        len(content),
+        content_utf8_bytes,
+        truncated,
+    )
+
+
+def _artifact_observation(
+    workspace: Path,
+    hermes_home: Path,
+    relative_path: str,
+) -> ScenarioArtifactObservation:
+    projection = _artifact_projection(workspace, hermes_home, relative_path)
     return ScenarioArtifactObservation(
         relative_path=relative_path,
-        exists=True,
-        sha256=hashlib.sha256(payload).hexdigest(),
-        size_bytes=len(payload),
+        exists=projection.exists,
+        sha256=projection.content_sha256,
+        size_bytes=projection.content_utf8_bytes or 0,
+        content_char_length=projection.content_char_length,
+        content_utf8_bytes=projection.content_utf8_bytes,
+        truncated=projection.truncated,
     )
 
 
@@ -197,7 +262,7 @@ def _status(value: object) -> ScenarioProcessStatus:
 
 
 def _scenario_error(error_type: str, message: str, *, step_id: str | None = None) -> ScenarioError:
-    return ScenarioError(error_type=error_type.replace("_", "-"), message=message, step_id=step_id)
+    return ScenarioError(error_type=error_type, message=message, step_id=step_id)
 
 
 def _event_result(event: Mapping[str, object] | None) -> Mapping[str, object]:
@@ -323,6 +388,23 @@ def _cleanup_result(
     )
 
 
+def _process_contract_failure(plan, *, case_id: str) -> ProcessScenarioExecutionResult:
+    error = _scenario_error(
+        "process_scenario_count_error",
+        f"Case {case_id} contains more than one process_background Scenario",
+    )
+    return ProcessScenarioExecutionResult(
+        scenario_id=plan.scenario_id,
+        status=ScenarioStatus.FAILED,
+        scenario_timeout_seconds=plan.timeout_seconds,
+        process_identity_matched=False,
+        command_matched=False,
+        input_matched=False,
+        status_transitions_valid=False,
+        errors=[error],
+    )
+
+
 def build_scenario_results(
     request: MyHermesWorkerRequest,
     *,
@@ -333,12 +415,18 @@ def build_scenario_results(
     sensitive_values: Sequence[str] = (),
 ) -> tuple[list[ScenarioExecutionResult], list[ScenarioError], list[Path]]:
     events = _tool_events(responses, observations)
+    process_plans = [
+        item for item in request.scenarios
+        if item.kind is E2EScenarioKind.PROCESS_BACKGROUND
+    ]
+    process_contract_error = len(process_plans) > 1
     results: list[ScenarioExecutionResult] = []
     errors: list[ScenarioError] = []
     log_paths: list[Path] = []
     completed = len(turns) == len(request.turns) and all(
         item.runtime_status == "completed" for item in turns
     )
+    process_plan_ordinal = 0
     for plan in request.scenarios:
         if plan.kind is E2EScenarioKind.TOOLCHAIN:
             calls: list[ScenarioToolCallObservation] = []
@@ -356,20 +444,110 @@ def build_scenario_results(
                 ))
             outputs = [_artifact_observation(request.workspace, request.hermes_home, item) for item in plan.output_artifacts]
             inputs = [_artifact_observation(request.workspace, request.hermes_home, item) for item in plan.input_artifacts]
+            declared_artifacts = set(plan.output_artifacts)
             checkpoint_results: list[ScenarioCheckpointResult] = []
+            checkpoint_errors: list[ScenarioError] = []
             for checkpoint in plan.checkpoints:
                 passed = completed
-                if isinstance(checkpoint, OutputCheckpoint):
-                    target = inputs if checkpoint.artifact_scope == "input" else outputs
-                    passed = passed and all(item.exists for item in target)
+                checkpoint_error = None
+                artifact_projection = None
+                required_found: list[str] = []
+                required_missing: list[str] = []
+                forbidden_found: list[str] = []
+                if isinstance(checkpoint, ArtifactOutputCheckpoint):
+                    target_id = checkpoint.target_artifact_id
+                    if target_id not in declared_artifacts:
+                        checkpoint_error = _scenario_error(
+                            "toolchain_artifact_target_error",
+                            "Toolchain checkpoint target Artifact was not declared",
+                        )
+                    else:
+                        artifact_projection = _artifact_projection(
+                            request.workspace,
+                            request.hermes_home,
+                            target_id,
+                        )
+                        if artifact_projection.read_error:
+                            checkpoint_error = _scenario_error(
+                                "toolchain_artifact_read_error",
+                                "declared Toolchain Artifact could not be safely read",
+                            )
+                        elif not artifact_projection.exists:
+                            checkpoint_error = _scenario_error(
+                                "artifact_missing",
+                                "declared Toolchain Artifact is missing",
+                            )
+                        elif artifact_projection.content is not None:
+                            content = artifact_projection.content
+                            required_found = [
+                                _safe_id(marker)
+                                for marker in checkpoint.required_markers
+                                if marker in content
+                            ]
+                            required_missing = [
+                                _safe_id(marker)
+                                for marker in checkpoint.required_markers
+                                if marker not in content
+                            ]
+                            forbidden_found = [
+                                _safe_id(marker)
+                                for marker in checkpoint.forbidden_markers
+                                if marker in content
+                            ]
+                            if required_missing:
+                                checkpoint_error = _scenario_error(
+                                    "toolchain_required_marker_missing",
+                                    "a required Toolchain Artifact marker was not found",
+                                )
+                            elif forbidden_found:
+                                checkpoint_error = _scenario_error(
+                                    "toolchain_forbidden_marker_present",
+                                    "a forbidden Toolchain Artifact marker was found",
+                                )
+                            elif (
+                                artifact_projection.content_char_length is None
+                                or artifact_projection.content_char_length
+                                < checkpoint.minimum_content_char_length
+                            ):
+                                checkpoint_error = _scenario_error(
+                                    "toolchain_minimum_length_error",
+                                    "Toolchain Artifact content length was below the declared minimum",
+                                )
+                            elif artifact_projection.truncated:
+                                checkpoint_error = _scenario_error(
+                                    "toolchain_artifact_read_error",
+                                    "Toolchain Artifact exceeded the bounded read limit",
+                                )
+                    passed = (
+                        passed
+                        and checkpoint_error is None
+                        and artifact_projection is not None
+                        and artifact_projection.exists
+                        and artifact_projection.content is not None
+                        and not artifact_projection.truncated
+                    )
+                if checkpoint_error is not None:
+                    checkpoint_errors.append(checkpoint_error)
                 checkpoint_results.append(ScenarioCheckpointResult(
                     checkpoint_id=checkpoint.checkpoint_id,
                     kind=checkpoint.kind,
                     required=checkpoint.required,
                     target_step_id=getattr(checkpoint, "target_step_id", None),
-                    artifact_scope=getattr(checkpoint, "artifact_scope", None),
+                    target_artifact_id=getattr(checkpoint, "target_artifact_id", None),
                     passed=passed,
                     observed_step_status=(ScenarioStatus.COMPLETED if passed else ScenarioStatus.FAILED),
+                    artifact_exists=(None if artifact_projection is None else artifact_projection.exists),
+                    content_sha256=(None if artifact_projection is None else artifact_projection.content_sha256),
+                    content_char_length=(None if artifact_projection is None else artifact_projection.content_char_length),
+                    content_utf8_bytes=(None if artifact_projection is None else artifact_projection.content_utf8_bytes),
+                    required_markers_found=required_found,
+                    missing_required_markers=required_missing,
+                    forbidden_markers_found=forbidden_found,
+                    required_marker_count=len(required_found),
+                    missing_required_marker_count=len(required_missing),
+                    forbidden_marker_count=len(forbidden_found),
+                    truncated=(None if artifact_projection is None else artifact_projection.truncated),
+                    error=checkpoint_error,
                 ))
             trace_ok = all(
                 any(
@@ -387,6 +565,7 @@ def build_scenario_results(
             status = ScenarioStatus.COMPLETED if (
                 completed and trace_ok and required_ok and forbidden_ok
                 and not observations.truncated and all(item.exists for item in inputs + outputs)
+                and all(item.passed is True for item in checkpoint_results if item.required)
             ) else ScenarioStatus.FAILED
             results.append(ToolchainScenarioExecutionResult(
                 scenario_id=plan.scenario_id,
@@ -397,10 +576,25 @@ def build_scenario_results(
                 tool_calls=calls,
                 final_response_present=bool(turns and turns[-1].final_output),
                 duration_ms=sum(item.duration_ms for item in turns),
-                errors=[] if status is ScenarioStatus.COMPLETED else [_scenario_error("toolchain-gate-failed", "declared Toolchain observation was incomplete")],
+                errors=(
+                    checkpoint_errors
+                    if checkpoint_errors
+                    else ([] if status is ScenarioStatus.COMPLETED else [_scenario_error("toolchain-gate-failed", "declared Toolchain observation was incomplete")])
+                ),
             ))
+            errors.extend(checkpoint_errors)
             continue
 
+        process_plan_ordinal += 1
+        if process_contract_error:
+            result = _process_contract_failure(plan, case_id=request.case_id)
+            results.append(result)
+            errors.extend(result.errors)
+            if process_plan_ordinal <= len(request.artifact_paths.process_output_logs):
+                log_path = request.artifact_paths.process_output_logs[process_plan_ordinal - 1]
+                atomic_write_text(log_path, "")
+                log_paths.append(log_path)
+            continue
         process_events = [item for item in events if item.get("name") in {"terminal", "process"}]
         event_index = 0
         start_process_id: str | None = None
@@ -488,7 +682,31 @@ def build_scenario_results(
                 output = output_value if isinstance(output_value, str) else ""
                 requested = result_payload.get("requested_cursor")
                 next_cursor = result_payload.get("next_cursor")
-                requested_ok = isinstance(requested, int) and requested >= 0 and requested == step.cursor_before and requested == cursor
+                source_read = (
+                    read_by_step.get(step.cursor_source_step_id)
+                    if step.cursor_source_step_id is not None
+                    else None
+                )
+                source_present = (
+                    step.cursor_source_step_id is None or source_read is not None
+                )
+                expected_cursor = (
+                    source_read.cursor_after
+                    if source_read is not None
+                    else step.cursor_before
+                )
+                cursor_reference_matched = (
+                    source_present
+                    and expected_cursor is not None
+                    and isinstance(requested, int)
+                    and requested >= 0
+                    and requested == expected_cursor
+                )
+                cursor_chain_matched = (
+                    cursor_reference_matched
+                    and expected_cursor == cursor
+                )
+                requested_ok = cursor_reference_matched and cursor_chain_matched
                 next_ok = isinstance(next_cursor, int) and next_cursor >= requested if isinstance(requested, int) else False
                 char_length = len(output)
                 delta_ok = next_ok and next_cursor - requested == char_length if isinstance(requested, int) and isinstance(next_cursor, int) else False
@@ -505,9 +723,13 @@ def build_scenario_results(
                 required_found = [marker for marker in step.required_markers if marker in accepted_output]
                 forbidden_found = [marker for marker in step.forbidden_markers if marker in accepted_output]
                 read = IncrementalReadObservation(
+                    step_id=step.step_id,
                     read_index=len(incremental),
                     cursor_before=cursor,
                     cursor_after=next_value,
+                    cursor_source_step_id=step.cursor_source_step_id,
+                    cursor_reference_matched=cursor_reference_matched,
+                    cursor_chain_matched=cursor_chain_matched,
                     new_output_char_length=len(accepted_output),
                     new_output_utf8_bytes=len(accepted_output.encode("utf-8")),
                     content_sha256=_hash_text(accepted_output) if accepted_output else None,
@@ -578,6 +800,12 @@ def build_scenario_results(
             passed = bool(action_matched and (identity_match or step.action is ProcessAction.START) and result_payload.get("ok", True) is not False and semantic_ok and not timed_out)
             if step.action is ProcessAction.START:
                 passed = passed and actual_status is step.expected_initial_status and bool(command_matched)
+            step_error_type = "process-observation-missing" if event is None else "process-step-gate-failed"
+            if step.action is ProcessAction.READ_INCREMENTAL:
+                if not read.cursor_reference_matched:
+                    step_error_type = "process_cursor_reference_error"
+                elif not read.cursor_chain_matched:
+                    step_error_type = "process_cursor_chain_error"
             step_results.append(ScenarioStepResult(
                 step_id=step.step_id,
                 action=step.action,
@@ -595,7 +823,7 @@ def build_scenario_results(
                 process_identity_matched=(True if step.action is ProcessAction.START else identity_match),
                 action_matched=action_matched,
                 error=None if passed else _scenario_error(
-                    "process-observation-missing" if event is None else "process-step-gate-failed",
+                    step_error_type,
                     "public Process observation did not satisfy the declared step",
                     step_id=step.step_id,
                 ),
@@ -618,6 +846,7 @@ def build_scenario_results(
         if cleanup_plan and cleanup_plan.expect_no_live_processes and cleanup.live_process_count_after != 0:
             cleanup_ok = False
         checkpoint_results: list[ScenarioCheckpointResult] = []
+        checkpoint_errors: list[ScenarioError] = []
         step_map = {item.step_id: item for item in step_results}
         for checkpoint in plan.checkpoints:
             passed = True
@@ -625,6 +854,11 @@ def build_scenario_results(
             observed_process_status = None
             agent_close = None
             worker_cleanup = None
+            checkpoint_error = None
+            required_markers_found: list[str] = []
+            missing_required_markers: list[str] = []
+            forbidden_markers_found: list[str] = []
+            truncated = None
             if isinstance(checkpoint, StepStatusCheckpoint):
                 step_observation = step_map.get(checkpoint.target_step_id)
                 observed_step_status = None if step_observation is None else step_observation.status
@@ -633,9 +867,28 @@ def build_scenario_results(
                 step_observation = step_map.get(checkpoint.target_step_id)
                 observed_process_status = None if step_observation is None else step_observation.actual_status
                 passed = observed_process_status is checkpoint.expected_process_status
-            elif isinstance(checkpoint, OutputCheckpoint):
+            elif isinstance(checkpoint, ProcessOutputCheckpoint):
                 read = read_by_step.get(checkpoint.target_step_id)
                 passed = read is not None and read.new_output_char_length >= checkpoint.minimum_new_output_length and not read.required_markers_missing and not read.forbidden_markers_found
+                if read is None:
+                    checkpoint_error = _scenario_error(
+                        "process_cursor_reference_error",
+                        "Process output checkpoint target read was not observed",
+                    )
+                elif read.cursor_source_step_id is not None and not read.cursor_reference_matched:
+                    checkpoint_error = _scenario_error(
+                        "process_cursor_reference_error",
+                        "Process output checkpoint cursor reference was not observed",
+                    )
+                elif read.cursor_source_step_id is not None and not read.cursor_chain_matched:
+                    checkpoint_error = _scenario_error(
+                        "process_cursor_chain_error",
+                        "Process output checkpoint cursor chain did not match",
+                    )
+                required_markers_found = list(read.required_markers_found) if read is not None else []
+                missing_required_markers = list(read.required_markers_missing) if read is not None else []
+                forbidden_markers_found = list(read.forbidden_markers_found) if read is not None else []
+                truncated = read.truncated if read is not None else None
             elif isinstance(checkpoint, CleanupCheckpoint):
                 agent_close = agent_close_observed
                 worker_cleanup = cleanup.complete
@@ -649,13 +902,23 @@ def build_scenario_results(
                 kind=checkpoint.kind,
                 required=checkpoint.required,
                 target_step_id=getattr(checkpoint, "target_step_id", None),
-                artifact_scope=getattr(checkpoint, "artifact_scope", None),
+                target_artifact_id=getattr(checkpoint, "target_artifact_id", None),
                 passed=passed,
                 observed_step_status=observed_step_status,
                 observed_process_status=observed_process_status,
                 agent_close_observed=agent_close,
                 worker_cleanup_completed=worker_cleanup,
+                required_markers_found=required_markers_found,
+                missing_required_markers=missing_required_markers,
+                forbidden_markers_found=forbidden_markers_found,
+                required_marker_count=len(required_markers_found),
+                missing_required_marker_count=len(missing_required_markers),
+                forbidden_marker_count=len(forbidden_markers_found),
+                truncated=truncated,
+                error=checkpoint_error,
             ))
+            if checkpoint_error is not None:
+                checkpoint_errors.append(checkpoint_error)
         timed_steps = [
             item for item in step_results
             if item.started_at is not None and item.completed_at is not None
@@ -711,7 +974,11 @@ def build_scenario_results(
             agent_close_observed=agent_close_observed,
             worker_cleanup_result=cleanup,
             duration_ms=scenario_duration_ms,
-            errors=[] if scenario_status is ScenarioStatus.COMPLETED else [_scenario_error("process-gate-failed", "declared Process lifecycle was incomplete")],
+            errors=(
+                checkpoint_errors
+                if checkpoint_errors
+                else ([] if scenario_status is ScenarioStatus.COMPLETED else [_scenario_error("process-gate-failed", "declared Process lifecycle was incomplete")])
+            ),
         )
         results.append(result)
         if request.artifact_paths.process_output_logs:
