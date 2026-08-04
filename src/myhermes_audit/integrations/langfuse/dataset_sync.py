@@ -284,6 +284,10 @@ def _case_expectations(
             }
             for item in expected.tool_trajectories
         ],
+        "scenarios": [
+            _without_schema(item)
+            for item in case.scenarios
+        ],
         **(
             {}
             if not expected.memories

@@ -22,6 +22,7 @@ from myhermes_audit.contracts import (
     MetricResult,
     MetricSource,
     MetricStatus,
+    ScenarioExecutionResult,
     TurnResult,
 )
 from myhermes_audit.contracts.common import validate_relative_path
@@ -60,6 +61,7 @@ class ValidationContext:
     variant_id: str | None = None
     background_review_results: tuple[BackgroundReviewExecutionResult, ...] = ()
     background_review_errors: tuple[BackgroundReviewExecutionError, ...] = ()
+    scenario_results: tuple[ScenarioExecutionResult, ...] = ()
 
 
 def resolve_validation_path(context: ValidationContext, declared: str) -> Path:

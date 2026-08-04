@@ -1,5 +1,20 @@
 # Subject Capability Probe
 
+## P6.1 Process projection
+
+The optional public checks include `process_toolset`, `process_start`,
+`process_read_incremental`, `process_send_input`, `process_wait`,
+`process_interrupt`, `process_kill`, `process_status`,
+`process_session_cleanup`, and the derived `background_process_supported`.
+Checks inspect declarations, public `ProcessManager` method signatures, and
+the public process handler only. They never instantiate a manager, create a
+Session, start a command, read a user's process, or call a model/network.
+
+In the current Subject, the `process` declaration is a companion of the
+`terminal` Toolset. `interrupt` is reported unavailable when the public
+manager does not expose it; a scenario that explicitly requires it fails
+before Sandbox creation with Case ID, scenario ID and safe capability names.
+
 ## P5 Background Review capability projection
 
 Capability protocol `4.0` adds optional P5 public-surface checks without turning a Probe into a Review run. It binds only public module exports and safe call signatures for:

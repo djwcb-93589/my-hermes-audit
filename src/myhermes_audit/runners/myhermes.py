@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 import unicodedata
+import re
 from pathlib import Path
 from typing import Sequence
 
@@ -104,6 +105,9 @@ from myhermes_audit.integrations.myhermes.contracts import (
     BackgroundReviewSnapshotsArtifact,
     MemoryArtifact,
     MemoryQueryPlan,
+    ProcessCleanupArtifact,
+    ProcessScenarioArtifact,
+    ToolchainScenarioArtifact,
     MyHermesWorkerRequest,
     MyHermesWorkerResult,
     ObservationBundle,
@@ -309,6 +313,8 @@ class MyHermesTrialRunner:
             )
         if ToolsetName.SKILL_READ in case.execution.enabled_toolsets:
             self._preflight_skill_read_case(case)
+        if case.scenarios:
+            self._preflight_scenarios(case)
         if case.mode is CaseMode.SCRIPTED_MULTI_TURN and any(
             turn.role is not ConversationRole.USER for turn in case.input.turns
         ):
@@ -338,6 +344,7 @@ class MyHermesTrialRunner:
                 EvaluatorKind.RETRIEVAL,
                 EvaluatorKind.COMPRESSION,
                 EvaluatorKind.BACKGROUND_REVIEW,
+                EvaluatorKind.SCENARIO,
             }
         ]
         if unsupported_evaluators:
@@ -376,6 +383,68 @@ class MyHermesTrialRunner:
                 case_id=case.case_id,
             )
         preflight_evaluators(case)
+
+    def _preflight_scenarios(self, case: AuditCase) -> None:
+        report = self._capability_report
+        if report is None:
+            raise SubjectCapabilityError(
+                f"case={case.case_id}: Subject capability report is unavailable",
+                case_id=case.case_id,
+            )
+        for scenario in case.scenarios:
+            missing_toolsets = sorted(
+                set(scenario.required_toolsets)
+                - {item.value for item in case.execution.enabled_toolsets}
+            )
+            if missing_toolsets:
+                raise SubjectCapabilityError(
+                    (
+                        f"case={case.case_id}, scenario={scenario.scenario_id}: "
+                        "scenario required Toolset is not enabled by foreground: "
+                        + ", ".join(missing_toolsets)
+                    ),
+                    case_id=case.case_id,
+                    scenario_id=scenario.scenario_id,
+                    missing_toolsets=missing_toolsets,
+                    supported_toolsets=_supported_foreground_toolsets(report),
+                )
+            required: list[str] = []
+            required.extend(
+                name
+                for toolset in scenario.required_toolsets
+                for name in _SCENARIO_TOOLSET_CAPABILITIES.get(toolset, ())
+            )
+            if scenario.kind.value == "process_background":
+                required.extend(_PROCESS_SCENARIO_CAPABILITIES)
+                actions = {step.action.value for step in scenario.steps}
+                if "interrupt" not in actions:
+                    required.remove("process_interrupt")
+                if "send_input" not in actions:
+                    required.remove("process_send_input")
+            missing = [
+                name
+                for name in dict.fromkeys(required)
+                if not _capability_available(report, name)
+            ]
+            if not missing:
+                continue
+            supported = ",".join(
+                item.name
+                for item in report.capabilities
+                if item.available and item.name.startswith("process_")
+            ) or "<none>"
+            raise SubjectCapabilityError(
+                (
+                    f"case={case.case_id}, scenario={scenario.scenario_id}: "
+                    f"missing public capability={missing[0]}; supported process "
+                    f"capabilities={supported}"
+                ),
+                case_id=case.case_id,
+                scenario_id=scenario.scenario_id,
+                missing_capability=missing[0],
+                missing_capabilities=missing,
+                supported_toolsets=_supported_foreground_toolsets(report),
+            )
 
     def _preflight_skill_read_case(self, case: AuditCase) -> None:
         report = self._capability_report
@@ -791,11 +860,17 @@ class MyHermesTrialRunner:
             else configuration.memory_strategy
         )
         review_enabled = _is_background_review_case(case)
+        scenario_timeout = (
+            min(timeout_seconds, max(item.timeout_seconds for item in case.scenarios))
+            if case.scenarios
+            else timeout_seconds
+        )
         paths = _worker_artifact_paths(
             sandbox,
             memory_enabled=memory_case,
             ablation_enabled=configuration is not None,
             background_review_enabled=review_enabled,
+            scenarios=case.scenarios,
         )
         started = time.perf_counter()
         captured_stdout = ""
@@ -862,7 +937,8 @@ class MyHermesTrialRunner:
                     case.fixture.background_review_plans
                 ),
                 skill_fixtures=list(case.fixture.skills),
-                timeout_seconds=timeout_seconds,
+                scenarios=list(case.scenarios),
+                timeout_seconds=scenario_timeout,
                 artifact_paths=paths,
             )
             atomic_write_json(paths.worker_request, request)
@@ -1062,6 +1138,30 @@ class MyHermesTrialRunner:
                     BackgroundReviewSnapshotsArtifact,
                 )
             )
+            toolchain_artifact = (
+                None
+                if paths.toolchain_results is None
+                else _read_protocol_model(
+                    paths.toolchain_results,
+                    ToolchainScenarioArtifact,
+                )
+            )
+            process_artifact = (
+                None
+                if paths.process_scenario_results is None
+                else _read_protocol_model(
+                    paths.process_scenario_results,
+                    ProcessScenarioArtifact,
+                )
+            )
+            process_cleanup_artifact = (
+                None
+                if paths.process_cleanup is None
+                else _read_protocol_model(
+                    paths.process_cleanup,
+                    ProcessCleanupArtifact,
+                )
+            )
             _validate_worker_artifacts(
                 request,
                 result,
@@ -1072,6 +1172,9 @@ class MyHermesTrialRunner:
                 review_artifact,
                 review_evidence_artifact,
                 review_snapshots_artifact,
+                toolchain_artifact,
+                process_artifact,
+                process_cleanup_artifact,
                 returncode=process.returncode,
             )
             result, transcript = _redact_worker_content(
@@ -1459,6 +1562,8 @@ class MyHermesTrialRunner:
             ),
             background_review_results=tuple(result.background_review_results),
             background_review_errors=tuple(result.background_review_errors),
+            scenario_results=tuple(result.scenario_results),
+            process_errors=tuple(result.process_errors),
             review_gate_passed=result.review_gate_passed,
             tool_calls=tool_calls,
             tool_trace_complete=(
@@ -1466,13 +1571,7 @@ class MyHermesTrialRunner:
                 and observations is not None
                 and not observations.truncated
             ),
-            artifact_paths={
-                field_name: value
-                for field_name in type(paths).model_fields
-                if field_name != "schema_version"
-                and (value := getattr(paths, field_name)) is not None
-                and value.exists()
-            },
+            artifact_paths=_existing_artifact_paths(paths),
             error_type=result.error_type,
             error_message=(None if result.error is None else result.error.message),
             retryable=(False if result.error is None else result.retryable),
@@ -1484,6 +1583,23 @@ class MyHermesTrialRunner:
                 for item in result.warnings
             ),
         )
+
+
+def _existing_artifact_paths(paths: WorkerArtifactPaths) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    for field_name in type(paths).model_fields:
+        if field_name == "schema_version":
+            continue
+        value = getattr(paths, field_name)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            for index, path in enumerate(value):
+                if path.exists():
+                    result[f"{field_name}_{index}"] = path
+        elif value.exists():
+            result[field_name] = value
+    return result
 
 
 def _local_observations(
@@ -1970,6 +2086,26 @@ _SKILL_READ_CAPABILITIES = (
     "skill_read_tool_registration",
 )
 
+_PROCESS_SCENARIO_CAPABILITIES = (
+    "process_toolset",
+    "process_start",
+    "process_read_incremental",
+    "process_send_input",
+    "process_wait",
+    "process_interrupt",
+    "process_kill",
+    "process_status",
+    "process_session_cleanup",
+    "background_process_supported",
+)
+
+_SCENARIO_TOOLSET_CAPABILITIES = {
+    "file": ("file_tool_declaration",),
+    "terminal": ("terminal_tool_declaration",),
+    "memory": ("memory_tool",),
+    "skill_read": _SKILL_READ_CAPABILITIES,
+}
+
 _FOREGROUND_TOOLSET_CAPABILITIES = (
     (ToolsetName.FILE.value, ("file_tool_declaration",)),
     (ToolsetName.TERMINAL.value, ("terminal_tool_declaration",)),
@@ -2014,6 +2150,7 @@ def _worker_artifact_paths(
     memory_enabled: bool,
     ablation_enabled: bool,
     background_review_enabled: bool,
+    scenarios=(),
 ) -> WorkerArtifactPaths:
     root = sandbox.artifacts_dir.resolve(strict=True)
     return WorkerArtifactPaths(
@@ -2041,7 +2178,35 @@ def _worker_artifact_paths(
             if background_review_enabled
             else None
         ),
+        toolchain_results=(
+            root / "toolchain-results.json"
+            if any(item.kind.value == "toolchain" for item in scenarios)
+            else None
+        ),
+        process_scenario_results=(
+            root / "process-scenario-results.json"
+            if any(item.kind.value == "process_background" for item in scenarios)
+            else None
+        ),
+        process_cleanup=(
+            root / "process-cleanup.json"
+            if any(item.kind.value == "process_background" for item in scenarios)
+            else None
+        ),
+        process_output_logs=[
+            root / f"process-output-{_scenario_log_component(item.scenario_id)}.log"
+            for item in scenarios
+            if item.kind.value == "process_background"
+        ],
     )
+
+
+def _scenario_log_component(scenario_id: str) -> str:
+    """Keep the conventional name while making unusual IDs path-safe."""
+
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", scenario_id):
+        return scenario_id
+    return hashlib.sha256(scenario_id.encode("utf-8")).hexdigest()[:16]
 
 
 def _start_capture(stream):
@@ -2139,6 +2304,9 @@ def _validate_worker_artifacts(
     review_artifact: BackgroundReviewArtifact | None,
     review_evidence_artifact: BackgroundReviewEvidenceArtifact | None,
     review_snapshots_artifact: BackgroundReviewSnapshotsArtifact | None,
+    toolchain_artifact: ToolchainScenarioArtifact | None,
+    process_artifact: ProcessScenarioArtifact | None,
+    process_cleanup_artifact: ProcessCleanupArtifact | None,
     *,
     returncode: int,
 ) -> None:
@@ -2172,9 +2340,93 @@ def _validate_worker_artifacts(
             if review_snapshots_artifact is None
             else [review_snapshots_artifact.protocol_version]
         ),
+        *( [] if toolchain_artifact is None else [toolchain_artifact.protocol_version] ),
+        *( [] if process_artifact is None else [process_artifact.protocol_version] ),
+        *( [] if process_cleanup_artifact is None else [process_cleanup_artifact.protocol_version] ),
     }
     if len(protocol_versions) != 1:
         raise WorkerProtocolError("worker artifact protocol versions do not match")
+    scenario_results = [
+        item
+        for artifact in (toolchain_artifact, process_artifact)
+        if artifact is not None
+        for item in artifact.results
+    ]
+    expected_scenario_ids = {item.scenario_id for item in request.scenarios}
+    observed_scenario_ids = {item.scenario_id for item in result.scenario_results}
+    if observed_scenario_ids - expected_scenario_ids:
+        raise WorkerProtocolError("worker returned an undeclared scenario")
+    if sorted(item.scenario_id for item in scenario_results) != sorted(
+        item.scenario_id for item in result.scenario_results
+    ):
+        raise WorkerProtocolError("worker scenario Artifact facts do not match result")
+    if toolchain_artifact is not None and (
+        toolchain_artifact.trial_id != request.trial_id
+        or toolchain_artifact.case_id != request.case_id
+    ):
+        raise WorkerProtocolError("Toolchain Artifact identity does not match request")
+    if process_artifact is not None and (
+        process_artifact.trial_id != request.trial_id
+        or process_artifact.case_id != request.case_id
+    ):
+        raise WorkerProtocolError("Process Artifact identity does not match request")
+    if process_cleanup_artifact is not None and (
+        process_cleanup_artifact.trial_id != request.trial_id
+        or process_cleanup_artifact.case_id != request.case_id
+    ):
+        raise WorkerProtocolError("Process cleanup Artifact identity does not match request")
+    has_process_results = any(
+        item.kind.value == "process_background"
+        for item in result.scenario_results
+    )
+    if process_cleanup_artifact is not None and not has_process_results:
+        raise WorkerProtocolError("empty worker result cannot return Process cleanup")
+    if result.toolchain_results_artifact is not None and toolchain_artifact is None:
+        raise WorkerProtocolError("worker result names a missing Toolchain Artifact")
+    if result.process_scenario_results_artifact is not None and process_artifact is None:
+        raise WorkerProtocolError("worker result names a missing Process Artifact")
+    expected_toolchain_ref = (
+        None
+        if request.artifact_paths.toolchain_results is None
+        else f"artifacts/{request.artifact_paths.toolchain_results.name}"
+    )
+    expected_process_ref = (
+        None
+        if request.artifact_paths.process_scenario_results is None
+        else f"artifacts/{request.artifact_paths.process_scenario_results.name}"
+    )
+    expected_cleanup_ref = (
+        None
+        if request.artifact_paths.process_cleanup is None
+        else f"artifacts/{request.artifact_paths.process_cleanup.name}"
+    )
+    if result.toolchain_results_artifact != (
+        expected_toolchain_ref if toolchain_artifact is not None else None
+    ):
+        raise WorkerProtocolError("worker Toolchain Artifact reference is unexpected")
+    if result.process_scenario_results_artifact != (
+        expected_process_ref if process_artifact is not None else None
+    ):
+        raise WorkerProtocolError("worker Process Artifact reference is unexpected")
+    if result.process_cleanup_artifact != (
+        expected_cleanup_ref if has_process_results else None
+    ):
+        raise WorkerProtocolError("worker cleanup Artifact reference is unexpected")
+    expected_process_count = sum(
+        item.kind.value == "process_background" for item in result.scenario_results
+    )
+    if len(result.process_output_artifacts) != expected_process_count:
+        raise WorkerProtocolError("worker Process output Artifact count does not match scenarios")
+    expected_output_refs = [
+        f"artifacts/{path.name}"
+        for path in request.artifact_paths.process_output_logs[:expected_process_count]
+    ]
+    if result.process_output_artifacts != expected_output_refs:
+        raise WorkerProtocolError("worker Process output Artifact references are unexpected")
+    if result.worker_status is WorkerStatus.COMPLETED:
+        for path in request.artifact_paths.process_output_logs[:expected_process_count]:
+            if path.is_symlink() or not path.is_file():
+                raise WorkerProtocolError("worker Process output Artifact is missing")
     if transcript.trial_id != request.trial_id or transcript.case_id != request.case_id:
         raise WorkerProtocolError("worker transcript identity does not match request")
     if transcript.turns != result.turns:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import MutableSequence
 
 from myhermes_audit.integrations.myhermes.contracts import WorkerWarning
 
@@ -15,6 +16,7 @@ def close_runtime_resources(
     process_manager,
     model_client,
     shutdown_background_review: bool = True,
+    cleanup_reports: MutableSequence[dict] | None = None,
 ) -> list[WorkerWarning]:
     # All imports are intentionally lazy; see worker.py's import boundary.
     from hermes.delegate_jobs import shutdown_delegate_jobs
@@ -60,6 +62,8 @@ def close_runtime_resources(
                 current_session_id,
                 process_manager=process_manager,
             )
+            if cleanup_reports is not None:
+                cleanup_reports.append(_safe_cleanup_report(report))
             if not report.complete:
                 warnings.append(_warning("session_cleanup_incomplete"))
         except Exception:
@@ -71,6 +75,8 @@ def close_runtime_resources(
                 background_complete and delegate_complete
             ),
         )
+        if cleanup_reports is not None:
+            cleanup_reports.append(_safe_cleanup_report(report))
         if not report.complete:
             warnings.append(_warning("global_cleanup_incomplete"))
     except Exception:
@@ -90,6 +96,27 @@ def _warning(warning_type: str) -> WorkerWarning:
         warning_type=warning_type,
         message=f"MyHermes lifecycle warning: {warning_type}",
     )
+
+
+def _safe_cleanup_report(report: object) -> dict:
+    process_cleanup = getattr(report, "process_cleanup", None)
+    unresolved = getattr(process_cleanup, "unresolved_process_ids", ()) or ()
+    attempted = getattr(process_cleanup, "attempted_process_ids", ()) or ()
+    completed = getattr(process_cleanup, "completed_process_ids", ()) or ()
+    import hashlib
+
+    def safe_ids(values) -> list[str]:
+        return [
+            hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+            for value in values
+        ]
+
+    return {
+        "complete": bool(getattr(report, "complete", False)),
+        "attempted_count": len(tuple(attempted)),
+        "completed_count": len(tuple(completed)),
+        "unresolved_ids": safe_ids(unresolved),
+    }
 
 
 def _deduplicate_warnings(items: list[WorkerWarning]) -> list[WorkerWarning]:

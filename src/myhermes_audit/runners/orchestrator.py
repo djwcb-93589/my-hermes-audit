@@ -54,6 +54,7 @@ from myhermes_audit.runners.base import (
 )
 from myhermes_audit.sandbox import AuditSandbox
 from myhermes_audit.validators import ValidationContext, evaluate_case
+from myhermes_audit.serialization import canonical_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +227,11 @@ class AuditOrchestrator:
         basis_fingerprint: str | None,
     ) -> tuple[TrialResult, Path | None]:
         trial_id = (
-            f"trial-{uuid.uuid4().hex}"
+            (
+                f"trial-{canonical_sha256(case.scenarios)[:16]}-{uuid.uuid4().hex}"
+                if case.scenarios
+                else f"trial-{uuid.uuid4().hex}"
+            )
             if trial_identity is None
             else stable_trial_id(trial_identity)
         )
@@ -295,6 +300,7 @@ class AuditOrchestrator:
                 variant_id=(None if variant is None else variant.variant_id),
                 background_review_results=outcome.background_review_results,
                 background_review_errors=outcome.background_review_errors,
+                scenario_results=outcome.scenario_results,
             )
             validator_result = evaluate_case(
                 case,
@@ -350,6 +356,9 @@ class AuditOrchestrator:
                             ()
                             if outcome is None
                             else outcome.background_review_errors
+                        ),
+                        scenario_results=(
+                            () if outcome is None else outcome.scenario_results
                         ),
                     )
                     validator_result = evaluate_case(
@@ -410,6 +419,12 @@ class AuditOrchestrator:
             and outcome.status is RunnerStatus.COMPLETED
             and validator_result is not None
             and validator_result.task_hard_gates_passed
+        )
+        toolchain_gate_passed = (
+            None if validator_result is None else validator_result.toolchain_hard_gates_passed
+        )
+        process_gate_passed = (
+            None if validator_result is None else validator_result.process_hard_gates_passed
         )
         review_gate_passed = (
             None
@@ -515,6 +530,11 @@ class AuditOrchestrator:
                     else trial_identity.configuration_sha256
                 ),
                 comparison_basis_fingerprint=basis_fingerprint,
+                scenario_fingerprint=(
+                    None
+                    if not case.scenarios
+                    else canonical_sha256(case.scenarios)
+                ),
                 effective_subject_configuration=configuration,
                 status=status,
                 task_passed=task_passed,
@@ -606,6 +626,14 @@ class AuditOrchestrator:
                     else list(outcome.background_review_errors)
                 ),
                 review_gate_passed=review_gate_passed,
+                scenario_results=(
+                    [] if outcome is None else list(outcome.scenario_results)
+                ),
+                process_errors=(
+                    [] if outcome is None else list(outcome.process_errors)
+                ),
+                toolchain_gate_passed=toolchain_gate_passed,
+                process_gate_passed=process_gate_passed,
                 metrics=metrics,
                 judge_result=(
                     None if judge_evaluation is None else judge_evaluation.result

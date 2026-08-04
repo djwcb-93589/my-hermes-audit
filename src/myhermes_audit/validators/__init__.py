@@ -16,6 +16,7 @@ from myhermes_audit.validators.engine import (
 from myhermes_audit.validators.json_file import JsonFileValidator
 from myhermes_audit.validators.text import TextValidator
 from myhermes_audit.validators.tool_trajectory import ToolTrajectoryValidator
+from myhermes_audit.validators.scenario import evaluate_scenario_plan
 
 __all__ = (
     "FileValidator",
@@ -29,6 +30,7 @@ __all__ = (
     "evaluate_case",
     "evaluate_ablation",
     "evaluate_background_review_expectation",
+    "evaluate_scenario_plan",
     "preflight_evaluators",
     "resolve_judge_expectation",
 )

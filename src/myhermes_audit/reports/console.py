@@ -43,6 +43,9 @@ def render_console_summary(result: AuditRunResult) -> str:
     ablation_lines = _ablation_summary(result)
     if ablation_lines:
         lines.extend(ablation_lines)
+    scenario_lines = _scenario_summary(result)
+    if scenario_lines:
+        lines.extend(scenario_lines)
     if result.integration_errors:
         lines.append(f"Langfuse errors:   {len(result.integration_errors)}")
     publication = result.langfuse_publish_result
@@ -109,6 +112,39 @@ def _failure(trial) -> str:
     if failed_metrics:
         return ", ".join(metric.metric_name for metric in failed_metrics)
     return "required evaluator did not pass"
+
+
+def _scenario_summary(result: AuditRunResult) -> list[str]:
+    scenarios = [item for trial in result.trials for item in trial.scenario_results]
+    if not scenarios:
+        return []
+    process = [item for item in scenarios if item.kind.value == "process_background"]
+    output_bytes = sum(
+        read.new_output_length
+        for item in process
+        for read in item.incremental_reads
+    )
+    return [
+        f"Toolchain scenarios: {sum(item.kind.value == 'toolchain' for item in scenarios)}",
+        f"Process scenarios:   {len(process)}",
+        "Process gate:         "
+        + _gate_or_missing(next((trial.process_gate_passed for trial in result.trials if trial.process_gate_passed is not None), None)),
+        "Final process status:  "
+        + (process[-1].final_status.value if process and process[-1].final_status is not None else "not evaluated"),
+        f"Incremental output bytes: {output_bytes}",
+        "Process cleanup:      "
+        + _gate_or_missing(
+            all(item.cleanup_result.complete for item in process if item.cleanup_result is not None)
+            if process and all(item.cleanup_result is not None for item in process)
+            else None
+        ),
+    ]
+
+
+def _gate_or_missing(value: bool | None) -> str:
+    if value is None:
+        return "not evaluated"
+    return "passed" if value else "failed"
 
 
 def _percent_or_missing(value: float | None) -> str:

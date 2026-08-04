@@ -1,0 +1,250 @@
+schema_version: "1.0"
+suite_id: e2e-process-background-v1
+name: P6.1 synthetic Process and Background scenarios
+description: >-
+  Three bounded cross-platform Python background-process scenarios driven only
+  through the Subject terminal and process public tools.
+tags: [e2e, process, background, p6.1, synthetic]
+defaults:
+  trials: 1
+  timeout_seconds: 180
+  preserve_sandbox: false
+  metadata:
+    data_classification: synthetic
+cases:
+  - case_id: process-short-background
+    name: Read a short background task incrementally to completion
+    description: Start, read new output, wait for completion, and clean up.
+    mode: single_turn
+    input:
+      message: >-
+        Use the public terminal tool to start this bounded background Python
+        command: python -c "import time; print('P6-BEGIN', flush=True); time.sleep(0.2); print('P6-END', flush=True)".
+        Use the returned process identity with the public process tool. Read
+        output incrementally (without repeating old bytes), wait for completed,
+        and report the observed markers only after cleanup.
+    execution:
+      enabled_toolsets: [terminal]
+    fixture:
+      files: []
+    expected:
+      texts:
+        - target: final_output
+          contains: P6-END
+          case_sensitive: true
+    scenarios:
+      - scenario_id: process-short
+        kind: process_background
+        timeout_seconds: 120
+        required: true
+        required_toolsets: [terminal]
+        checkpoints:
+          - checkpoint_id: started
+            required: true
+          - checkpoint_id: incrementally-read
+            required: true
+          - checkpoint_id: completed
+            required: true
+          - checkpoint_id: cleaned
+            required: true
+        steps:
+          - step_id: start
+            action: start
+            timeout_seconds: 30
+            required: true
+            command: python -c "import time; print('P6-BEGIN', flush=True); time.sleep(0.2); print('P6-END', flush=True)"
+            expected_initial_status: running
+          - step_id: read-first
+            action: read_incremental
+            timeout_seconds: 30
+            required: true
+            minimum_new_output_length: 1
+            required_markers: [P6-BEGIN]
+            forbidden_markers: []
+          - step_id: wait-completed
+            action: wait
+            timeout_seconds: 30
+            required: true
+            expected_status: completed
+            maximum_wait_seconds: 60
+          - step_id: read-final
+            action: read_incremental
+            timeout_seconds: 30
+            required: true
+            minimum_new_output_length: 1
+            required_markers: [P6-END]
+            forbidden_markers: []
+          - step_id: assert-completed
+            action: assert_status
+            timeout_seconds: 30
+            required: true
+            expected_status: completed
+          - step_id: cleanup
+            action: cleanup_session
+            timeout_seconds: 30
+            required: true
+            expect_no_live_processes: true
+    evaluators:
+      - evaluator_id: process-short-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: process-short-scenario
+        kind: scenario
+        required: true
+
+  - case_id: process-input-background
+    name: Send input to a waiting background task
+    description: Start a stdin task, submit one synthetic line, then observe completion.
+    mode: single_turn
+    input:
+      message: >-
+        Start a bounded background Python task with the public terminal tool
+        that waits for one line on stdin and prints P6-INPUT-OK. Use the public
+        process tool to observe waiting_for_input, submit the synthetic line
+        from fixtures/process-input.txt, wait for completed, and clean
+        up. Never include the input body in the report.
+    execution:
+      enabled_toolsets: [terminal]
+    fixture:
+      files:
+        - path: workspace/fixtures/process-input.txt
+          content: synthetic-input
+    expected:
+      texts:
+        - target: final_output
+          contains: P6-INPUT-OK
+          case_sensitive: true
+    scenarios:
+      - scenario_id: process-input
+        kind: process_background
+        timeout_seconds: 120
+        required: true
+        required_toolsets: [terminal]
+        checkpoints:
+          - checkpoint_id: waiting
+            required: true
+          - checkpoint_id: input-submitted
+            required: true
+          - checkpoint_id: input-completed
+            required: true
+          - checkpoint_id: cleaned
+            required: true
+        steps:
+          - step_id: start
+            action: start
+            timeout_seconds: 30
+            required: true
+            command: python -c "import sys; print('P6-WAIT', flush=True); line=sys.stdin.readline(); print('P6-INPUT-OK', flush=True)"
+            expected_initial_status: running
+          - step_id: read-wait
+            action: read_incremental
+            timeout_seconds: 30
+            required: true
+            minimum_new_output_length: 1
+            required_markers: [P6-WAIT]
+            forbidden_markers: []
+          - step_id: send
+            action: send_input
+            timeout_seconds: 30
+            required: true
+            input_source: fixtures/process-input.txt
+            submit: true
+          - step_id: wait
+            action: wait
+            timeout_seconds: 30
+            required: true
+            expected_status: completed
+            maximum_wait_seconds: 60
+          - step_id: read-result
+            action: read_incremental
+            timeout_seconds: 30
+            required: true
+            minimum_new_output_length: 1
+            required_markers: [P6-INPUT-OK]
+            forbidden_markers: []
+          - step_id: cleanup
+            action: cleanup_session
+            timeout_seconds: 30
+            required: true
+            expect_no_live_processes: true
+    evaluators:
+      - evaluator_id: process-input-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: process-input-scenario
+        kind: scenario
+        required: true
+
+  - case_id: process-kill-cleanup
+    name: Kill a bounded long task and clean up the session
+    description: Exercise explicit kill and verify the final terminal state is retained.
+    mode: single_turn
+    input:
+      message: >-
+        Start a bounded background Python task with the public terminal tool
+        that prints P6-LONG and sleeps for ten seconds. Use the public process
+        tool to read its initial output, issue kill with a bounded grace period,
+        observe killed or another truthful terminal status, and run session
+        cleanup. Do not use an OS kill command and do not claim completion from
+        assistant text.
+    execution:
+      enabled_toolsets: [terminal]
+    fixture:
+      files: []
+    expected:
+      texts:
+        - target: final_output
+          contains: P6-LONG
+          case_sensitive: true
+    scenarios:
+      - scenario_id: process-kill
+        kind: process_background
+        timeout_seconds: 120
+        required: true
+        required_toolsets: [terminal]
+        checkpoints:
+          - checkpoint_id: started
+            required: true
+          - checkpoint_id: killed
+            required: true
+          - checkpoint_id: cleaned
+            required: true
+        steps:
+          - step_id: start
+            action: start
+            timeout_seconds: 30
+            required: true
+            command: python -c "import time; print('P6-LONG', flush=True); time.sleep(10)"
+            expected_initial_status: running
+          - step_id: read
+            action: read_incremental
+            timeout_seconds: 30
+            required: true
+            minimum_new_output_length: 1
+            required_markers: [P6-LONG]
+            forbidden_markers: []
+          - step_id: kill
+            action: kill
+            timeout_seconds: 30
+            required: true
+            expected_terminal_status: killed
+          - step_id: assert-killed
+            action: assert_status
+            timeout_seconds: 30
+            required: true
+            expected_status: killed
+          - step_id: cleanup
+            action: cleanup_session
+            timeout_seconds: 30
+            required: true
+            expect_no_live_processes: true
+    evaluators:
+      - evaluator_id: process-kill-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: process-kill-scenario
+        kind: scenario
+        required: true

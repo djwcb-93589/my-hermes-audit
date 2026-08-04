@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
+import re
 from typing import Literal
 
 from pydantic import Field, StrictBool, StrictStr, model_validator
@@ -27,6 +28,9 @@ from myhermes_audit.contracts import (
     MemoryStateSnapshot,
     RetrievalStrategy,
     RequiredFactExpectation,
+    ScenarioError,
+    ScenarioExecutionResult,
+    ScenarioPlan,
     ToolsetName,
     TurnResult,
 )
@@ -34,6 +38,7 @@ from myhermes_audit.contracts.suite import SkillFixture
 from myhermes_audit.contracts.common import (
     ContractModel,
     Identifier,
+    JsonObject,
     NonEmptyText,
     NonNegativeInt,
     PositiveInt,
@@ -41,9 +46,9 @@ from myhermes_audit.contracts.common import (
 )
 
 
-WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v4"
-LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v3"
-WorkerProtocolVersion = Literal["myhermes-audit-worker-v4"]
+WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v5"
+LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v4"
+WorkerProtocolVersion = Literal["myhermes-audit-worker-v5"]
 
 
 class WorkerMode(str, Enum):
@@ -80,15 +85,24 @@ class WorkerArtifactPaths(ContractModel):
     background_review_results: Path | None = None
     background_review_evidence: Path | None = None
     background_review_snapshots: Path | None = None
+    toolchain_results: Path | None = None
+    process_scenario_results: Path | None = None
+    process_cleanup: Path | None = None
+    process_output_logs: list[Path] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_artifact_paths(self) -> "WorkerArtifactPaths":
-        paths = [
-            value
-            for name in type(self).model_fields
-            if name != "schema_version"
-            and (value := getattr(self, name)) is not None
-        ]
+        paths: list[Path] = []
+        for name in type(self).model_fields:
+            if name == "schema_version":
+                continue
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                paths.extend(value)
+            else:
+                paths.append(value)
         if any(not path.is_absolute() for path in paths):
             raise ValueError("worker artifact paths must be absolute")
         parents = {path.resolve(strict=False).parent for path in paths}
@@ -122,6 +136,7 @@ class MyHermesWorkerRequest(ContractModel):
         default_factory=list
     )
     skill_fixtures: list[SkillFixture] = Field(default_factory=list)
+    scenarios: list[ScenarioPlan] = Field(default_factory=list)
     timeout_seconds: PositiveInt
     artifact_paths: WorkerArtifactPaths
 
@@ -205,6 +220,34 @@ class MyHermesWorkerRequest(ContractModel):
         plan_ids = [plan.review_id for plan in self.background_review_plans]
         if len(plan_ids) != len(set(plan_ids)):
             raise ValueError("P5 Review plan IDs must not repeat")
+        scenario_ids = [item.scenario_id for item in self.scenarios]
+        if len(scenario_ids) != len(set(scenario_ids)):
+            raise ValueError("P6 scenario IDs must not repeat")
+        scenario_kinds = {item.kind.value for item in self.scenarios}
+        if ("toolchain" in scenario_kinds) != (
+            self.artifact_paths.toolchain_results is not None
+        ):
+            raise ValueError("Toolchain scenarios require their Artifact path")
+        if ("process_background" in scenario_kinds) != (
+            self.artifact_paths.process_scenario_results is not None
+        ):
+            raise ValueError(
+                "Process scenarios require their Scenario Artifact path"
+            )
+        has_process_scenarios = "process_background" in scenario_kinds
+        if has_process_scenarios != (
+            self.artifact_paths.process_cleanup is not None
+        ):
+            raise ValueError("Process scenarios require the cleanup Artifact path")
+        process_count = sum(
+            item.kind.value == "process_background" for item in self.scenarios
+        )
+        if process_count != len(self.artifact_paths.process_output_logs):
+            raise ValueError(
+                "each Process scenario requires one output Artifact path"
+            )
+        if not self.scenarios and self.artifact_paths.toolchain_results is not None:
+            raise ValueError("non-P6 requests cannot name Toolchain Artifacts")
         return self
 
 
@@ -408,7 +451,7 @@ class BackgroundReviewArtifact(ContractModel):
     @model_validator(mode="after")
     def validate_review_artifact(self) -> "BackgroundReviewArtifact":
         if self.protocol_version != WORKER_PROTOCOL_VERSION:
-            raise ValueError("Background Review Artifacts require Worker protocol v4")
+            raise ValueError("Background Review Artifacts require the current Worker protocol")
         review_ids = [item.review_id for item in self.results]
         if len(review_ids) != len(set(review_ids)):
             raise ValueError("Background Review Artifact result IDs must be unique")
@@ -426,7 +469,7 @@ class BackgroundReviewEvidenceArtifact(ContractModel):
     @model_validator(mode="after")
     def validate_evidence_artifact(self) -> "BackgroundReviewEvidenceArtifact":
         if self.protocol_version != WORKER_PROTOCOL_VERSION:
-            raise ValueError("Background Review Evidence requires Worker protocol v4")
+            raise ValueError("Background Review Evidence requires the current Worker protocol")
         return self
 
 
@@ -441,7 +484,80 @@ class BackgroundReviewSnapshotsArtifact(ContractModel):
     @model_validator(mode="after")
     def validate_snapshots_artifact(self) -> "BackgroundReviewSnapshotsArtifact":
         if self.protocol_version != WORKER_PROTOCOL_VERSION:
-            raise ValueError("Background Review Snapshots require Worker protocol v4")
+            raise ValueError("Background Review Snapshots require the current Worker protocol")
+        return self
+
+
+class ToolchainScenarioArtifact(ContractModel):
+    """Content-free Toolchain scenario observations produced by the Worker."""
+
+    protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
+    trial_id: Identifier
+    case_id: Identifier
+    results: list[ScenarioExecutionResult] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_toolchain_results(self) -> "ToolchainScenarioArtifact":
+        if any(item.kind.value != "toolchain" for item in self.results):
+            raise ValueError("Toolchain Artifact cannot contain Process results")
+        scenario_ids = [item.scenario_id for item in self.results]
+        if len(scenario_ids) != len(set(scenario_ids)):
+            raise ValueError("Toolchain scenario IDs must be unique")
+        return self
+
+
+class ProcessScenarioArtifact(ContractModel):
+    """Content-free Process lifecycle observations produced by the Worker."""
+
+    protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
+    trial_id: Identifier
+    case_id: Identifier
+    results: list[ScenarioExecutionResult] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_process_results(self) -> "ProcessScenarioArtifact":
+        if any(item.kind.value != "process_background" for item in self.results):
+            raise ValueError("Process Artifact cannot contain Toolchain results")
+        scenario_ids = [item.scenario_id for item in self.results]
+        if len(scenario_ids) != len(set(scenario_ids)):
+            raise ValueError("Process scenario IDs must be unique")
+        return self
+
+
+class ProcessCleanupArtifact(ContractModel):
+    """Safe cleanup facts; no command, environment, or raw process output."""
+
+    protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
+    trial_id: Identifier
+    case_id: Identifier
+    reports: list[JsonObject] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_reports(self) -> "ProcessCleanupArtifact":
+        allowed = {"complete", "attempted_count", "completed_count", "unresolved_ids"}
+        if any(set(report) - allowed for report in self.reports):
+            raise ValueError("Process cleanup reports contain unsupported fields")
+        for report in self.reports:
+            if "complete" in report and type(report["complete"]) is not bool:
+                raise ValueError("Process cleanup complete must be a boolean")
+            for field_name in ("attempted_count", "completed_count"):
+                value = report.get(field_name)
+                if value is not None and (
+                    type(value) is not int or value < 0
+                ):
+                    raise ValueError(
+                        f"Process cleanup {field_name} must be a non-negative integer"
+                    )
+            unresolved = report.get("unresolved_ids")
+            if unresolved is not None:
+                if not isinstance(unresolved, list) or any(
+                    not isinstance(item, str)
+                    or re.fullmatch(r"[0-9a-f]{16}", item) is None
+                    for item in unresolved
+                ):
+                    raise ValueError(
+                        "Process cleanup unresolved IDs must be safe digests"
+                    )
         return self
 
 
@@ -487,6 +603,12 @@ class MyHermesWorkerResult(ContractModel):
     background_review_errors: list[BackgroundReviewExecutionError] = Field(
         default_factory=list
     )
+    scenario_results: list[ScenarioExecutionResult] = Field(default_factory=list)
+    process_errors: list[ScenarioError] = Field(default_factory=list)
+    toolchain_results_artifact: SafeRelativePath | None = None
+    process_scenario_results_artifact: SafeRelativePath | None = None
+    process_cleanup_artifact: SafeRelativePath | None = None
+    process_output_artifacts: list[SafeRelativePath] = Field(default_factory=list)
     review_gate_passed: StrictBool | None = None
     warnings: list[WorkerWarning] = Field(default_factory=list)
     error: WorkerError | None = None
@@ -592,6 +714,25 @@ class MyHermesWorkerResult(ContractModel):
         # Worker only reports execution facts and must not pre-judge them.
         if self.review_gate_passed is not None:
             raise ValueError("worker must not calculate the Background Review gate")
+        scenario_ids = [item.scenario_id for item in self.scenario_results]
+        if len(scenario_ids) != len(set(scenario_ids)):
+            raise ValueError("worker scenario result IDs must be unique")
+        scenario_kinds = {item.kind.value for item in self.scenario_results}
+        if ("toolchain" in scenario_kinds) != (
+            self.toolchain_results_artifact is not None
+        ):
+            raise ValueError("Toolchain worker results require their Artifact ref")
+        if ("process_background" in scenario_kinds) != (
+            self.process_scenario_results_artifact is not None
+        ):
+            raise ValueError("Process worker results require their Artifact ref")
+        has_process_results = "process_background" in scenario_kinds
+        if has_process_results != (self.process_cleanup_artifact is not None):
+            raise ValueError("Process worker results require cleanup Artifact ref")
+        if "process_background" not in scenario_kinds and self.process_output_artifacts:
+            raise ValueError(
+                "process output Artifacts require Process scenario results"
+            )
         return self
 
 
@@ -600,6 +741,9 @@ __all__ = (
     "BackgroundReviewArtifact",
     "BackgroundReviewEvidenceArtifact",
     "BackgroundReviewSnapshotsArtifact",
+    "ToolchainScenarioArtifact",
+    "ProcessScenarioArtifact",
+    "ProcessCleanupArtifact",
     "MyHermesWorkerRequest",
     "MyHermesWorkerResult",
     "MemoryArtifact",

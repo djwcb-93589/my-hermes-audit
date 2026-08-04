@@ -5,6 +5,9 @@ from myhermes_audit.integrations.myhermes.contracts import (
     MyHermesWorkerRequest,
     MyHermesWorkerResult,
     ObservationBundle,
+    ProcessCleanupArtifact,
+    ProcessScenarioArtifact,
+    ToolchainScenarioArtifact,
     WorkerArtifactPaths,
     WorkerStatus,
 )
@@ -17,7 +20,10 @@ __all__ = (
     "MyHermesWorkerRequest",
     "MyHermesWorkerResult",
     "ObservationBundle",
+    "ProcessCleanupArtifact",
+    "ProcessScenarioArtifact",
     "SubjectCapabilityReport",
+    "ToolchainScenarioArtifact",
     "WorkerArtifactPaths",
     "WorkerStatus",
 )

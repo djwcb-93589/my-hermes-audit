@@ -63,6 +63,13 @@ from myhermes_audit.contracts.background_review import (
     BackgroundReviewExecutionError,
     BackgroundReviewExecutionResult,
 )
+from myhermes_audit.contracts.scenario import (
+    E2EScenarioKind,
+    ProcessScenarioExecutionResult,
+    ScenarioError,
+    ScenarioExecutionResult,
+    ToolchainScenarioExecutionResult,
+)
 from myhermes_audit.serialization import canonical_sha256
 
 
@@ -283,6 +290,7 @@ class TrialResult(ContractModel):
     compression_mode: CompressionMode | None = None
     configuration_fingerprint: Sha256Digest | None = None
     comparison_basis_fingerprint: Sha256Digest | None = None
+    scenario_fingerprint: Sha256Digest | None = None
     effective_subject_configuration: EffectiveSubjectConfiguration | None = None
     status: TrialStatus
     task_passed: StrictBool | None = None
@@ -320,11 +328,35 @@ class TrialResult(ContractModel):
         default_factory=list
     )
     review_gate_passed: StrictBool | None = None
+    scenario_results: list[ScenarioExecutionResult] = Field(default_factory=list)
+    process_errors: list[ScenarioError] = Field(default_factory=list)
+    toolchain_gate_passed: StrictBool | None = None
+    process_gate_passed: StrictBool | None = None
     metrics: list[MetricResult] = Field(default_factory=list)
     judge_result: JudgeResult | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     warnings: list[TrialWarning] = Field(default_factory=list)
     error: TrialError | None = None
+
+    @property
+    def toolchain_scenario_results(self) -> list[ToolchainScenarioExecutionResult]:
+        """Return Toolchain facts without duplicating the canonical result list."""
+
+        return [
+            item
+            for item in self.scenario_results
+            if item.kind is E2EScenarioKind.TOOLCHAIN
+        ]
+
+    @property
+    def process_scenario_results(self) -> list[ProcessScenarioExecutionResult]:
+        """Return Process facts without creating a second source of truth."""
+
+        return [
+            item
+            for item in self.scenario_results
+            if item.kind is E2EScenarioKind.PROCESS_BACKGROUND
+        ]
 
     @model_validator(mode="after")
     def validate_trial_result(self) -> "TrialResult":
@@ -444,6 +476,10 @@ class TrialResult(ContractModel):
             raise ValueError("failed required-fact gate cannot have task_passed=true")
         if self.review_gate_passed is False and self.task_passed is True:
             raise ValueError("failed Review gate cannot have task_passed=true")
+        if self.process_gate_passed is False and self.task_passed is True:
+            raise ValueError("failed Process gate cannot have task_passed=true")
+        if self.toolchain_gate_passed is False and self.task_passed is True:
+            raise ValueError("failed Toolchain gate cannot have task_passed=true")
         if self.task_passed is False and self.passed is True:
             raise ValueError("failed task cannot have passed=true")
         if self.status is TrialStatus.TIMEOUT:
@@ -472,6 +508,27 @@ class TrialResult(ContractModel):
         review_ids = [item.review_id for item in self.background_review_results]
         if len(review_ids) != len(set(review_ids)):
             raise ValueError("Background Review result IDs must be unique")
+        scenario_ids = [item.scenario_id for item in self.scenario_results]
+        if len(scenario_ids) != len(set(scenario_ids)):
+            raise ValueError("scenario result IDs must be unique")
+        if self.scenario_results and self.scenario_fingerprint is None:
+            raise ValueError("scenario results require a scenario fingerprint")
+        process_ids = [
+            item.scenario_id
+            for item in self.scenario_results
+            if item.kind is E2EScenarioKind.PROCESS_BACKGROUND
+        ]
+        if self.process_gate_passed is not None and not process_ids:
+            raise ValueError("process_gate_passed requires Process scenario results")
+        toolchain_ids = [
+            item.scenario_id
+            for item in self.scenario_results
+            if item.kind is E2EScenarioKind.TOOLCHAIN
+        ]
+        if self.toolchain_gate_passed is not None and not toolchain_ids:
+            raise ValueError(
+                "toolchain_gate_passed requires Toolchain scenario results"
+            )
         review_snapshot_ids = [
             snapshot.snapshot_id
             for item in self.background_review_results

@@ -40,6 +40,7 @@ from myhermes_audit.contracts import (
     TokenCountSource,
     TurnResult,
 )
+from myhermes_audit.contracts import ScenarioError
 from myhermes_audit.errors import (
     AuditError,
     CompressionConfigurationError,
@@ -59,6 +60,9 @@ from myhermes_audit.integrations.myhermes.contracts import (
     MyHermesWorkerRequest,
     MyHermesWorkerResult,
     ObservationBundle,
+    ProcessCleanupArtifact,
+    ProcessScenarioArtifact,
+    ToolchainScenarioArtifact,
     WorkerError,
     WorkerStatus,
     WorkerTranscript,
@@ -72,6 +76,7 @@ from myhermes_audit.integrations.myhermes.observation_reader import (
     latest_run_id,
     read_observations,
 )
+from myhermes_audit.integrations.myhermes.scenarios import build_scenario_results
 from myhermes_audit.security import redact_text, sensitive_environment_values
 
 
@@ -207,10 +212,12 @@ def _validate_isolation_boundary(
         candidate = getattr(request.artifact_paths, field_name)
         if candidate is None:
             continue
-        if candidate.parent.resolve(strict=True) != artifacts_root:
-            raise ValueError("artifact path escaped the Trial artifacts directory")
-        if candidate.is_symlink():
-            raise ValueError("artifact paths cannot be symbolic links")
+        candidates = candidate if isinstance(candidate, list) else [candidate]
+        for current in candidates:
+            if current.parent.resolve(strict=True) != artifacts_root:
+                raise ValueError("artifact path escaped the Trial artifacts directory")
+            if current.is_symlink():
+                raise ValueError("artifact paths cannot be symbolic links")
     config_path = hermes_home / "config.yaml"
     if not config_path.is_file() or config_path.is_symlink():
         raise ValueError("isolated MyHermes config is missing")
@@ -265,6 +272,11 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
     review_failure_stops_foreground = False
     previous_session_id: str | None = None
     estimate_context_tokens = None
+    response_messages: list[Mapping[str, object]] = []
+    cleanup_reports: list[dict] = []
+    scenario_results = []
+    process_errors: list[ScenarioError] = []
+    process_output_paths: list[Path] = []
     fact_by_id = {
         fact.fact_id: fact
         for expectation in request.required_fact_expectations
@@ -509,6 +521,8 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                 hook_registry=hook_registry,
                 background_review_coordinator=background_review_coordinator,
             )
+            if isinstance(response, Mapping):
+                response_messages.append(response)
             duration_ms = max(0, round((time.perf_counter() - turn_clock) * 1000))
             turn_finished = datetime.now(timezone.utc)
             run_id = latest_run_id(request.sqlite_path, seen_run_ids)
@@ -885,6 +899,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                         shutdown_background_review=not bool(
                             request.background_review_plans
                         ),
+                        cleanup_reports=cleanup_reports,
                     )
                 )
             except Exception as exc:
@@ -939,6 +954,62 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                 ),
             )
 
+    if request.scenarios:
+        try:
+            scenario_results, process_errors, process_output_paths = build_scenario_results(
+                request,
+                responses=response_messages,
+                observations=observations,
+                turns=turns,
+                cleanup_reports=cleanup_reports,
+                sensitive_values=sensitive_values,
+            )
+            toolchain_results = [
+                item for item in scenario_results
+                if item.kind.value == "toolchain"
+            ]
+            process_results = [
+                item for item in scenario_results
+                if item.kind.value == "process_background"
+            ]
+            if request.artifact_paths.toolchain_results is not None:
+                atomic_write_json(
+                    request.artifact_paths.toolchain_results,
+                    ToolchainScenarioArtifact(
+                        trial_id=request.trial_id,
+                        case_id=request.case_id,
+                        results=toolchain_results,
+                    ),
+                )
+            if request.artifact_paths.process_scenario_results is not None:
+                atomic_write_json(
+                    request.artifact_paths.process_scenario_results,
+                    ProcessScenarioArtifact(
+                        trial_id=request.trial_id,
+                        case_id=request.case_id,
+                        results=process_results,
+                    ),
+                )
+            if request.artifact_paths.process_cleanup is not None:
+                atomic_write_json(
+                    request.artifact_paths.process_cleanup,
+                    ProcessCleanupArtifact(
+                        trial_id=request.trial_id,
+                        case_id=request.case_id,
+                        reports=cleanup_reports,
+                    ),
+                )
+        except Exception as exc:
+            process_errors.append(
+                ScenarioError(
+                    error_type="scenario_artifact_error",
+                    message="scenario observations could not be persisted",
+                )
+            )
+            lifecycle_warnings.append(_worker_warning("scenario_artifact_error", exc))
+            failed_status = failed_status or "scenario_artifact_error"
+            failed_error_type = failed_error_type or "scenario_artifact_error"
+            failed_fatal = True
     duration_ms = max(0, round((time.perf_counter() - started) * 1000))
     prompt_tokens = _complete_optional_sum(
         item.prompt_tokens for item in observations.model_calls
@@ -1047,6 +1118,30 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         ),
         background_review_results=background_review_results,
         background_review_errors=background_review_errors,
+        scenario_results=scenario_results,
+        process_errors=process_errors,
+        toolchain_results_artifact=(
+            None
+            if request.artifact_paths.toolchain_results is None
+            or not any(item.kind.value == "toolchain" for item in scenario_results)
+            else _artifact_relative(request.artifact_paths.toolchain_results)
+        ),
+        process_scenario_results_artifact=(
+            None
+            if request.artifact_paths.process_scenario_results is None
+            or not any(item.kind.value == "process_background" for item in scenario_results)
+            else _artifact_relative(request.artifact_paths.process_scenario_results)
+        ),
+        process_cleanup_artifact=(
+            None
+            if request.artifact_paths.process_cleanup is None
+            or not any(
+                item.kind.value == "process_background"
+                for item in scenario_results
+            )
+            else _artifact_relative(request.artifact_paths.process_cleanup)
+        ),
+        process_output_artifacts=[_artifact_relative(path) for path in process_output_paths],
         review_gate_passed=None,
     )
 

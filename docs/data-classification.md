@@ -4,6 +4,15 @@ Suite 在 `defaults.metadata.data_classification` 声明 `synthetic`、`internal
 
 ## `synthetic`
 
+## P6.1 Process artifacts
+
+Process scenario JSON retains only safe process/session identities, status,
+step outcome, offset, byte length, SHA-256, marker result, truncation and
+cleanup summaries. Raw command, stdin, full environment and unbounded output
+remain local; output logs are bounded and redacted before publication.
+`--langfuse-no-content` projects only scenario/step/action/status/offset,
+length/hash/marker, duration and gate metadata.
+
 可上传经凭据脱敏和受控截断的用户输入、最终输出、Judge rubric/result 与 Validator 摘要。仍不上传 Fixture 正文、隐藏 Prompt、隐藏推理、完整工具参数/结果、config、环境或数据库内容。
 
 ## `internal`

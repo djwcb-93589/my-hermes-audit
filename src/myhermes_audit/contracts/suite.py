@@ -56,6 +56,7 @@ from myhermes_audit.contracts.memory import (
     MemoryQueryPhase,
     RetrievalStrategy,
 )
+from myhermes_audit.contracts.scenario import ScenarioPlan
 
 
 class CaseMode(str, Enum):
@@ -529,6 +530,7 @@ class EvaluatorKind(str, Enum):
     RETRIEVAL = "retrieval"
     COMPRESSION = "compression"
     BACKGROUND_REVIEW = "background_review"
+    SCENARIO = "scenario"
 
 
 class EvaluatorSpec(ContractModel):
@@ -566,6 +568,7 @@ class AuditCase(ContractModel):
     execution: ExecutionSpec = Field(default_factory=ExecutionSpec)
     fixture: FixtureSpec = Field(default_factory=FixtureSpec)
     expected: ExpectedSpec = Field(default_factory=ExpectedSpec)
+    scenarios: list[ScenarioPlan] = Field(default_factory=list)
     ablation: AblationPlan | None = None
     evaluators: list[EvaluatorSpec] = Field(default_factory=list)
 
@@ -583,6 +586,16 @@ class AuditCase(ContractModel):
             raise ValueError("evaluator_id must be unique within an AuditCase")
         if len(self.tags) != len(set(self.tags)):
             raise ValueError("case tags must not repeat")
+        scenario_ids = [item.scenario_id for item in self.scenarios]
+        if len(scenario_ids) != len(set(scenario_ids)):
+            raise ValueError("scenario_id must be unique within an AuditCase")
+        checkpoint_ids = [
+            checkpoint.checkpoint_id
+            for scenario in self.scenarios
+            for checkpoint in scenario.checkpoints
+        ]
+        if len(checkpoint_ids) != len(set(checkpoint_ids)):
+            raise ValueError("scenario checkpoint IDs must be unique within an AuditCase")
         if "data_classification" in self.metadata:
             classification_from_metadata(self.metadata)
         query_ids = [item.query_id for item in self.expected.memories]

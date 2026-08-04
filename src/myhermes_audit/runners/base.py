@@ -24,6 +24,8 @@ from myhermes_audit.contracts import (
     TurnResult,
     BackgroundReviewExecutionError,
     BackgroundReviewExecutionResult,
+    ScenarioError,
+    ScenarioExecutionResult,
 )
 from myhermes_audit.sandbox import AuditSandbox
 from myhermes_audit.validators.base import ToolTraceEntry
@@ -64,6 +66,26 @@ class TrialRunnerOutcome:
     background_review_results: tuple[BackgroundReviewExecutionResult, ...] = ()
     background_review_errors: tuple[BackgroundReviewExecutionError, ...] = ()
     review_gate_passed: bool | None = None
+    scenario_results: tuple[ScenarioExecutionResult, ...] = ()
+    process_errors: tuple[ScenarioError, ...] = ()
+    toolchain_gate_passed: bool | None = None
+    process_gate_passed: bool | None = None
+
+    @property
+    def process_scenario_results(self) -> tuple[ScenarioExecutionResult, ...]:
+        return tuple(
+            item
+            for item in self.scenario_results
+            if item.kind.value == "process_background"
+        )
+
+    @property
+    def toolchain_scenario_results(self) -> tuple[ScenarioExecutionResult, ...]:
+        return tuple(
+            item
+            for item in self.scenario_results
+            if item.kind.value == "toolchain"
+        )
 
 
 class TrialRunnerPort(Protocol):

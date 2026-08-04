@@ -38,6 +38,7 @@ from myhermes_audit.validators.memory import (
 )
 from myhermes_audit.validators.text import TextValidator
 from myhermes_audit.validators.tool_trajectory import ToolTrajectoryValidator
+from myhermes_audit.validators.scenario import evaluate_scenario_plan
 
 
 _DETERMINISTIC_GROUPS = frozenset({"all", "files", "texts", "json_values"})
@@ -172,6 +173,27 @@ class ValidatorResultsArtifact(ContractModel):
         )
 
     @property
+    def toolchain_hard_gates_passed(self) -> bool | None:
+        return self.required_gate_status(
+            evaluator_kind=EvaluatorKind.SCENARIO,
+            metric_types=frozenset({"toolchain_gate", "toolchain_trace", "toolchain_artifacts", "toolchain_checkpoints"}),
+        )
+
+    @property
+    def process_hard_gates_passed(self) -> bool | None:
+        return self.required_gate_status(
+            evaluator_kind=EvaluatorKind.SCENARIO,
+            metric_types=frozenset(
+                {
+                    "process_gate",
+                    "process_steps",
+                    "process_cleanup",
+                    "process_checkpoints",
+                }
+            ),
+        )
+
+    @property
     def hard_gates_passed(self) -> bool:
         """Compatibility alias for task_hard_gates_passed."""
 
@@ -222,6 +244,7 @@ def preflight_evaluators(case: AuditCase) -> None:
     retrieval_covered = False
     compression_covered = False
     background_review_covered = False
+    scenario_covered = False
     covered_judges: set[int] = set()
     for evaluator in case.evaluators:
         if evaluator.kind is EvaluatorKind.DETERMINISTIC:
@@ -341,6 +364,34 @@ def preflight_evaluators(case: AuditCase) -> None:
                 )
             background_review_covered = True
             continue
+        if evaluator.kind is EvaluatorKind.SCENARIO:
+            if evaluator.config:
+                raise UnsupportedCaseError(
+                    "scenario evaluator config must be empty; use strict scenario contracts",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            if scenario_covered:
+                raise UnsupportedCaseError(
+                    "scenario plans cannot be evaluated more than once",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            if not case.scenarios:
+                raise UnsupportedCaseError(
+                    "scenario evaluator requires at least one P6 scenario",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            has_required_scenario = any(item.required for item in case.scenarios)
+            if evaluator.required is not has_required_scenario:
+                raise UnsupportedCaseError(
+                    "scenario evaluator required must match declared scenario gates",
+                    case_id=case.case_id,
+                    evaluator_id=evaluator.evaluator_id,
+                )
+            scenario_covered = True
+            continue
         raise UnsupportedCaseError(
             "evaluator kind is outside the P1 boundary",
             case_id=case.case_id,
@@ -368,6 +419,8 @@ def preflight_evaluators(case: AuditCase) -> None:
         orphan_groups.append("ablation")
     if case.expected.background_reviews and not background_review_covered:
         orphan_groups.append("background_reviews")
+    if case.scenarios and not scenario_covered:
+        orphan_groups.append("scenarios")
     if orphan_groups:
         raise UnsupportedCaseError(
             "P1 expectations must be attached to an evaluator",
@@ -502,6 +555,27 @@ def _evaluate_one(
                     context,
                     metric_prefix=(
                         f"{evaluator.evaluator_id}.review.{expectation.review_id}"
+                    ),
+                )
+            )
+        return [
+            _attach_evaluator_metadata(result, evaluator)
+            for result in results
+        ]
+    elif evaluator.kind is EvaluatorKind.SCENARIO:
+        if evaluator.config:
+            raise UnsupportedCaseError(
+                "scenario evaluator config must be empty",
+                evaluator_id=evaluator.evaluator_id,
+            )
+        results: list[MetricResult] = []
+        for scenario in case.scenarios:
+            results.extend(
+                evaluate_scenario_plan(
+                    scenario,
+                    context,
+                    metric_prefix=(
+                        f"{evaluator.evaluator_id}.scenario.{scenario.scenario_id}"
                     ),
                 )
             )

@@ -34,6 +34,8 @@ BACKGROUND_REVIEW_SNAPSHOT_NAME = "myhermes.audit.background_review.snapshot"
 BACKGROUND_REVIEW_CHANGE_NAME = "myhermes.audit.background_review.observed_change"
 BACKGROUND_REVIEW_LIFECYCLE_NAME = "myhermes.audit.background_review.lifecycle"
 BACKGROUND_REVIEW_EVALUATOR_NAME = "myhermes.audit.background_review.evaluator"
+SCENARIO_NAME = "myhermes.audit.scenario"
+PROCESS_STEP_NAME = "myhermes.audit.process.step"
 
 
 def publish_replay_observations(
@@ -57,6 +59,7 @@ def publish_replay_observations(
         "audit_run_id": request.experiment.audit_run_id,
         "trial_run_id": trial.run_id,
         "trial_number": trial.trial_number,
+        "scenario_fingerprint": trial.scenario_fingerprint,
         "subject_commit": request.subject_commit,
         "subject_dirty": request.subject_dirty,
         "audit_commit": request.audit_commit,
@@ -152,6 +155,21 @@ def publish_replay_observations(
             if p5_enabled
             else {}
         ),
+        **(
+            {
+                "scenario_count": len(trial.scenario_results),
+                "toolchain_scenario_count": sum(
+                    item.kind.value == "toolchain" for item in trial.scenario_results
+                ),
+                "process_scenario_count": sum(
+                    item.kind.value == "process_background" for item in trial.scenario_results
+                ),
+                "toolchain_gate_passed": trial.toolchain_gate_passed,
+                "process_gate_passed": trial.process_gate_passed,
+            }
+            if trial.scenario_results
+            else {}
+        ),
         "post_hoc_publication": True,
         "runtime_timestamps_not_replayed": True,
         "experiment_runner_replay": True,
@@ -170,9 +188,13 @@ def publish_replay_observations(
     )
     session_id = f"audit:{request.experiment.audit_run_id}:{trial.trial_id}"
     version = (
-        "p5"
-        if p5_enabled
-        else ("p4" if p4_enabled else ("p3" if memory_enabled else "p2"))
+        "p6.1"
+        if trial.scenario_results
+        else (
+            "p5"
+            if p5_enabled
+            else ("p4" if p4_enabled else ("p3" if memory_enabled else "p2"))
+        )
     )
     with propagate_attributes(
         session_id=session_id[:200],
@@ -195,6 +217,7 @@ def publish_replay_observations(
             _publish_turns(root, request, sensitive_values=sensitive_values)
             _publish_memory(root, request, sensitive_values=sensitive_values)
             _publish_background_reviews(root, request)
+            _publish_scenarios(root, request)
             _publish_evaluators(root, request, sensitive_values=sensitive_values)
             _publish_ablation(root, request)
 
@@ -273,6 +296,132 @@ def _publish_turns(
         root,
         [item for item in tool_calls if item.run_id not in handled_runs],
     )
+
+
+def _publish_scenarios(root: Any, request: LangfuseTrialRequest) -> None:
+    """Replay only local scenario facts; never restart a process or a Validator."""
+    trial = request.trial
+    for scenario in trial.scenario_results:
+        common = {
+            "scenario_id": scenario.scenario_id,
+            "scenario_kind": scenario.kind.value,
+            "status": scenario.status.value,
+            "duration_ms": scenario.duration_ms,
+            "error_count": len(scenario.errors),
+            "content_omitted": True,
+        }
+        observation = root.start_observation(
+            name=SCENARIO_NAME,
+            as_type="span",
+            input={"content_omitted": True},
+            output={"content_omitted": True, "status": scenario.status.value},
+            metadata=common,
+            version="p6.1",
+        )
+        try:
+            steps = getattr(scenario, "steps", ())
+            for step in steps:
+                step_metadata = {
+                    "scenario_id": scenario.scenario_id,
+                    "step_id": step.step_id,
+                    "action": step.action.value,
+                    "status": step.status.value,
+                    "duration_ms": step.duration_ms,
+                    "observation_ref_count": len(step.observation_refs),
+                    "content_omitted": True,
+                }
+                child = observation.start_observation(
+                    name=PROCESS_STEP_NAME,
+                    as_type="span",
+                    input={"content_omitted": True},
+                    output={"content_omitted": True, "status": step.status.value},
+                    metadata=step_metadata,
+                    version="p6.1",
+                )
+                child.end()
+            for checkpoint in getattr(scenario, "checkpoints", ()):
+                checkpoint_span = observation.start_observation(
+                    name=PROCESS_STEP_NAME,
+                    as_type="event",
+                    input={"content_omitted": True},
+                    output={"content_omitted": True},
+                    metadata={
+                        "scenario_id": scenario.scenario_id,
+                        "action": "checkpoint",
+                        "checkpoint_id": checkpoint.checkpoint_id,
+                        "required": checkpoint.required,
+                        "passed": checkpoint.passed,
+                        "observed_status": (
+                            None
+                            if checkpoint.observed_status is None
+                            else checkpoint.observed_status.value
+                        ),
+                        "content_omitted": True,
+                    },
+                    version="p6.1",
+                )
+                checkpoint_span.end()
+            for read in getattr(scenario, "incremental_reads", ()):
+                read_span = observation.start_observation(
+                    name=PROCESS_STEP_NAME,
+                    as_type="event",
+                    input={"content_omitted": True},
+                    output={"content_omitted": True},
+                    metadata={
+                        "scenario_id": scenario.scenario_id,
+                        "action": "read_incremental",
+                        "read_index": read.read_index,
+                        "offset_before": read.offset_before,
+                        "offset_after": read.offset_after,
+                        "new_output_length": read.new_output_length,
+                        "content_sha256": read.content_sha256,
+                        "required_markers_found": read.required_markers_found,
+                        "required_markers_missing": read.required_markers_missing,
+                        "forbidden_markers_found": read.forbidden_markers_found,
+                        "truncated": read.truncated,
+                        "content_omitted": True,
+                    },
+                    version="p6.1",
+                )
+                read_span.end()
+            for event in getattr(scenario, "input_events", ()):
+                input_span = observation.start_observation(
+                    name=PROCESS_STEP_NAME,
+                    as_type="event",
+                    input={"content_omitted": True},
+                    output={"content_omitted": True},
+                    metadata={
+                        "scenario_id": scenario.scenario_id,
+                        "action": "send_input",
+                        "submitted": event.submitted,
+                        "accepted": event.accepted,
+                        "bytes_written": event.bytes_written,
+                        "content_omitted": True,
+                    },
+                    version="p6.1",
+                )
+                input_span.end()
+            cleanup = getattr(scenario, "cleanup_result", None)
+            if cleanup is not None:
+                cleanup_span = observation.start_observation(
+                    name=PROCESS_STEP_NAME,
+                    as_type="event",
+                    input={"content_omitted": True},
+                    output={"content_omitted": True},
+                    metadata={
+                        "scenario_id": scenario.scenario_id,
+                        "action": "cleanup_session",
+                        "gate": cleanup.complete,
+                        "attempted_count": len(cleanup.attempted_process_ids),
+                        "completed_count": len(cleanup.completed_process_ids),
+                        "unresolved_count": len(cleanup.unresolved_process_ids),
+                        "content_omitted": True,
+                    },
+                    version="p6.1",
+                )
+                cleanup_span.end()
+        finally:
+            observation.end()
 
 
 def _publish_model_calls(parent: Any, items: list, request: LangfuseTrialRequest) -> None:

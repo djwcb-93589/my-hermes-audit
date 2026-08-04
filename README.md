@@ -1,5 +1,14 @@
 # my-hermes-audit
 
+## P6.1 E2E scenarios
+
+The first P6 stage provides strict synthetic Toolchain and Process/Background
+scenario contracts. See [`docs/p6-e2e-scenarios.md`](docs/p6-e2e-scenarios.md),
+[`examples/e2e_toolchain_v1.yaml`](examples/e2e_toolchain_v1.yaml), and
+[`examples/e2e_process_background_v1.yaml`](examples/e2e_process_background_v1.yaml).
+Process lifecycle facts come from the Subject's public terminal/process tools;
+Audit does not start commands directly or create a second ProcessManager.
+
 ## P5 Background Review 评测
 
 P5 把 MyHermes 的公开 Memory/Skill Background Review 生命周期接入隔离 Trial Worker。仅声明 `fixture.background_review_plans` 的 Case 才创建 trial-local Driver Registry、Review Agent Loop 与受限 Review ToolPolicy；旧 P0–P4 Case 不初始化任何 Review 组件。P5 记录真实 foreground evidence、Subject `prepare_run()` 证据窗口、before/after live snapshot、独立的 `observed_changes`、重复 claim 事实和安全错误投影，并由六个确定性 Review 维度形成 required Review gate。它评测同步、可收口的单 Review 生命周期，不实现异步队列、并行调度或完整后台闭环；后者留给 P6。

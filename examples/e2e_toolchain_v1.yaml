@@ -1,0 +1,149 @@
+schema_version: "1.0"
+suite_id: e2e-toolchain-v1
+name: P6.1 synthetic Toolchain end-to-end scenarios
+description: >-
+  Two small synthetic Toolchain scenarios. The Agent reads fixture data,
+  performs the requested transformation with the public file Tool, and writes
+  a local Artifact that the Audit validators inspect.
+tags: [e2e, toolchain, p6.1, synthetic]
+defaults:
+  trials: 1
+  timeout_seconds: 180
+  preserve_sandbox: false
+  metadata:
+    data_classification: synthetic
+cases:
+  - case_id: toolchain-text-export
+    name: Read a fixture and publish a text Artifact
+    description: Use the file Tool for both the fixture read and Artifact write.
+    mode: single_turn
+    input:
+      message: >-
+        Read fixtures/toolchain-text-source.txt with the public file
+        tool. Summarize the verified synthetic result in one short line and
+        write that line to exports/toolchain-text-output.txt using
+        the same public file tool. Report the final result only after the write
+        succeeds.
+    execution:
+      enabled_toolsets: [file]
+    fixture:
+      files:
+        - path: workspace/fixtures/toolchain-text-source.txt
+          content: "Verified synthetic Toolchain input: the export channel is green."
+    expected:
+      files:
+        - path: workspace/exports/toolchain-text-output.txt
+          exists: true
+          content_contains: [green]
+      texts:
+        - target: final_output
+          contains: green
+          case_sensitive: false
+      tool_trajectories:
+        - required_tools: [file]
+          required_successful_tools: [file]
+          minimum_tool_calls: 2
+    scenarios:
+      - scenario_id: toolchain-text
+        kind: toolchain
+        timeout_seconds: 120
+        required: true
+        required_toolsets: [file]
+        required_tool_calls:
+          - tool_name: file
+        forbidden_tool_calls: []
+        input_artifacts: [workspace/fixtures/toolchain-text-source.txt]
+        output_artifacts: [workspace/exports/toolchain-text-output.txt]
+        trace_requirements:
+          - tool_name: file
+            minimum_calls: 2
+            minimum_successful_calls: 2
+            required: true
+        checkpoints:
+          - checkpoint_id: text-input-read
+            required: true
+          - checkpoint_id: text-output-written
+            required: true
+    evaluators:
+      - evaluator_id: toolchain-text-deterministic
+        kind: deterministic
+        required: true
+        config: {expectation_group: all}
+      - evaluator_id: toolchain-text-trajectory
+        kind: tool_trajectory
+        required: true
+      - evaluator_id: toolchain-text-scenario
+        kind: scenario
+        required: true
+
+  - case_id: toolchain-json-export
+    name: Transform a JSON fixture into a JSON Artifact
+    description: Read JSON with the file Tool and publish a strict JSON object.
+    mode: single_turn
+    input:
+      message: >-
+        Read fixtures/toolchain-json-source.json with the public file
+        tool. Create exports/toolchain-json-output.json containing a
+        JSON object with the same project and state values, using the public
+        file tool to write it. Confirm completion only after the Artifact is
+        written.
+    execution:
+      enabled_toolsets: [file]
+    fixture:
+      files:
+        - path: workspace/fixtures/toolchain-json-source.json
+          content: '{"project":"synthetic-p6","state":"ready","count":2}'
+    expected:
+      files:
+        - path: workspace/exports/toolchain-json-output.json
+          exists: true
+          content_contains: [synthetic-p6, ready]
+      json_values:
+        - target: workspace/exports/toolchain-json-output.json
+          match: subset
+          root_type: object
+          values:
+            - path: project
+              expected: synthetic-p6
+            - path: state
+              expected: ready
+      texts:
+        - target: final_output
+          contains: ready
+          case_sensitive: false
+      tool_trajectories:
+        - required_tools: [file]
+          required_successful_tools: [file]
+          minimum_tool_calls: 2
+    scenarios:
+      - scenario_id: toolchain-json
+        kind: toolchain
+        timeout_seconds: 120
+        required: true
+        required_toolsets: [file]
+        required_tool_calls:
+          - tool_name: file
+        forbidden_tool_calls: []
+        input_artifacts: [workspace/fixtures/toolchain-json-source.json]
+        output_artifacts: [workspace/exports/toolchain-json-output.json]
+        trace_requirements:
+          - tool_name: file
+            minimum_calls: 2
+            minimum_successful_calls: 2
+            required: true
+        checkpoints:
+          - checkpoint_id: json-input-read
+            required: true
+          - checkpoint_id: json-output-written
+            required: true
+    evaluators:
+      - evaluator_id: toolchain-json-deterministic
+        kind: deterministic
+        required: true
+        config: {expectation_group: all}
+      - evaluator_id: toolchain-json-trajectory
+        kind: tool_trajectory
+        required: true
+      - evaluator_id: toolchain-json-scenario
+        kind: scenario
+        required: true

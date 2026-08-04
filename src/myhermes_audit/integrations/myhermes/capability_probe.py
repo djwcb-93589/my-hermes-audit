@@ -145,6 +145,14 @@ def _bind_skill_handler(signature: inspect.Signature) -> None:
     signature.bind(_BIND_PLACEHOLDER)
 
 
+def _bind_process_handler(signature: inspect.Signature) -> None:
+    signature.bind(
+        _BIND_PLACEHOLDER,
+        process_manager=_BIND_PLACEHOLDER,
+        session_key=_BIND_PLACEHOLDER,
+    )
+
+
 def _bind_skill_register(signature: inspect.Signature) -> None:
     signature.bind(_BIND_PLACEHOLDER)
 
@@ -650,7 +658,7 @@ class _ProbeBuilder:
         operation: Callable[[], bool],
         *,
         required: bool = True,
-    ) -> None:
+    ) -> bool:
         available = False
         failure_type: str | None = None
         try:
@@ -679,6 +687,54 @@ class _ProbeBuilder:
                 "available": "yes" if available else "no",
             }
         )
+        return available
+
+    def method_check(
+        self,
+        name: str,
+        module_name: str,
+        class_name: str,
+        method_name: str,
+        *,
+        required: bool = False,
+    ) -> bool:
+        available = False
+        signature: str | None = None
+        failure_type: str | None = None
+        try:
+            module = importlib.import_module(module_name)
+            owner = getattr(module, class_name)
+            method = getattr(owner, method_name)
+            if not callable(method):
+                raise TypeError("public method is not callable")
+            signature = _safe_signature(inspect.signature(method))
+            available = True
+        except AttributeError:
+            failure_type = "symbol_missing"
+        except (TypeError, ValueError):
+            failure_type = "signature_unavailable"
+        except Exception:
+            failure_type = "capability_check_failed"
+        self.checks.append(
+            SubjectCapabilityCheck(
+                name=name,
+                required=required,
+                available=available,
+                module=module_name,
+                public_object=f"{class_name}.{method_name}",
+                signature=signature,
+                failure_type=failure_type,
+            )
+        )
+        self.api_entries.append(
+            {
+                "module": module_name,
+                "object": f"{class_name}.{method_name}",
+                "signature": signature,
+                "available": "yes" if available else "no",
+            }
+        )
+        return available
 
 
 def _has_parameters(*names: str) -> Callable[[object], bool]:
@@ -862,6 +918,15 @@ def _skill_read_declaration_surface(value: object) -> bool:
         read_declarations,
         expected_toolsets=frozenset({"skill_read"}),
         expected_names=frozenset({"skill_view", "skills_list"}),
+    )
+
+
+def _process_declaration_surface(value: object) -> bool:
+    """The current Subject exposes the process companion through terminal."""
+    return _tool_declaration_surface(
+        value,
+        expected_toolsets=frozenset({"terminal"}),
+        expected_names=frozenset({"process"}),
     )
 
 
@@ -1137,6 +1202,95 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         "hermes.tool_declarations.terminal",
         "TOOL_DECLARATIONS",
         _terminal_declaration_surface,
+    )
+    process_declaration = builder.check(
+        "process_toolset",
+        "hermes.tool_declarations.process",
+        "TOOL_DECLARATIONS",
+        _process_declaration_surface,
+        required=False,
+    )
+    process_handler = builder.check(
+        "process_handler",
+        "hermes.tools.process",
+        "run_process",
+        callable,
+        signature_validator=_bind_process_handler,
+        required=False,
+    )
+    process_start = builder.method_check(
+        "process_start",
+        "hermes.processes",
+        "ProcessManager",
+        "spawn",
+        required=False,
+    )
+    process_read_incremental = builder.method_check(
+        "process_read_incremental",
+        "hermes.processes",
+        "ProcessManager",
+        "log",
+        required=False,
+    )
+    process_send_input = builder.method_check(
+        "process_send_input",
+        "hermes.processes",
+        "ProcessManager",
+        "write_stdin",
+        required=False,
+    )
+    process_wait = builder.method_check(
+        "process_wait",
+        "hermes.processes",
+        "ProcessManager",
+        "wait",
+        required=False,
+    )
+    process_interrupt = builder.method_check(
+        "process_interrupt",
+        "hermes.processes",
+        "ProcessManager",
+        "interrupt",
+        required=False,
+    )
+    process_kill = builder.method_check(
+        "process_kill",
+        "hermes.processes",
+        "ProcessManager",
+        "kill",
+        required=False,
+    )
+    process_status = builder.method_check(
+        "process_status",
+        "hermes.processes",
+        "ProcessManager",
+        "poll",
+        required=False,
+    )
+    process_session_cleanup = builder.method_check(
+        "process_session_cleanup",
+        "hermes.processes",
+        "ProcessManager",
+        "cleanup_session",
+        required=False,
+    )
+    builder.derived_check(
+        "background_process_supported",
+        available=all(
+            item is not None
+            for item in (
+                process_declaration,
+                process_handler,
+                process_start,
+                process_read_incremental,
+                process_send_input,
+                process_wait,
+                process_kill,
+                process_status,
+                process_session_cleanup,
+            )
+        ),
+        public_object="terminal process declaration+ProcessManager lifecycle",
     )
     skill_read_declaration = builder.check(
         "skill_read_toolset",

@@ -1,5 +1,15 @@
 # Deterministic Validator
 
+## P6.1 scenario evaluator
+
+The `scenario` evaluator consumes only Worker-produced Toolchain and Process
+observations. It emits independent metrics for status, trace/steps, Artifact
+presence, checkpoints, and cleanup. Required scenario metrics are hard gates;
+the aggregate is exposed as `toolchain_gate_passed` or
+`process_gate_passed` and flows into the existing task gate. No fourth
+first-level score is introduced, and missing observations are errors rather
+than fabricated success.
+
 ## P5 Background Review
 
 `background_review` evaluator 只消费 Worker 已持久化的 `BackgroundReviewExecutionResult`、安全 evidence projection、live snapshot 和 observed state diff；它不导入 MyHermes、不重新运行 Review、模型或工具，也不根据 Assistant 文本猜测状态变化。
