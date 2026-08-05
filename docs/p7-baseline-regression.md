@@ -63,7 +63,7 @@ inferred by parsing free-form logs and are never collapsed into “model issue�
 
 ## Baseline contract
 
-`AuditBaseline` is `baseline-v4`. It can be created from any strictly valid
+`AuditBaseline` is `baseline-v5`. It can be created from any strictly valid
 `AuditRunResult`, including a result with failed or timed-out Trials. It stores
 the source run ID, Audit and Subject commits, Suite ID and both Suite digests,
 Result Schema, Worker Protocol, model/config/pricing identities, total Trial
@@ -91,7 +91,7 @@ Memory text, Review evidence正文, user identity, or local absolute paths.
 
 ## Comparability
 
-`AuditRegressionReport` is `regression-v4` and reports structured reasons when
+`AuditRegressionReport` is `regression-v5` and reports structured reasons when
 comparison is not valid. Core correctness comparison requires the same Suite
 ID, semantic Suite digest, ordered Case set, Result Schema identity, metric
 contract, Worker Protocol, model identity, and configuration identity. Each
@@ -111,16 +111,23 @@ Pricing identity is deliberately independent. If pricing fingerprints differ,
 task, Tool, Memory, Review, turn, time, token, and cache observations remain
 comparable. Money, cost, savings, and effective-cost metrics are marked
 `not_comparable` with a structured reason.
+Each `MetricComparison` carries the generated `requires_pricing_match` policy
+fact. The comparison engine and Report validator use that field; the validator
+does not infer pricing applicability from a metric-name prefix. Default cost
+policies set it to true, and an explicit custom policy can set it for any
+metric. A pricing mismatch remains local to metrics whose fact is true.
 
 Metric evaluation is a one-way chain: raw baseline/current values and sample
-counts first derive `evaluation_status`; identity, Suite/Case, Result, metric,
-and applicable pricing facts then derive `comparability_status` and an exact
-finite reason-code set. Only after those facts are established are deltas and
-Metric decisions calculated. `not_evaluated` means a required metric/sample
-fact is absent, while `not_comparable` means evaluated facts cannot be aligned;
-the latter never masks the former. Case and Report validators repeat this
-derivation and reject missing, duplicate, or fabricated comparability reasons,
-so a serialized decision cannot downgrade a real regression.
+counts first derive `evaluation_status`; independent `comparability_fact_codes`
+and applicable pricing facts then derive `comparability_status` and the exact
+finite `reason_codes`. Only after those facts are established are deltas and
+Metric decisions calculated. `reason_codes` are verification output, never
+input to fact derivation. `MetricComparison` and Case projections mark their
+comparability facts as report-only; the complete `AuditRegressionReport`
+re-derives them from both sides' identities and rejects fabricated facts.
+`not_evaluated` means a required metric/sample fact is absent, while
+`not_comparable` means evaluated facts cannot be aligned; the latter never
+masks the former.
 
 ## RegressionPolicy
 
@@ -143,11 +150,14 @@ comparison engine reads these policy fields; thresholds are not hard-coded in
 the comparison decision path.
 
 Metric decisions are `improved`, `unchanged`, `regressed`, `warning`,
-`not_comparable`, or `not_evaluated`. The pure decision helper is the only
+`not_comparable`, or `not_evaluated`. Invalid comparison inputs are rejected
+before a Report is created; `invalid_input` is not a self-asserted Report
+status. The pure decision helper is the only
 place that applies direction, policy mode, and thresholds; both comparison and
 strict contract reload validation call it. Independent `evaluation_status`,
-`comparability_status`, and finite `reason_codes` are derived from raw values,
-sample counts, identity, and contract facts before a saved decision is checked;
+`comparability_status`, finite `reason_codes`, and the explicit
+`requires_pricing_match` fact are derived from raw values, sample counts,
+identity, policy, and contract facts before a saved decision is checked;
 the saved decision is never used to infer those facts. Every decision carries
 baseline/current values, absolute and (where defined) relative deltas, and both
 sample counts. A disabled policy may still record `improved` or `unchanged`,
@@ -215,7 +225,7 @@ outside the safe contract are excluded.
 
 ## Versioning and scope
 
-Baseline and Regression contracts are `baseline-v4` and `regression-v4`.
+Baseline and Regression contracts are `baseline-v5` and `regression-v5`.
 P7 adds the
 semantic Suite comparison digest to `AuditFingerprint`, so the Audit Result
 Schema is `1.6`; Worker Protocol remains v13. Existing Trial and evaluator

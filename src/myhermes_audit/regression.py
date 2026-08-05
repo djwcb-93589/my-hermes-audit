@@ -633,7 +633,7 @@ def _compare_metric(
     *,
     pricing_comparable: bool,
     pricing_reason: str | None = None,
-    comparability_reasons: Sequence[str] = (),
+    comparability_fact_codes: Sequence[str] = (),
 ) -> MetricComparison:
     name = (current or baseline).metric_name  # type: ignore[union-attr]
     base_value = None if baseline is None else baseline.value
@@ -656,10 +656,8 @@ def _compare_metric(
         max_relative_increase=policy.max_relative_increase,
         max_absolute_increase=policy.max_absolute_increase,
     )
-    pricing_issue = (
-        not pricing_comparable
-        and (policy.require_pricing_match or name.startswith("deepseek_cost_"))
-    )
+    requires_pricing_match = policy.require_pricing_match or name.startswith("deepseek_cost_")
+    pricing_issue = not pricing_comparable and requires_pricing_match
     facts = derive_metric_evaluation_facts(
         MetricEvaluationInput(
             metric_name=name,
@@ -669,8 +667,8 @@ def _compare_metric(
             current_value=current_value,
             baseline_sample_count=base_samples,
             current_sample_count=current_samples,
-            comparability_reasons=tuple(
-                [*comparability_reasons]
+            comparability_fact_codes=tuple(
+                [*comparability_fact_codes]
                 + ([pricing_reason or "pricing_fingerprint_mismatch"] if pricing_issue else [])
             ),
         )
@@ -693,6 +691,9 @@ def _compare_metric(
         **common,
         baseline_metric_present=baseline is not None,
         current_metric_present=current is not None,
+        comparability_fact_codes=list(facts.comparability_fact_codes),
+        requires_pricing_match=requires_pricing_match,
+        comparability_facts_verified=False,
         evaluation_status=facts.evaluation_status,
         comparability_status=facts.comparability_status,
         reason_codes=list(facts.reason_codes),
@@ -791,7 +792,7 @@ def compare_baseline(
                 policy_metrics.get(name, default_policy),
                 pricing_comparable=pricing_comparable,
                 pricing_reason=pricing_reason,
-                comparability_reasons=core_reasons,
+                comparability_fact_codes=core_reasons,
             )
         )
     case_reports: list[CaseRegressionSummary] = []
@@ -809,7 +810,7 @@ def compare_baseline(
                 policy_metrics.get(name, default_policy),
                 pricing_comparable=pricing_comparable,
                 pricing_reason=pricing_reason,
-                comparability_reasons=core_reasons,
+                comparability_fact_codes=core_reasons,
             )
             for name in sorted(set(old_map) | set(new_map))
         ]
@@ -844,6 +845,7 @@ def compare_baseline(
                 current_review_decision_accuracy=new.background_review_decision_accuracy,
                 baseline_background_review_decision_sample_count=old.background_review_decision_sample_count,
                 background_review_decision_sample_count=new.background_review_decision_sample_count,
+                comparability_facts_verified=False,
                 metrics=metrics,
                 metric_comparison_count=len(metrics),
                 decision_reason=_case_decision_reason(metrics),
@@ -866,6 +868,18 @@ def compare_baseline(
     )
     if comparable_metric_count == 0:
         reasons.append("no_comparable_core_metrics")
+    pricing_applicability_fingerprint = canonical_sha256(
+        [
+            {
+                "metric_name": item.metric_name,
+                "requires_pricing_match": item.requires_pricing_match,
+            }
+            for item in [
+                *suite_metrics,
+                *(metric for case in case_reports for metric in case.metrics),
+            ]
+        ]
+    )
     core_reasons = [
         reason
         for reason in reasons
@@ -916,6 +930,7 @@ def compare_baseline(
         current_metric_contract_identity=current_identities["metric_contract"],
         baseline_pricing_fingerprint=baseline.pricing_fingerprint,
         current_pricing_fingerprint=current.deepseek_pricing_fingerprint,
+        pricing_applicability_fingerprint=pricing_applicability_fingerprint,
         baseline_trial_count=baseline.declared_trial_count,
         current_trial_count=current.summary.trial_count,
         baseline_total_trial_count=baseline.total_trial_count,

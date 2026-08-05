@@ -125,7 +125,7 @@ class ReportDecisionResult:
 
 @dataclass(frozen=True)
 class MetricEvaluationInput:
-    """Raw metric facts and independently computed contract facts."""
+    """Raw metric facts and independently projected contract fact codes."""
 
     metric_name: str
     baseline_present: bool
@@ -134,7 +134,7 @@ class MetricEvaluationInput:
     current_value: object
     baseline_sample_count: int
     current_sample_count: int
-    comparability_reasons: tuple[str, ...] = ()
+    comparability_fact_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -142,13 +142,14 @@ class MetricEvaluationFacts:
     evaluation_status: EvaluationStatus
     comparability_status: ComparabilityStatus
     reason_codes: tuple[str, ...]
+    comparability_fact_codes: tuple[str, ...]
     delta_allowed: bool
 
 
 def derive_metric_evaluation_facts(
     inputs: MetricEvaluationInput,
 ) -> MetricEvaluationFacts:
-    """Derive status/reasons only from raw facts, never a saved decision."""
+    """Derive status/reasons from raw facts, never saved decisions or reasons."""
 
     reasons: list[str] = []
     for side, present, value, samples in (
@@ -182,7 +183,7 @@ def derive_metric_evaluation_facts(
     structural_reasons = tuple(
         sorted(
             reason
-            for reason in inputs.comparability_reasons
+            for reason in inputs.comparability_fact_codes
             if reason in COMPARABILITY_REASON_CODES
         )
     )
@@ -196,6 +197,7 @@ def derive_metric_evaluation_facts(
             else ComparabilityStatus.NOT_COMPARABLE
         ),
         reason_codes=all_reasons,
+        comparability_fact_codes=structural_reasons,
         delta_allowed=comparable,
     )
 
@@ -435,13 +437,10 @@ def decide_report_status(
     warning_count: int,
     comparable_metric_count: int,
     core_reason_count: int,
-    invalid_input: bool = False,
     warning_fails_gate: bool = False,
 ) -> ReportDecisionResult:
     """Derive report status and gate from counts, not persisted conclusions."""
 
-    if invalid_input:
-        return ReportDecisionResult("invalid_input", False, "invalid_input")
     if core_reason_count or comparable_metric_count == 0:
         return ReportDecisionResult(
             "not_comparable",

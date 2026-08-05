@@ -434,6 +434,7 @@ def render_console_regression(report: AuditRegressionReport) -> str:
             f"samples={metric.baseline_sample_count}->{metric.current_sample_count} "
             f"evaluation={metric.evaluation_status.value} "
             f"comparability={metric.comparability_status.value} "
+            f"requires_pricing_match={metric.requires_pricing_match} "
             f"decision={metric.decision.value} "
             f"reasons={','.join(metric.reason_codes) or '<none>'}"
         )

@@ -47,13 +47,13 @@ from myhermes_audit.regression_decision import (
 )
 
 
-BASELINE_SCHEMA_VERSION = "baseline-v4"
-REGRESSION_SCHEMA_VERSION = "regression-v4"
+BASELINE_SCHEMA_VERSION = "baseline-v5"
+REGRESSION_SCHEMA_VERSION = "regression-v5"
 REGRESSION_POLICY_SCHEMA_VERSION = "regression-policy-v1"
 METRIC_CONTRACT_VERSION = "p7-metrics-v1"
 
-BaselineSchemaVersion = Literal["baseline-v4"]
-RegressionSchemaVersion = Literal["regression-v4"]
+BaselineSchemaVersion = Literal["baseline-v5"]
+RegressionSchemaVersion = Literal["regression-v5"]
 RegressionPolicySchemaVersion = Literal["regression-policy-v1"]
 MetricNumber = StrictInt | StrictFloat | Decimal
 
@@ -63,7 +63,6 @@ class RegressionStatus(str, Enum):
     PASSED_WITH_WARNINGS = "passed_with_warnings"
     REGRESSED = "regressed"
     NOT_COMPARABLE = "not_comparable"
-    INVALID_INPUT = "invalid_input"
 
 
 class MetricDecision(str, Enum):
@@ -473,6 +472,9 @@ class MetricComparison(ContractModel):
     current_sample_count: NonNegativeInt = 0
     baseline_denominator: NonNegativeInt | None = None
     current_denominator: NonNegativeInt | None = None
+    comparability_fact_codes: list[NonEmptyText] = Field(...)
+    requires_pricing_match: StrictBool
+    comparability_facts_verified: Literal[False]
     evaluation_status: EvaluationStatus
     comparability_status: ComparabilityStatus
     reason_codes: list[NonEmptyText] = Field(...)
@@ -519,6 +521,12 @@ class MetricComparison(ContractModel):
         allowed = COMPARABILITY_REASON_CODES | EVALUATION_REASON_CODES
         if any(reason not in allowed for reason in self.reason_codes):
             raise ValueError("comparison reason code is not recognized")
+        if len(self.comparability_fact_codes) != len(set(self.comparability_fact_codes)):
+            raise ValueError("comparability fact codes must be unique")
+        if self.comparability_fact_codes != sorted(self.comparability_fact_codes):
+            raise ValueError("comparability fact codes must be sorted")
+        if any(code not in COMPARABILITY_REASON_CODES for code in self.comparability_fact_codes):
+            raise ValueError("comparability fact code is not recognized")
         facts = derive_metric_evaluation_facts(
             MetricEvaluationInput(
                 metric_name=self.metric_name,
@@ -528,22 +536,19 @@ class MetricComparison(ContractModel):
                 current_value=self.current_value,
                 baseline_sample_count=self.baseline_sample_count,
                 current_sample_count=self.current_sample_count,
-                comparability_reasons=tuple(
-                    reason
-                    for reason in self.reason_codes
-                    if reason not in EVALUATION_REASON_CODES
-                ),
+                comparability_fact_codes=tuple(self.comparability_fact_codes),
             )
         )
         if self.evaluation_status is not facts.evaluation_status:
             raise ValueError("evaluation status is inconsistent with metric facts")
         if self.comparability_status is not facts.comparability_status:
             raise ValueError("comparability status is inconsistent with metric facts")
+        if self.comparability_fact_codes != list(facts.comparability_fact_codes):
+            raise ValueError("comparability fact codes are inconsistent with metric facts")
         if self.reason_codes != list(facts.reason_codes):
             raise ValueError("comparison reason codes are inconsistent with metric facts")
         if self.comparability_status is ComparabilityStatus.COMPARABLE and self.reason_codes:
             raise ValueError("comparable metrics cannot carry comparability reasons")
-        reason_codes = tuple(self.reason_codes)
         expected = decide_metric_comparison(
             MetricDecisionInput(
                 baseline_value=self.baseline_value,
@@ -555,7 +560,7 @@ class MetricComparison(ContractModel):
                 max_absolute_increase=self.max_absolute_increase,
                 evaluation_status=self.evaluation_status.value,
                 comparability_status=self.comparability_status.value,
-                reason_codes=reason_codes,
+                reason_codes=facts.reason_codes,
             )
         )
         if self.decision.value != expected.decision.value:
@@ -579,11 +584,7 @@ def derive_metric_decision(item: MetricComparison):
             current_value=item.current_value,
             baseline_sample_count=item.baseline_sample_count,
             current_sample_count=item.current_sample_count,
-            comparability_reasons=tuple(
-                reason
-                for reason in item.reason_codes
-                if reason not in EVALUATION_REASON_CODES
-            ),
+            comparability_fact_codes=tuple(item.comparability_fact_codes),
         )
     )
     return decide_metric_comparison(
@@ -642,6 +643,7 @@ class CaseRegressionSummary(ContractModel):
     metric_comparison_count: NonNegativeInt
     baseline_background_review_decision_sample_count: NonNegativeInt
     background_review_decision_sample_count: NonNegativeInt
+    comparability_facts_verified: Literal[False]
     decision_reason: NonEmptyText | None = None
     decision: MetricDecision
 
@@ -677,18 +679,11 @@ class CaseRegressionSummary(ContractModel):
             raise ValueError("baseline background review action counts exceed decision samples")
         if sum(self.current_background_review_actions.values()) > self.background_review_decision_sample_count:
             raise ValueError("current background review action counts exceed decision samples")
-        expected = decide_case_regression(
-            [derive_metric_decision(item).value for item in self.metrics]
-        )
-        if self.decision.value != expected.decision.value:
-            raise ValueError("Case decision does not match the decision helper")
         if self.decision_reason is not None and (
             not self.decision_reason.replace("_", "").isalnum()
             or self.decision_reason.lower() != self.decision_reason
         ):
             raise ValueError("Case decision reason must be a stable reason code")
-        if self.decision_reason != expected.reason:
-            raise ValueError("Case decision reason does not match the decision helper")
         return self
 
 
@@ -728,6 +723,7 @@ class AuditRegressionReport(ContractModel):
     current_metric_contract_identity: IdentityEvidence
     baseline_pricing_fingerprint: Sha256Digest | None = None
     current_pricing_fingerprint: Sha256Digest | None = None
+    pricing_applicability_fingerprint: Sha256Digest
     baseline_trial_count: NonNegativeInt
     current_trial_count: NonNegativeInt
     baseline_total_trial_count: NonNegativeInt
@@ -816,6 +812,17 @@ class AuditRegressionReport(ContractModel):
         elif self.suite_task_success_rate_delta is None or not math.isclose(self.suite_task_success_rate_delta, expected_suite_delta, rel_tol=1e-9, abs_tol=1e-12):
             raise ValueError("suite task success delta is inconsistent")
         all_metrics = [*self.suite_metrics, *(metric for case in self.case_summaries for metric in case.metrics)]
+        expected_pricing_applicability = canonical_sha256(
+            [
+                {
+                    "metric_name": item.metric_name,
+                    "requires_pricing_match": item.requires_pricing_match,
+                }
+                for item in all_metrics
+            ]
+        )
+        if self.pricing_applicability_fingerprint != expected_pricing_applicability:
+            raise ValueError("pricing applicability facts are inconsistent")
         expected_counts = metric_decision_counts(all_metrics)
         for name, expected in expected_counts.items():
             if getattr(self, name) != expected:
@@ -878,9 +885,14 @@ class AuditRegressionReport(ContractModel):
             None,
         )
         for item in all_metrics:
-            applicable_reasons = list(core_reasons)
-            if pricing_reason is not None and item.metric_name.startswith("deepseek_cost_"):
-                applicable_reasons.append(pricing_reason)
+            applicable_fact_codes = [
+                reason
+                for reason in core_reasons
+                if reason in COMPARABILITY_REASON_CODES
+            ]
+            if pricing_reason is not None and item.requires_pricing_match:
+                applicable_fact_codes.append(pricing_reason)
+            applicable_fact_codes = sorted(set(applicable_fact_codes))
             expected_facts = derive_metric_evaluation_facts(
                 MetricEvaluationInput(
                     metric_name=item.metric_name,
@@ -890,26 +902,33 @@ class AuditRegressionReport(ContractModel):
                     current_value=item.current_value,
                     baseline_sample_count=item.baseline_sample_count,
                     current_sample_count=item.current_sample_count,
-                    comparability_reasons=tuple(applicable_reasons),
+                    comparability_fact_codes=tuple(applicable_fact_codes),
                 )
             )
             if item.evaluation_status is not expected_facts.evaluation_status:
                 raise ValueError("Metric evaluation status does not match report facts")
             if item.comparability_status is not expected_facts.comparability_status:
                 raise ValueError("Metric comparability status does not match report facts")
+            if item.comparability_fact_codes != list(expected_facts.comparability_fact_codes):
+                raise ValueError("Metric comparability facts do not match report facts")
             if item.reason_codes != list(expected_facts.reason_codes):
                 raise ValueError("Metric reason codes do not match report facts")
+        for case in self.case_summaries:
+            expected_case = decide_case_regression(
+                [derive_metric_decision(item).value for item in case.metrics]
+            )
+            if case.decision.value != expected_case.decision.value:
+                raise ValueError("Case decision does not match report-derived facts")
+            if case.decision_reason != expected_case.reason:
+                raise ValueError("Case decision reason does not match report-derived facts")
         expected_status = decide_report_status(
             regression_count=expected_counts["regression_count"],
             warning_count=expected_counts["warning_count"],
             comparable_metric_count=comparable_metric_count,
             core_reason_count=len(core_reasons),
-            invalid_input=self.status is RegressionStatus.INVALID_INPUT,
         )
         if self.status.value != expected_status.status or self.overall_regression_gate != expected_status.gate:
             raise ValueError("report status or gate does not match the decision helper")
-        if self.status is RegressionStatus.INVALID_INPUT and any(expected_counts.values()):
-            raise ValueError("invalid input cannot carry a regression conclusion")
         if self.status is RegressionStatus.NOT_COMPARABLE and any(
             expected_counts[name]
             for name in (
