@@ -43,6 +43,7 @@ def render_console_summary(result: AuditRunResult) -> str:
         f"(P50 {_integer_or_missing(summary.tool_call_count_p50)}, "
         f"P95 {_integer_or_missing(summary.tool_call_count_p95)})",
         "DeepSeek cache:    " + _cache_summary(summary.deepseek_cache),
+        "DeepSeek cost:     " + _cost_summary(summary.deepseek_cost),
         f"Failure rate:       {_percent_or_missing(summary.failure_rate)}",
         f"Timeout rate:       {_percent_or_missing(summary.timeout_rate)}",
         "Langfuse experiment: " + _langfuse_experiment(result),
@@ -193,6 +194,47 @@ def _cache_summary(value) -> str:
         f"rate {rate}, model coverage {model_coverage}, "
         f"trial coverage {_percent_or_missing(value.trial_coverage_rate)}"
     )
+
+
+def _cost_summary(value) -> str:
+    if value is None or value.status.value == "not_evaluated":
+        return "not evaluated"
+    parts = [value.status.value]
+    if value.total_cost_usd is not None:
+        parts.append(f"total USD {_money(value.total_cost_usd)}")
+    if value.classified_cost_usd is not None and value.total_cost_usd is None:
+        parts.append(f"classified USD {_money(value.classified_cost_usd)}")
+    if value.mean_cost_per_successful_trial_usd is not None:
+        parts.append(
+            "mean successful Trial USD "
+            f"{_money(value.mean_cost_per_successful_trial_usd)}"
+        )
+    if value.effective_cost_per_success_usd is not None:
+        parts.append(
+            "effective USD " f"{_money(value.effective_cost_per_success_usd)}"
+        )
+    if value.cache_savings_usd is not None:
+        savings = f"savings USD {_money(value.cache_savings_usd)}"
+        if value.cache_savings_rate is not None:
+            savings += f" ({_percent_decimal(value.cache_savings_rate)})"
+        parts.append(savings)
+    parts.append(
+        "coverage "
+        + (
+            "not evaluated"
+            if value.cost_coverage_rate is None
+            else _percent_decimal(value.cost_coverage_rate)
+        )
+    )
+    return ", ".join(parts)
+
+
+def _money(value) -> str:
+    return format(value, ".8f")
+
+
+def _percent_decimal(value) -> str:
+    return f"{value * 100:.1f}%"
 
 
 def _langfuse_experiment(result: AuditRunResult) -> str:

@@ -4,6 +4,10 @@
 
 ## P6.2B Worker v13
 
+P6.3 cost is computed by the Audit parent after Worker execution from
+`TrialRuntimeSummary`; pricing configuration and monetary projections do not
+cross the Worker protocol. Therefore the Worker protocol remains v13.
+
 `myhermes-audit-worker-v13` projects the two exact public DeepSeek cache
 fields, `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens`, plus
 `deepseek_cache_evaluated_prompt_tokens`, through the

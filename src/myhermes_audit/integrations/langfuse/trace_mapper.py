@@ -165,6 +165,7 @@ def publish_replay_observations(
             if runtime is None
             else runtime.deepseek_cache_invalid_model_call_count
         ),
+        **_cost_metadata(trial),
         **(
             {
                 "memory_query_count": len(trial.memory_query_results),
@@ -1819,6 +1820,34 @@ def _case_input(request: LangfuseTrialRequest) -> dict:
             }
             for turn in case_input.turns
         ]
+    }
+
+
+def _cost_metadata(trial) -> dict[str, object]:
+    """Project only safe cost facts; never include the pricing source note."""
+
+    cost = trial.deepseek_cost
+    if cost is None:
+        return {
+            "deepseek_cost_status": "not_evaluated",
+            "deepseek_cost_currency": None,
+            "deepseek_cost_pricing_fingerprint": None,
+        }
+
+    def amount(value):
+        return None if value is None else format(value, "f")
+
+    return {
+        "deepseek_cost_status": cost.status.value,
+        "deepseek_cost_currency": cost.currency,
+        "deepseek_cost_pricing_fingerprint": cost.pricing_fingerprint,
+        "deepseek_cost_classified_cost_usd": amount(cost.classified_cost_usd),
+        "deepseek_cost_total_cost_usd": amount(cost.total_cost_usd),
+        "deepseek_cost_estimated_without_cache_usd": amount(
+            cost.estimated_cost_without_cache_usd
+        ),
+        "deepseek_cost_cache_savings_usd": amount(cost.cache_savings_usd),
+        "deepseek_cost_cache_savings_rate": amount(cost.cache_savings_rate),
     }
 
 

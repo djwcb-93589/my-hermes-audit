@@ -35,6 +35,7 @@ from myhermes_audit.contracts import (
     EffectiveSubjectConfiguration,
     TrialIdentity,
 )
+from myhermes_audit.costs import apply_deepseek_costs
 from myhermes_audit.datasets.fixtures import materialize_fixtures
 from myhermes_audit.errors import (
     AuditError,
@@ -204,6 +205,10 @@ class AuditOrchestrator:
                 ) from exc
 
         trials = apply_token_savings(selected, trials)
+        # Cost is deliberately calculated in the parent process from the
+        # canonical TrialRuntimeSummary; pricing never crosses the Worker
+        # boundary.
+        trials = apply_deepseek_costs(suite.defaults.deepseek_pricing, trials)
         comparisons = build_ablation_comparisons(selected, trials)
         case_ids = [case.case_id for case in selected]
         audit_finished = datetime.now(timezone.utc)
@@ -213,6 +218,11 @@ class AuditOrchestrator:
             suite_id=suite.suite_id,
             subject_fingerprint=subject_fingerprint,
             audit_fingerprint=audit_fingerprint,
+            deepseek_pricing_fingerprint=(
+                None
+                if suite.defaults.deepseek_pricing is None
+                else suite.defaults.deepseek_pricing.pricing_fingerprint()
+            ),
             started_at=audit_started,
             finished_at=audit_finished,
             trials=trials,

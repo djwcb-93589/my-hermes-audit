@@ -18,6 +18,7 @@ from myhermes_audit.contracts import (
     TrialResult,
     TrialStatus,
 )
+from myhermes_audit.costs import aggregate_deepseek_costs
 
 
 def aggregate_cases(
@@ -32,6 +33,7 @@ def aggregate_cases(
         passed_count = sum(trial.passed is True for trial in case_trials)
         stats = _aggregate_statistics(case_trials)
         cache = _deepseek_cache_summary(case_trials)
+        cost = aggregate_deepseek_costs(case_trials)
         aggregates.append(
             CaseAggregate(
                 case_id=case_id,
@@ -55,6 +57,19 @@ def aggregate_cases(
                 ),
                 deepseek_cache_trial_coverage_rate=cache.trial_coverage_rate,
                 deepseek_cache=cache,
+                deepseek_cost=cost,
+                deepseek_cost_status=cost.status,
+                deepseek_cost_mean_per_evaluated_trial_usd=(
+                    cost.mean_cost_per_evaluated_trial_usd
+                ),
+                deepseek_cost_mean_per_successful_trial_usd=(
+                    cost.mean_cost_per_successful_trial_usd
+                ),
+                deepseek_cost_effective_cost_per_success_usd=(
+                    cost.effective_cost_per_success_usd
+                ),
+                deepseek_cost_cache_savings_usd=cost.cache_savings_usd,
+                deepseek_cost_coverage_rate=cost.cost_coverage_rate,
             )
         )
     return aggregates
@@ -68,6 +83,7 @@ def aggregate_audit(
     passed_count = sum(trial.passed is True for trial in trials)
     trial_count = len(trials)
     cache = _deepseek_cache_summary(trials)
+    cost = aggregate_deepseek_costs(trials)
     return AuditSummary(
         case_count=len(case_ids),
         trial_count=trial_count,
@@ -124,6 +140,7 @@ def aggregate_audit(
         environment_error_count=stats["environment_error_count"],
         cancelled_count=stats["cancelled_count"],
         deepseek_cache=cache,
+        deepseek_cost=cost,
         metadata=stats["metadata"],
     )
 

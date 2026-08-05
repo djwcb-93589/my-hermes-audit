@@ -88,6 +88,11 @@ P6.2B 的代表性效率、质量和 DeepSeek 缓存指标定义见
 [`docs/p6-2b-metrics.md`](docs/p6-2b-metrics.md)。缓存字段只被动读取
 MyHermes 公共 Observation；本阶段不计算成本，也不把缓存状态作为任务门禁。
 
+P6.3 的显式 DeepSeek USD 定价、Trial/Suite 成本、缓存节省和覆盖率合同见
+[`docs/p6-3-cost-metrics.md`](docs/p6-3-cost-metrics.md)。定价只在 Audit
+配置中声明，由父进程基于 `TrialRuntimeSummary` 计算；缺失定价或事实表示
+`not_evaluated`，不会影响原有任务门禁，也不会进入 Worker。
+
 项目要求 Python 3.13 或更高版本，与 MyHermes 的 `requires-python` 保持一致。基础运行依赖仅有 Pydantic v2 与 PyYAML；Langfuse Python SDK `>=4.14.2,<5` 与 OpenAI Python SDK 均为延迟导入的可选依赖。
 
 ## 已实现

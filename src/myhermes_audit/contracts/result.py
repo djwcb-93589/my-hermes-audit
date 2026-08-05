@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from decimal import Decimal
 from enum import Enum
 from typing import Literal
 
@@ -26,6 +27,11 @@ from myhermes_audit.contracts.common import (
     SafeRelativePath,
     Sha256Digest,
     UtcDatetime,
+)
+from myhermes_audit.contracts.cost import (
+    DeepSeekCostAggregate,
+    DeepSeekCostStatus,
+    DeepSeekCostSummary,
 )
 from myhermes_audit.contracts.ablation import (
     AblationComparisonResult,
@@ -73,8 +79,8 @@ from myhermes_audit.contracts.scenario import (
 from myhermes_audit.serialization import canonical_sha256
 
 
-RESULT_SCHEMA_VERSION = "1.2"
-ResultSchemaVersion = Literal["1.2"]
+RESULT_SCHEMA_VERSION = "1.3"
+ResultSchemaVersion = Literal["1.3"]
 
 
 class TrialStatus(str, Enum):
@@ -603,6 +609,7 @@ class TrialResult(ContractModel):
     duration_ms: NonNegativeInt | None = None
     turns: list[TurnResult] = Field(default_factory=list)
     runtime: TrialRuntimeSummary | None = None
+    deepseek_cost: DeepSeekCostSummary | None = None
     deepseek_cache_evaluated_prompt_tokens: NonNegativeInt | None = None
     observations: TrialObservationSummary | None = None
     memory_query_results: list[MemoryQueryResult] = Field(default_factory=list)
@@ -1007,6 +1014,13 @@ class CaseAggregate(ContractModel):
         default=None, ge=0, le=1
     )
     deepseek_cache: DeepSeekCacheSummary | None = None
+    deepseek_cost: DeepSeekCostAggregate | None = None
+    deepseek_cost_status: DeepSeekCostStatus = DeepSeekCostStatus.NOT_EVALUATED
+    deepseek_cost_mean_per_evaluated_trial_usd: Decimal | None = None
+    deepseek_cost_mean_per_successful_trial_usd: Decimal | None = None
+    deepseek_cost_effective_cost_per_success_usd: Decimal | None = None
+    deepseek_cost_cache_savings_usd: Decimal | None = None
+    deepseek_cost_coverage_rate: Decimal | None = None
 
     @model_validator(mode="after")
     def validate_counts(self) -> "CaseAggregate":
@@ -1057,6 +1071,32 @@ class CaseAggregate(ContractModel):
                 != self.deepseek_cache.trial_coverage_rate
             ):
                 raise ValueError("Case trial coverage must mirror DeepSeek summary")
+        if self.deepseek_cost is not None:
+            if self.deepseek_cost.trial_count != self.trial_count:
+                raise ValueError("Case cost trial count must mirror Case aggregate")
+            if self.deepseek_cost_status is not self.deepseek_cost.status:
+                raise ValueError("Case cost status must mirror DeepSeek aggregate")
+            if self.deepseek_cost_mean_per_evaluated_trial_usd != self.deepseek_cost.mean_cost_per_evaluated_trial_usd:
+                raise ValueError("Case evaluated cost mean must mirror DeepSeek aggregate")
+            if self.deepseek_cost_mean_per_successful_trial_usd != self.deepseek_cost.mean_cost_per_successful_trial_usd:
+                raise ValueError("Case successful cost mean must mirror DeepSeek aggregate")
+            if self.deepseek_cost_effective_cost_per_success_usd != self.deepseek_cost.effective_cost_per_success_usd:
+                raise ValueError("Case effective cost must mirror DeepSeek aggregate")
+            if self.deepseek_cost_cache_savings_usd != self.deepseek_cost.cache_savings_usd:
+                raise ValueError("Case cost savings must mirror DeepSeek aggregate")
+            if self.deepseek_cost_coverage_rate != self.deepseek_cost.cost_coverage_rate:
+                raise ValueError("Case cost coverage must mirror DeepSeek aggregate")
+        elif self.deepseek_cost_status is not DeepSeekCostStatus.NOT_EVALUATED or any(
+            value is not None
+            for value in (
+                self.deepseek_cost_mean_per_evaluated_trial_usd,
+                self.deepseek_cost_mean_per_successful_trial_usd,
+                self.deepseek_cost_effective_cost_per_success_usd,
+                self.deepseek_cost_cache_savings_usd,
+                self.deepseek_cost_coverage_rate,
+            )
+        ):
+            raise ValueError("Case cost projections require DeepSeek aggregate")
         return self
 
 
@@ -1116,6 +1156,7 @@ class AuditSummary(ContractModel):
     environment_error_count: NonNegativeInt = 0
     cancelled_count: NonNegativeInt = 0
     deepseek_cache: DeepSeekCacheSummary | None = None
+    deepseek_cost: DeepSeekCostAggregate | None = None
     metadata: JsonObject = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -1167,6 +1208,8 @@ class AuditSummary(ContractModel):
             raise ValueError("environment_error_count cannot exceed trial_count")
         if self.cancelled_count > self.trial_count:
             raise ValueError("cancelled_count cannot exceed trial_count")
+        if self.deepseek_cost is not None and self.deepseek_cost.trial_count != self.trial_count:
+            raise ValueError("Summary cost trial count must mirror summary trials")
         return self
 
 
@@ -1178,6 +1221,7 @@ class AuditRunResult(ContractModel):
     suite_id: Identifier
     subject_fingerprint: SubjectFingerprint
     audit_fingerprint: AuditFingerprint
+    deepseek_pricing_fingerprint: Sha256Digest | None = None
     started_at: UtcDatetime
     finished_at: UtcDatetime | None = None
     trials: list[TrialResult] = Field(default_factory=list)
@@ -1238,6 +1282,20 @@ class AuditRunResult(ContractModel):
                 raise ValueError(
                     "P4 Trial identity must match Audit Suite and Subject fingerprints"
                 )
+        cost_fingerprints = {
+            trial.deepseek_cost.pricing_fingerprint
+            for trial in self.trials
+            if trial.deepseek_cost is not None
+            and trial.deepseek_cost.pricing_fingerprint is not None
+        }
+        if len(cost_fingerprints) > 1:
+            raise ValueError("Trials must use one DeepSeek pricing fingerprint")
+        if cost_fingerprints and self.deepseek_pricing_fingerprint != next(
+            iter(cost_fingerprints)
+        ):
+            raise ValueError(
+                "deepseek_pricing_fingerprint must match Trial cost summaries"
+            )
         if set(comparison_case_ids) != p4_case_ids:
             raise ValueError(
                 "ablation comparisons must cover every and only P4 Case"
@@ -1283,6 +1341,9 @@ class AuditRunResult(ContractModel):
             raise ValueError("summary.case_count must match case aggregates")
         if self.summary.trial_count != len(self.trials):
             raise ValueError("summary.trial_count must match trials")
+        if self.summary.deepseek_cost is not None and cost_fingerprints:
+            if self.summary.deepseek_cost.pricing_fingerprint not in cost_fingerprints:
+                raise ValueError("summary cost fingerprint must match Trial costs")
         expected_local_status = (
             LocalExecutionStatus.COMPLETED
             if self.summary.passed_count == self.summary.trial_count

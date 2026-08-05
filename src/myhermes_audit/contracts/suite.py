@@ -43,6 +43,7 @@ from myhermes_audit.contracts.common import (
     SchemaVersion,
     Sha256Digest,
 )
+from myhermes_audit.contracts.cost import DeepSeekPricingConfig
 from myhermes_audit.contracts.data import (
     DataClassification,
     classification_from_metadata,
@@ -113,6 +114,7 @@ class TrialConfig(ContractModel):
     timeout_seconds: PositiveInt = 120
     seed: StrictInt | None = None
     preserve_sandbox: StrictBool = False
+    deepseek_pricing: DeepSeekPricingConfig | None = None
     metadata: JsonObject = Field(
         default_factory=lambda: {
             "data_classification": DataClassification.INTERNAL.value,

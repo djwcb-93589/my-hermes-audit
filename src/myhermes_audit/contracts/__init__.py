@@ -74,6 +74,12 @@ from myhermes_audit.contracts.background_review import (
     SkillSource,
 )
 from myhermes_audit.contracts.fingerprint import AuditFingerprint, SubjectFingerprint
+from myhermes_audit.contracts.cost import (
+    DeepSeekCostAggregate,
+    DeepSeekCostStatus,
+    DeepSeekCostSummary,
+    DeepSeekPricingConfig,
+)
 from myhermes_audit.contracts.data import DataClassification
 from myhermes_audit.contracts.judge import (
     JUDGE_PROMPT_VERSION,
@@ -278,6 +284,10 @@ __all__ = (
     "CaseAggregate",
     "DeepSeekCacheStatus",
     "DeepSeekCacheSummary",
+    "DeepSeekCostAggregate",
+    "DeepSeekCostStatus",
+    "DeepSeekCostSummary",
+    "DeepSeekPricingConfig",
     "CaseInput",
     "CaseMode",
     "DataClassification",
