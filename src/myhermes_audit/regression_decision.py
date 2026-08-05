@@ -129,6 +129,29 @@ class ReportDecisionResult:
     reason: str | None = None
 
 
+class MetricRole(str, Enum):
+    """Whether a Metric contributes to core Report comparability."""
+
+    CORE = "core"
+    LOCAL = "local"
+
+
+COMPARABLE_DECISION_VALUES = frozenset(
+    {
+        DecisionValue.IMPROVED.value,
+        DecisionValue.UNCHANGED.value,
+        DecisionValue.WARNING.value,
+        DecisionValue.REGRESSED.value,
+    }
+)
+
+
+@dataclass(frozen=True)
+class ComparableMetricCounts:
+    comparable_core_metric_count: int
+    comparable_local_metric_count: int
+
+
 @dataclass(frozen=True)
 class ReportComparabilityFacts:
     """Final Report reason projection after all Metric facts are verified."""
@@ -209,6 +232,45 @@ def resolve_metric_policy(
     )
 
 
+def derive_metric_role(policy: MetricPolicyFacts) -> MetricRole:
+    """Classify one Metric from its already-resolved effective policy."""
+
+    if not isinstance(policy, MetricPolicyFacts):
+        raise TypeError("Metric role requires resolved policy facts")
+    return (
+        MetricRole.LOCAL
+        if policy.requires_pricing_match
+        else MetricRole.CORE
+    )
+
+
+def count_comparable_metric_roles(
+    decisions: Sequence[DecisionValue | str],
+    roles: Sequence[MetricRole | str],
+) -> ComparableMetricCounts:
+    """Count comparable decisions by the effective Metric role."""
+
+    if len(decisions) != len(roles):
+        raise ValueError("Metric decisions and roles must have equal lengths")
+    core = 0
+    local = 0
+    for decision, role in zip(decisions, roles):
+        decision_value = decision.value if isinstance(decision, Enum) else str(decision)
+        role_value = role.value if isinstance(role, MetricRole) else str(role)
+        if role_value not in {item.value for item in MetricRole}:
+            raise ValueError("unknown Metric role")
+        if decision_value not in COMPARABLE_DECISION_VALUES:
+            continue
+        if role_value == MetricRole.CORE.value:
+            core += 1
+        else:
+            local += 1
+    return ComparableMetricCounts(
+        comparable_core_metric_count=core,
+        comparable_local_metric_count=local,
+    )
+
+
 def derive_pricing_comparability_reason(
     requires_pricing_match: bool,
     baseline_pricing_fingerprint: str | None,
@@ -228,10 +290,13 @@ def derive_pricing_comparability_reason(
 def finalize_report_comparability_reasons(
     base_reasons: Sequence[str],
     pricing_reasons: Sequence[str],
-    comparable_metric_count: int,
+    comparable_core_metric_count: int,
+    comparable_local_metric_count: int = 0,
 ) -> ReportComparabilityFacts:
     """Finalize Report reasons only after all effective Metric decisions exist."""
 
+    if comparable_core_metric_count < 0 or comparable_local_metric_count < 0:
+        raise ValueError("comparable Metric counts cannot be negative")
     allowed = REASON_CODES | {"no_comparable_core_metrics"}
     if any(reason not in allowed for reason in base_reasons):
         raise ValueError("unknown Report comparability reason")
@@ -250,15 +315,20 @@ def finalize_report_comparability_reasons(
     if any(reason not in PRICING_REASON_CODES for reason in pricing):
         raise ValueError("unknown pricing comparability reason")
     reasons = base.union(pricing)
-    if comparable_metric_count == 0:
+    core_reasons = tuple(
+        reason
+        for reason in sorted(base)
+        if reason not in PRICING_REASON_CODES
+    )
+    if not core_reasons and comparable_core_metric_count == 0:
         reasons.add("no_comparable_core_metrics")
     final_reasons = tuple(sorted(reasons))
-    core_reasons = tuple(
+    final_core_reasons = tuple(
         reason for reason in final_reasons if reason not in PRICING_REASON_CODES
     )
     return ReportComparabilityFacts(
         reasons=final_reasons,
-        core_reasons=core_reasons,
+        core_reasons=final_core_reasons,
         pricing_reasons=pricing,
     )
 
@@ -576,13 +646,13 @@ def decide_report_status(
     *,
     regression_count: int,
     warning_count: int,
-    comparable_metric_count: int,
+    comparable_core_metric_count: int,
     core_reason_count: int,
     warning_fails_gate: bool = False,
 ) -> ReportDecisionResult:
     """Derive report status and gate from counts, not persisted conclusions."""
 
-    if core_reason_count or comparable_metric_count == 0:
+    if core_reason_count or comparable_core_metric_count == 0:
         return ReportDecisionResult(
             "not_comparable",
             False,
@@ -601,6 +671,8 @@ def decide_report_status(
 
 __all__ = (
     "CaseDecisionResult",
+    "ComparableMetricCounts",
+    "COMPARABLE_DECISION_VALUES",
     "COMPARABILITY_REASON_CODES",
     "ComparabilityStatus",
     "DecisionValue",
@@ -609,6 +681,7 @@ __all__ = (
     "EvaluationStatus",
     "MetricEvaluationFacts",
     "MetricEvaluationInput",
+    "MetricRole",
     "MetricPolicyFacts",
     "MetricDecisionInput",
     "MetricDecisionResult",
@@ -623,7 +696,9 @@ __all__ = (
     "decide_report_status",
     "derive_comparability_reason_codes",
     "derive_metric_evaluation_facts",
+    "derive_metric_role",
     "derive_pricing_comparability_reason",
+    "count_comparable_metric_roles",
     "finalize_report_comparability_reasons",
     "resolve_metric_policy",
 )

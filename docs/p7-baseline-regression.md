@@ -91,7 +91,7 @@ Memory text, Review evidence正文, user identity, or local absolute paths.
 
 ## Comparability
 
-`AuditRegressionReport` is `regression-v7` and reports structured reasons when
+`AuditRegressionReport` is `regression-v8` and reports structured reasons when
 comparison is not valid. Core correctness comparison requires the same Suite
 ID, semantic Suite digest, ordered Case set, Result Schema identity, metric
 contract, Worker Protocol, model identity, and configuration identity. Each
@@ -123,6 +123,15 @@ flag; it does not use the metric prefix for mode, direction, or thresholds. An
 explicit custom policy can require pricing identity for any metric. A pricing
 mismatch remains local to metrics whose effective fact is true.
 
+Metric roles are derived only from the effective Policy snapshot: an effective
+`requires_pricing_match=false` policy makes a Metric `core`, while
+`requires_pricing_match=true` makes it `local`. This includes both the fixed
+DeepSeek cost family and explicitly pricing-sensitive custom Metrics. The
+comparison engine and strict validator use the same pure role and count
+helpers. Reports persist `comparable_core_metric_count` and
+`comparable_local_metric_count`; comparable decisions are `improved`,
+`unchanged`, `warning`, or `regressed`.
+
 Metric evaluation is a one-way chain: raw baseline/current values and sample
 counts first derive `evaluation_status`; independent `comparability_fact_codes`
 and applicable pricing facts then derive `comparability_status` and the exact
@@ -137,10 +146,15 @@ masks the former.
 
 Report reasons are finalized only after effective Metric policies,
 evaluation/comparability facts, and Metric decisions have been re-derived.
-`no_comparable_core_metrics` is added only when every core Metric is
-`not_evaluated` or `not_comparable`; a pricing-only local failure never adds
-that core reason when another core Metric is comparable. The generator and
-strict reload validator share the same pricing-reason and final-reason helpers.
+`no_comparable_core_metrics` is added only when there is no more-specific core
+identity/contract reason and `comparable_core_metric_count == 0` (therefore
+every core Metric is `not_evaluated` or `not_comparable`). A pricing-only local
+failure never adds that core reason when another core Metric is comparable.
+Local Metrics may retain evaluated decisions even when the Report is
+`not_comparable` because no core Metric is comparable; those decisions are
+diagnostic and cannot make the overall gate pass. The generator and strict
+reload validator share the same role, count, pricing-reason, and final-reason
+helpers.
 
 The complete report contains an immutable `RegressionPolicySnapshot` with the
 policy schema version, default mode, sorted explicit metric entries, and a
@@ -206,8 +220,9 @@ failure (for example 5/5), without naming a special Case rule.
 Case decisions use one shared precedence: hard regression, warning, improvement,
 unchanged, all-not-comparable, then all-not-evaluated. Mixed unavailable
 states receive a stable reason code. A report is `not_comparable` when no core
-metric is comparable, even if no identity mismatch exists; `passed` requires at
-least one comparable metric.
+Metric is comparable, even if no identity mismatch exists; `passed` requires
+at least one comparable core Metric. Local pricing-sensitive decisions remain
+visible as diagnostics and cannot establish the Report gate.
 
 ## CLI, console, and JSON
 
@@ -252,7 +267,9 @@ outside the safe contract are excluded.
 
 ## Versioning and scope
 
-Baseline and Regression contracts are `baseline-v5` and `regression-v7`.
+Baseline and Regression contracts are `baseline-v5` and `regression-v8`.
+The v8 Report requires both comparable core/local count fields and an explicit
+`schema_version`; v7 Reports or payloads missing these fields are rejected.
 P7 adds the
 semantic Suite comparison digest to `AuditFingerprint`, so the Audit Result
 Schema is `1.6`; Worker Protocol remains v13. Existing Trial and evaluator

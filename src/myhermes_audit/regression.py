@@ -52,11 +52,13 @@ from myhermes_audit.regression_decision import (
     MetricEvaluationInput,
     MetricPolicyFacts,
     PolicySnapshotFacts,
+    count_comparable_metric_roles,
     decide_case_regression,
     decide_metric_comparison,
     decide_report_status,
     derive_comparability_reason_codes,
     derive_metric_evaluation_facts,
+    derive_metric_role,
     derive_pricing_comparability_reason,
     finalize_report_comparability_reasons,
     resolve_metric_policy,
@@ -887,19 +889,13 @@ def compare_baseline(
         *suite_metrics,
         *(metric for case in case_reports for metric in case.metrics),
     ]
-    comparable_metric_count = sum(
-        derive_metric_decision(
-            item,
-            resolve_metric_policy(item.metric_name, policy_facts),
-        ).value
-        in {
-            MetricDecision.IMPROVED.value,
-            MetricDecision.UNCHANGED.value,
-            MetricDecision.REGRESSED.value,
-            MetricDecision.WARNING.value,
-        }
-        for item in all_metrics
-    )
+    metric_decisions = []
+    metric_roles = []
+    for item in all_metrics:
+        effective_policy = resolve_metric_policy(item.metric_name, policy_facts)
+        metric_decisions.append(derive_metric_decision(item, effective_policy))
+        metric_roles.append(derive_metric_role(effective_policy))
+    comparable_counts = count_comparable_metric_roles(metric_decisions, metric_roles)
     report_comparability = finalize_report_comparability_reasons(
         reasons,
         [
@@ -913,7 +909,8 @@ def compare_baseline(
                 )
             ) is not None
         ],
-        comparable_metric_count,
+        comparable_counts.comparable_core_metric_count,
+        comparable_counts.comparable_local_metric_count,
     )
     reasons = list(report_comparability.reasons)
     pricing_applicability_fingerprint_value = pricing_applicability_fingerprint(
@@ -925,7 +922,7 @@ def compare_baseline(
     report_decision = decide_report_status(
         regression_count=counts["regression_count"],
         warning_count=counts["warning_count"],
-        comparable_metric_count=comparable_metric_count,
+        comparable_core_metric_count=comparable_counts.comparable_core_metric_count,
         core_reason_count=len(core_reasons),
     )
     status = RegressionStatus(report_decision.status)
@@ -999,6 +996,8 @@ def compare_baseline(
         suite_metrics=suite_metrics,
         case_summaries=case_reports,
         **counts,
+        comparable_core_metric_count=comparable_counts.comparable_core_metric_count,
+        comparable_local_metric_count=comparable_counts.comparable_local_metric_count,
         overall_regression_gate=report_decision.gate,
         warnings=warnings,
     )

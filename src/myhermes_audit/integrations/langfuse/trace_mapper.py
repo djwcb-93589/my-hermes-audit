@@ -10,6 +10,7 @@ from myhermes_audit.contracts import MemorySnapshotPhase, MetricSource, MetricSt
 from myhermes_audit.contracts.regression import AuditRegressionReport
 from myhermes_audit.integrations.langfuse.redaction import project_remote_content
 from myhermes_audit.ports.langfuse import LangfuseTrialRequest
+from myhermes_audit.regression_decision import derive_metric_role, resolve_metric_policy
 
 
 TRACE_NAME = "myhermes.audit.trial"
@@ -1040,6 +1041,7 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
     to IDs, statuses, counts, deltas, safe policy facts, and failure codes.
     """
 
+    policy_facts = report.regression_policy.to_facts()
     return {
         "baseline_id": report.baseline_id,
         "current_run_id": report.current_run_id,
@@ -1073,6 +1075,8 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
         "warning_count": report.warning_count,
         "not_comparable_count": report.not_comparable_count,
         "not_evaluated_count": report.not_evaluated_count,
+        "comparable_core_metric_count": report.comparable_core_metric_count,
+        "comparable_local_metric_count": report.comparable_local_metric_count,
         "overall_regression_gate": report.overall_regression_gate,
         "case_task_success": {
             item.case_id: {
@@ -1100,6 +1104,9 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
                 "current_sample_count": item.current_sample_count,
                 "evaluation_status": item.evaluation_status.value,
                 "comparability_status": item.comparability_status.value,
+                "role": derive_metric_role(
+                    resolve_metric_policy(item.metric_name, policy_facts)
+                ).value,
                 "requires_pricing_match": item.requires_pricing_match,
                 "policy_mode": item.policy_mode.value,
                 "direction": item.direction.value,

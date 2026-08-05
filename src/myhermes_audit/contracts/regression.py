@@ -43,11 +43,13 @@ from myhermes_audit.regression_decision import (
     PolicyEntryFacts,
     PolicySnapshotFacts,
     PRICING_REASON_CODES,
+    count_comparable_metric_roles,
     decide_case_regression,
     decide_metric_comparison,
     decide_report_status,
     derive_comparability_reason_codes,
     derive_metric_evaluation_facts,
+    derive_metric_role,
     derive_pricing_comparability_reason,
     finalize_report_comparability_reasons,
     resolve_metric_policy,
@@ -55,12 +57,12 @@ from myhermes_audit.regression_decision import (
 
 
 BASELINE_SCHEMA_VERSION = "baseline-v5"
-REGRESSION_SCHEMA_VERSION = "regression-v7"
+REGRESSION_SCHEMA_VERSION = "regression-v8"
 REGRESSION_POLICY_SCHEMA_VERSION = "regression-policy-v1"
 METRIC_CONTRACT_VERSION = "p7-metrics-v1"
 
 BaselineSchemaVersion = Literal["baseline-v5"]
-RegressionSchemaVersion = Literal["regression-v7"]
+RegressionSchemaVersion = Literal["regression-v8"]
 RegressionPolicySchemaVersion = Literal["regression-policy-v1"]
 MetricNumber = StrictInt | StrictFloat | Decimal
 
@@ -931,6 +933,8 @@ class AuditRegressionReport(ContractModel):
     warning_count: NonNegativeInt = 0
     not_comparable_count: NonNegativeInt = 0
     not_evaluated_count: NonNegativeInt
+    comparable_core_metric_count: NonNegativeInt
+    comparable_local_metric_count: NonNegativeInt
     overall_regression_gate: StrictBool
     warnings: list[NonEmptyText] = Field(default_factory=list)
 
@@ -1091,19 +1095,17 @@ class AuditRegressionReport(ContractModel):
         for name, expected in expected_counts.items():
             if getattr(self, name) != expected:
                 raise ValueError(f"{name} does not match MetricComparison decisions")
-        comparable_metric_count = sum(
-            derive_metric_decision(
-                item,
-                resolve_metric_policy(item.metric_name, policy_facts),
-            ).value
-            in {
-                MetricDecision.IMPROVED.value,
-                MetricDecision.UNCHANGED.value,
-                MetricDecision.REGRESSED.value,
-                MetricDecision.WARNING.value,
-            }
-            for item in all_metrics
-        )
+        metric_decisions = []
+        metric_roles = []
+        for item in all_metrics:
+            effective_policy = resolve_metric_policy(item.metric_name, policy_facts)
+            metric_decisions.append(derive_metric_decision(item, effective_policy))
+            metric_roles.append(derive_metric_role(effective_policy))
+        comparable_counts = count_comparable_metric_roles(metric_decisions, metric_roles)
+        if self.comparable_core_metric_count != comparable_counts.comparable_core_metric_count:
+            raise ValueError("comparable core Metric count does not match derived facts")
+        if self.comparable_local_metric_count != comparable_counts.comparable_local_metric_count:
+            raise ValueError("comparable local Metric count does not match derived facts")
         report_comparability = finalize_report_comparability_reasons(
             expected_reasons,
             [
@@ -1117,7 +1119,8 @@ class AuditRegressionReport(ContractModel):
                     )
                 ) is not None
             ],
-            comparable_metric_count,
+            comparable_counts.comparable_core_metric_count,
+            comparable_counts.comparable_local_metric_count,
         )
         expected_reasons = list(report_comparability.reasons)
         saved_reasons = list(self.comparability_reasons)
@@ -1142,21 +1145,11 @@ class AuditRegressionReport(ContractModel):
         expected_status = decide_report_status(
             regression_count=expected_counts["regression_count"],
             warning_count=expected_counts["warning_count"],
-            comparable_metric_count=comparable_metric_count,
+            comparable_core_metric_count=comparable_counts.comparable_core_metric_count,
             core_reason_count=len(report_comparability.core_reasons),
         )
         if self.status.value != expected_status.status or self.overall_regression_gate != expected_status.gate:
             raise ValueError("report status or gate does not match the decision helper")
-        if self.status is RegressionStatus.NOT_COMPARABLE and any(
-            expected_counts[name]
-            for name in (
-                "regression_count",
-                "warning_count",
-                "improvement_count",
-                "unchanged_count",
-            )
-        ):
-            raise ValueError("not-comparable reports cannot carry evaluated decisions")
         if not report_comparability.core_reasons and self.status is RegressionStatus.NOT_COMPARABLE:
             raise ValueError("not-comparable status requires a core reason")
         return self

@@ -8,6 +8,7 @@ from myhermes_audit.contracts import (
     TrialStatus,
 )
 from myhermes_audit.contracts.regression import AuditRegressionReport
+from myhermes_audit.regression_decision import derive_metric_role, resolve_metric_policy
 
 
 def render_console_summary(result: AuditRunResult) -> str:
@@ -412,6 +413,7 @@ def _ablation_summary(result: AuditRunResult) -> list[str]:
 def render_console_regression(report: AuditRegressionReport) -> str:
     """Render baseline/current/delta facts, not a weighted summary score."""
 
+    policy_facts = report.regression_policy.to_facts()
     lines = [
         "P7 Regression comparison",
         f"Status:              {report.status.value}",
@@ -434,6 +436,8 @@ def render_console_regression(report: AuditRegressionReport) -> str:
         f"warning={report.warning_count} "
         f"not_comparable={report.not_comparable_count}",
         f"not_evaluated={report.not_evaluated_count}",
+        f"Comparable core Metrics: {report.comparable_core_metric_count}",
+        f"Comparable local Metrics: {report.comparable_local_metric_count}",
         "Suite task success:  "
         f"{report.baseline_total_trial_count} trials, "
         f"{report.baseline_suite_task_success_sample_count}/"
@@ -458,6 +462,8 @@ def render_console_regression(report: AuditRegressionReport) -> str:
             f"thresholds=(drop={metric.max_absolute_drop!r}, "
             f"relative_increase={metric.max_relative_increase!r}, "
             f"absolute_increase={metric.max_absolute_increase!r}) "
+            "role="
+            f"{derive_metric_role(resolve_metric_policy(metric.metric_name, policy_facts)).value} "
             f"requires_pricing_match={metric.requires_pricing_match} "
             f"pricing_reason={_pricing_reason(metric)} "
             f"decision={metric.decision.value} "
