@@ -37,7 +37,7 @@ Missing runtime model identity yields `not_evaluated`; a present but different
 identifier yields `invalid` with the safe warning
 `deepseek_pricing_model_mismatch` and no monetary totals.
 
-The result schema is `1.4`; older reports without cost fields or pricing
+The result schema is `1.5`; older reports without cost fields or pricing
 snapshots are legacy data
 and are never backfilled or interpreted as zero.
 
@@ -54,8 +54,9 @@ negative/non-finite calculations are `invalid` without failing the Trial.
 For `available` Trials, total cost is hit input cost plus miss input cost plus
 completion cost. A no-cache estimate prices every prompt token as a miss.
 Savings is the estimate minus actual total; the savings rate is omitted when
-the denominator is zero. Trial and aggregate contracts revalidate each
-token-by-price component and the savings relation when JSON is loaded. Failed
+the denominator is zero. Trial contracts revalidate each token-by-price
+component; aggregate contracts revalidate only component sums, amount
+subtotals, and the savings relation when JSON is loaded. Failed
 or timed-out Trials with complete costs are
 included in `effective_cost_per_success_usd` (complete Trial costs divided by
 the number of successful Trials), while partial and unevaluated Trials are
@@ -64,9 +65,16 @@ cost is emitted only when the aggregate is fully `available`; incomplete
 coverage never treats unknown cost as zero.
 
 Partial aggregates keep classified component costs and an available-cost
-subtotal only (`available_total_cost_usd`); their complete total, no-cache
-estimate, savings, and effective cost remain `None`. The successful-sample
-mean is backed by its explicit evaluated-success count and subtotal.
+subtotal only (`available_total_cost_usd`), plus available-only estimate and
+savings subtotals; their complete total, no-cache estimate, savings, and
+effective cost remain `None`. Aggregate money is the sum of already-quantized
+Trial money fields; it is never recomputed from aggregate Token totals. The
+successful-sample mean is backed by its explicit evaluated-success count and
+subtotal.
+
+When a result is loaded, the Case and Suite aggregates are recomputed from
+their selected Trial cost summaries and must match the serialized aggregates;
+an internally self-consistent but Trial-inconsistent aggregate is rejected.
 
 Suite and Case projections reuse the same aggregation component. Coverage is
 `available_trial_count / token_bearing_trial_count`; an empty denominator is

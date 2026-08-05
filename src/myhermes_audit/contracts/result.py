@@ -79,8 +79,8 @@ from myhermes_audit.contracts.scenario import (
 from myhermes_audit.serialization import canonical_sha256
 
 
-RESULT_SCHEMA_VERSION = "1.4"
-ResultSchemaVersion = Literal["1.4"]
+RESULT_SCHEMA_VERSION = "1.5"
+ResultSchemaVersion = Literal["1.5"]
 
 
 class TrialStatus(str, Enum):
@@ -1346,6 +1346,23 @@ class AuditRunResult(ContractModel):
             raise ValueError("summary.case_count must match case aggregates")
         if self.summary.trial_count != len(self.trials):
             raise ValueError("summary.trial_count must match trials")
+        from myhermes_audit.costs import aggregate_deepseek_costs
+
+        expected_suite_cost = aggregate_deepseek_costs(self.trials)
+        if self.summary.deepseek_cost != expected_suite_cost:
+            raise ValueError("summary cost must be recomputed from Trial costs")
+        expected_case_ids = {trial.case_id for trial in self.trials}
+        if set(case_ids) != expected_case_ids:
+            raise ValueError("case aggregates must cover exactly the Trial Case IDs")
+        for case in self.cases:
+            case_trials = [trial for trial in self.trials if trial.case_id == case.case_id]
+            if case.trial_count != len(case_trials):
+                raise ValueError("Case trial count must match Trial facts")
+            if case.passed_count != sum(trial.passed is True for trial in case_trials):
+                raise ValueError("Case passed count must match Trial facts")
+            expected_case_cost = aggregate_deepseek_costs(case_trials)
+            if case.deepseek_cost != expected_case_cost:
+                raise ValueError("Case cost must be recomputed from Trial costs")
         if self.summary.deepseek_cost is not None and cost_fingerprints:
             if self.summary.deepseek_cost.pricing_fingerprint not in cost_fingerprints:
                 raise ValueError("summary cost fingerprint must match Trial costs")

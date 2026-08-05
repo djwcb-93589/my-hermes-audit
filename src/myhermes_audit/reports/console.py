@@ -217,6 +217,18 @@ def _cost_summary(value) -> str:
         parts.append(
             f"available subtotal USD {_money(value.available_total_cost_usd)}"
         )
+    if (
+        value.available_estimated_cost_without_cache_usd is not None
+        and value.total_cost_usd is None
+    ):
+        parts.append(
+            "available no-cache USD "
+            f"{_money(value.available_estimated_cost_without_cache_usd)}"
+        )
+    if value.available_cache_savings_usd is not None and value.total_cost_usd is None:
+        parts.append(
+            f"available savings USD {_money(value.available_cache_savings_usd)}"
+        )
     if value.mean_cost_per_successful_trial_usd is not None:
         parts.append(
             "evaluated-success mean USD "

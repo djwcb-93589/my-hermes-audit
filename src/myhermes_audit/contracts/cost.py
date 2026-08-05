@@ -411,6 +411,8 @@ class DeepSeekCostAggregate(ContractModel):
     cost_evaluated_success_total_usd: Decimal | None = None
     effective_cost_per_success_usd: Decimal | None = None
     available_total_cost_usd: Decimal | None = None
+    available_estimated_cost_without_cache_usd: Decimal | None = None
+    available_cache_savings_usd: Decimal | None = None
     cost_coverage_rate: Decimal | None = None
     warnings: list[NonEmptyText] = Field(default_factory=list)
 
@@ -427,6 +429,8 @@ class DeepSeekCostAggregate(ContractModel):
         "cost_evaluated_success_total_usd",
         "effective_cost_per_success_usd",
         "available_total_cost_usd",
+        "available_estimated_cost_without_cache_usd",
+        "available_cache_savings_usd",
         mode="before",
     )
     @classmethod
@@ -502,9 +506,14 @@ class DeepSeekCostAggregate(ContractModel):
                 self.prompt_tokens - self.evaluated_prompt_tokens
             ):
                 raise ValueError("aggregate unclassified prompt tokens are inconsistent")
-        if self.cost_coverage_rate is not None:
-            if self.token_bearing_trial_count == 0:
-                raise ValueError("coverage requires token-bearing trials")
+        if self.available_trial_count > self.token_bearing_trial_count:
+            raise ValueError("available trials cannot exceed token-bearing trials")
+        if self.token_bearing_trial_count == 0:
+            if self.cost_coverage_rate is not None:
+                raise ValueError("zero token-bearing trials require no coverage rate")
+        else:
+            if self.cost_coverage_rate is None:
+                raise ValueError("token-bearing trials require a coverage rate")
             expected = Decimal(self.available_trial_count) / Decimal(
                 self.token_bearing_trial_count
             )
@@ -524,31 +533,27 @@ class DeepSeekCostAggregate(ContractModel):
             "cost_evaluated_success_total_usd",
             "effective_cost_per_success_usd",
             "available_total_cost_usd",
+            "available_estimated_cost_without_cache_usd",
+            "available_cache_savings_usd",
         )
         if self.status is DeepSeekCostStatus.INVALID:
-            if any(
-                getattr(self, name) is not None
-                for name in monetary_fields
-            ):
+            if any(getattr(self, name) is not None for name in monetary_fields):
                 raise ValueError("invalid aggregate cannot expose monetary totals")
-        if self.status is DeepSeekCostStatus.NOT_EVALUATED and any(
-            getattr(self, name) is not None
-            for name in monetary_fields
-        ):
-            raise ValueError("not-evaluated aggregate cannot expose totals")
-        if self.status is DeepSeekCostStatus.INVALID:
             if self.invalid_trial_count == 0 and (
                 "inconsistent_pricing_identity" not in self.warnings
             ):
                 raise ValueError("invalid aggregate requires invalid Trials")
         elif self.invalid_trial_count != 0:
             raise ValueError("non-invalid aggregate cannot contain invalid Trials")
-        if self.status is DeepSeekCostStatus.NOT_EVALUATED and (
-            self.available_trial_count
-            or self.partial_trial_count
-            or self.invalid_trial_count
-        ):
-            raise ValueError("not-evaluated aggregate cannot contain evaluated Trials")
+        if self.status is DeepSeekCostStatus.NOT_EVALUATED:
+            if any(getattr(self, name) is not None for name in monetary_fields):
+                raise ValueError("not-evaluated aggregate cannot expose totals")
+            if (
+                self.available_trial_count
+                or self.partial_trial_count
+                or self.invalid_trial_count
+            ):
+                raise ValueError("not-evaluated aggregate cannot contain evaluated Trials")
         if self.status in (
             DeepSeekCostStatus.NOT_EVALUATED,
             DeepSeekCostStatus.INVALID,
@@ -574,76 +579,70 @@ class DeepSeekCostAggregate(ContractModel):
                 )
             ):
                 raise ValueError("partial aggregate cannot expose complete totals")
-            if self.classified_cost_usd is None:
-                raise ValueError("partial aggregate requires classified cost")
             if self.pricing_snapshot is None or any(
                 getattr(self, name) is None
                 for name in (
+                    "prompt_tokens",
                     "prompt_cache_hit_tokens",
                     "prompt_cache_miss_tokens",
                     "evaluated_prompt_tokens",
+                    "unclassified_prompt_tokens",
                     "completion_tokens",
+                    "classified_cost_usd",
                     "cache_hit_input_cost_usd",
                     "cache_miss_input_cost_usd",
                     "completion_cost_usd",
                 )
             ):
-                raise ValueError("partial aggregate requires classified token facts")
+                raise ValueError("partial aggregate requires classified cost facts")
+            expected_classified = _quantized_sum(
+                self.cache_hit_input_cost_usd,
+                self.cache_miss_input_cost_usd,
+                self.completion_cost_usd,
+            )
+            if self.classified_cost_usd != expected_classified:
+                raise ValueError("partial classified cost must equal components")
             if self.available_trial_count == 0:
-                if (
-                    self.available_total_cost_usd is not None
-                    or self.mean_cost_per_evaluated_trial_usd is not None
+                if any(
+                    getattr(self, name) is not None
+                    for name in (
+                        "available_total_cost_usd",
+                        "available_estimated_cost_without_cache_usd",
+                        "available_cache_savings_usd",
+                        "mean_cost_per_evaluated_trial_usd",
+                    )
                 ):
-                    raise ValueError("partial aggregate has no available cost subtotal")
-            elif (
-                self.available_total_cost_usd is None
-                or self.mean_cost_per_evaluated_trial_usd is None
-                or self.mean_cost_per_evaluated_trial_usd
-                != _quantize_money(
+                    raise ValueError("partial aggregate has no available subtotal")
+            else:
+                if any(
+                    getattr(self, name) is None
+                    for name in (
+                        "available_total_cost_usd",
+                        "available_estimated_cost_without_cache_usd",
+                        "available_cache_savings_usd",
+                        "mean_cost_per_evaluated_trial_usd",
+                    )
+                ):
+                    raise ValueError("partial aggregate requires available subtotals")
+                if self.available_cache_savings_usd != _quantize_money(
+                    self.available_estimated_cost_without_cache_usd
+                    - self.available_total_cost_usd
+                ):
+                    raise ValueError("available savings must equal estimate minus total")
+                if self.available_cache_savings_usd < 0:
+                    raise ValueError("available savings cannot be negative")
+                if self.mean_cost_per_evaluated_trial_usd != _quantize_money(
                     self.available_total_cost_usd
                     / Decimal(self.available_trial_count)
-                )
-            ):
-                raise ValueError("available cost mean does not match its subtotal")
-            expected_hit = charge_tokens(
-                self.prompt_cache_hit_tokens,
-                self.pricing_snapshot.prompt_cache_hit_usd_per_million_tokens,
-            )
-            expected_miss = charge_tokens(
-                self.prompt_cache_miss_tokens,
-                self.pricing_snapshot.prompt_cache_miss_usd_per_million_tokens,
-            )
-            expected_completion = charge_tokens(
-                self.completion_tokens,
-                self.pricing_snapshot.completion_usd_per_million_tokens,
-            )
-            if (
-                self.cache_hit_input_cost_usd != expected_hit
-                or self.cache_miss_input_cost_usd != expected_miss
-                or self.completion_cost_usd != expected_completion
-                or self.classified_cost_usd
-                != _quantized_sum(expected_hit, expected_miss, expected_completion)
-            ):
-                raise ValueError("partial aggregate components do not match pricing")
-            if self.cost_evaluated_success_total_usd is not None and (
-                self.cost_evaluated_success_count == 0
-            ):
-                raise ValueError("evaluated success total requires evaluated successes")
+                ):
+                    raise ValueError("evaluated cost mean does not match subtotal")
+                if self.classified_cost_usd < self.available_total_cost_usd:
+                    raise ValueError("classified cost cannot be below available subtotal")
             if self.cost_evaluated_success_count == 0 and (
                 self.mean_cost_per_successful_trial_usd is not None
+                or self.cost_evaluated_success_total_usd is not None
             ):
-                raise ValueError("successful cost mean requires evaluated successes")
-            if (
-                self.cost_evaluated_success_count > 0
-                and self.mean_cost_per_successful_trial_usd is not None
-                and self.cost_evaluated_success_total_usd is not None
-                and self.mean_cost_per_successful_trial_usd
-                != _quantize_money(
-                    self.cost_evaluated_success_total_usd
-                    / Decimal(self.cost_evaluated_success_count)
-                )
-            ):
-                raise ValueError("successful cost mean does not match its facts")
+                raise ValueError("successful cost fields require evaluated successes")
         if self.status is DeepSeekCostStatus.AVAILABLE:
             if (
                 self.available_trial_count == 0
@@ -654,67 +653,49 @@ class DeepSeekCostAggregate(ContractModel):
                 or self.cost_coverage_rate != Decimal("1.00000000")
             ):
                 raise ValueError("available aggregate requires complete Trial coverage")
-            if any(
-                getattr(self, name) is None
-                for name in (
-                    "prompt_tokens",
-                    "prompt_cache_hit_tokens",
-                    "prompt_cache_miss_tokens",
-                    "evaluated_prompt_tokens",
-                    "unclassified_prompt_tokens",
-                    "completion_tokens",
-                    "cache_hit_input_cost_usd",
-                    "cache_miss_input_cost_usd",
-                    "completion_cost_usd",
-                    "total_cost_usd",
-                    "classified_cost_usd",
-                    "estimated_cost_without_cache_usd",
-                    "cache_savings_usd",
-                    "available_total_cost_usd",
-                )
-            ):
-                raise ValueError("available aggregate requires complete totals")
-            if self.pricing_snapshot is None:
-                raise ValueError("available aggregate requires pricing snapshot")
+            if self.cost_evaluated_success_count != self.successful_trial_count:
+                raise ValueError("available successes must all be cost-evaluated")
+            required = (
+                "prompt_tokens",
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
+                "evaluated_prompt_tokens",
+                "unclassified_prompt_tokens",
+                "completion_tokens",
+                "cache_hit_input_cost_usd",
+                "cache_miss_input_cost_usd",
+                "completion_cost_usd",
+                "total_cost_usd",
+                "classified_cost_usd",
+                "estimated_cost_without_cache_usd",
+                "cache_savings_usd",
+                "available_total_cost_usd",
+                "available_estimated_cost_without_cache_usd",
+                "available_cache_savings_usd",
+            )
+            if any(getattr(self, name) is None for name in required):
+                raise ValueError("available aggregate requires complete cost facts")
             if self.evaluated_prompt_tokens != self.prompt_tokens:
                 raise ValueError("available aggregate must classify all prompt tokens")
             if self.unclassified_prompt_tokens != 0:
                 raise ValueError("available aggregate cannot contain unclassified tokens")
-            expected_hit = charge_tokens(
-                self.prompt_cache_hit_tokens,
-                self.pricing_snapshot.prompt_cache_hit_usd_per_million_tokens,
+            expected_classified = _quantized_sum(
+                self.cache_hit_input_cost_usd,
+                self.cache_miss_input_cost_usd,
+                self.completion_cost_usd,
             )
-            expected_miss = charge_tokens(
-                self.prompt_cache_miss_tokens,
-                self.pricing_snapshot.prompt_cache_miss_usd_per_million_tokens,
-            )
-            expected_completion = charge_tokens(
-                self.completion_tokens,
-                self.pricing_snapshot.completion_usd_per_million_tokens,
-            )
-            if (
-                self.cache_hit_input_cost_usd != expected_hit
-                or self.cache_miss_input_cost_usd != expected_miss
-                or self.completion_cost_usd != expected_completion
+            if self.classified_cost_usd != expected_classified:
+                raise ValueError("available classified cost must equal components")
+            if self.total_cost_usd != self.available_total_cost_usd:
+                raise ValueError("available total must equal available subtotal")
+            if self.classified_cost_usd != self.available_total_cost_usd:
+                raise ValueError("available classified cost must equal subtotal")
+            if self.estimated_cost_without_cache_usd != (
+                self.available_estimated_cost_without_cache_usd
             ):
-                raise ValueError("aggregate components do not match tokens and pricing")
-            if self.classified_cost_usd != _quantized_sum(
-                expected_hit, expected_miss, expected_completion
-            ):
-                raise ValueError("aggregate classified cost does not match components")
-            expected_estimated = _quantized_sum(
-                charge_tokens(
-                    self.prompt_tokens,
-                    self.pricing_snapshot.prompt_cache_miss_usd_per_million_tokens,
-                ),
-                expected_completion,
-            )
-            if self.estimated_cost_without_cache_usd != expected_estimated:
-                raise ValueError("aggregate no-cache estimate does not match pricing")
-            if self.total_cost_usd != self.classified_cost_usd:
-                raise ValueError("available aggregate total must equal classified cost")
-            if self.available_total_cost_usd != self.total_cost_usd:
-                raise ValueError("available subtotal must equal total cost")
+                raise ValueError("available estimate must equal available subtotal")
+            if self.cache_savings_usd != self.available_cache_savings_usd:
+                raise ValueError("available savings must equal available subtotal")
             if self.cache_savings_usd != _quantize_money(
                 self.estimated_cost_without_cache_usd - self.total_cost_usd
             ):
@@ -726,6 +707,10 @@ class DeepSeekCostAggregate(ContractModel):
                 self.cache_savings_usd / self.estimated_cost_without_cache_usd
             ):
                 raise ValueError("aggregate savings rate must match savings")
+            if self.mean_cost_per_evaluated_trial_usd != _quantize_money(
+                self.available_total_cost_usd / Decimal(self.available_trial_count)
+            ):
+                raise ValueError("evaluated cost mean does not match subtotal")
             if self.successful_trial_count == 0:
                 if self.effective_cost_per_success_usd is not None:
                     raise ValueError("effective cost requires successful Trials")
@@ -733,39 +718,22 @@ class DeepSeekCostAggregate(ContractModel):
                 self.total_cost_usd / Decimal(self.successful_trial_count)
             ):
                 raise ValueError("effective cost does not match total and successes")
-            if self.mean_cost_per_evaluated_trial_usd != _quantize_money(
-                self.total_cost_usd / Decimal(self.available_trial_count)
-            ):
-                raise ValueError("evaluated cost mean does not match total and count")
-            if self.cost_evaluated_success_count == 0:
-                if self.mean_cost_per_successful_trial_usd is not None:
-                    raise ValueError("successful cost mean requires evaluated successes")
-            elif (
-                self.cost_evaluated_success_total_usd is None
-                or self.mean_cost_per_successful_trial_usd
-                != _quantize_money(
-                    self.cost_evaluated_success_total_usd
-                    / Decimal(self.cost_evaluated_success_count)
-                )
-            ):
-                raise ValueError("successful cost mean does not match its facts")
         if self.cost_evaluated_success_count == 0:
             if (
                 self.mean_cost_per_successful_trial_usd is not None
                 or self.cost_evaluated_success_total_usd is not None
             ):
                 raise ValueError("successful cost fields require evaluated successes")
-        else:
-            if (
-                self.cost_evaluated_success_total_usd is None
-                or self.mean_cost_per_successful_trial_usd is None
-                or self.mean_cost_per_successful_trial_usd
-                != _quantize_money(
-                    self.cost_evaluated_success_total_usd
-                    / Decimal(self.cost_evaluated_success_count)
-                )
-            ):
-                raise ValueError("successful cost mean does not match its facts")
+        elif (
+            self.cost_evaluated_success_total_usd is None
+            or self.mean_cost_per_successful_trial_usd is None
+            or self.mean_cost_per_successful_trial_usd
+            != _quantize_money(
+                self.cost_evaluated_success_total_usd
+                / Decimal(self.cost_evaluated_success_count)
+            )
+        ):
+            raise ValueError("successful cost mean does not match its facts")
         return self
 
 

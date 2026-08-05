@@ -290,8 +290,6 @@ def aggregate_deepseek_costs(
         and cost.status is DeepSeekCostStatus.AVAILABLE
         for trial, cost in zip(trials, costs)
     )
-    base["cost_evaluated_success_count"] = cost_evaluated_success_count
-    base["cost_evaluated_success_total_usd"] = _sum_money(successful_complete)
     base.update(
         prompt_tokens=_sum_int(evaluated_costs, "prompt_tokens"),
         prompt_cache_hit_tokens=_sum_int(
@@ -319,43 +317,57 @@ def aggregate_deepseek_costs(
     )
     complete_total = _sum_money(cost.total_cost_usd for cost in complete_costs)
     classified_total = _sum_money(classified_costs)
-    mean_evaluated = _mean_money(cost.total_cost_usd for cost in complete_costs)
-    mean_successful = _mean_money(successful_complete)
+    available_estimated = _sum_money(
+        cost.estimated_cost_without_cache_usd
+        for cost in complete_costs
+        if cost.estimated_cost_without_cache_usd is not None
+    )
+    available_savings = _sum_money(
+        cost.cache_savings_usd
+        for cost in complete_costs
+        if cost.cache_savings_usd is not None
+    )
     successful_complete_total = _sum_money(successful_complete)
     base["cost_evaluated_success_count"] = cost_evaluated_success_count
     base["cost_evaluated_success_total_usd"] = successful_complete_total
     base["available_total_cost_usd"] = complete_total
-    effective = (
-        None
-        if successful_count == 0 or complete_total is None
-        else quantize_money(complete_total / Decimal(successful_count))
-    )
+    base["available_estimated_cost_without_cache_usd"] = available_estimated
+    base["available_cache_savings_usd"] = available_savings
     status = (
         DeepSeekCostStatus.AVAILABLE
         if not partial_count and not not_evaluated_count and available_count == token_bearing_count
         else DeepSeekCostStatus.PARTIAL
     )
     base["status"] = status
-    estimated = _sum_money(
-        cost.estimated_cost_without_cache_usd
-        for cost in complete_costs
-        if cost.estimated_cost_without_cache_usd is not None
-    )
-    savings = _sum_money(
-        cost.cache_savings_usd
-        for cost in complete_costs
-        if cost.cache_savings_usd is not None
-    )
     if status is DeepSeekCostStatus.AVAILABLE:
         total = complete_total
+        estimated = available_estimated
+        savings = available_savings
         rate = (
             None
             if estimated in (None, Decimal("0")) or savings is None
             else quantize_rate(savings / estimated)
         )
+        effective = (
+            None
+            if successful_count == 0 or complete_total is None
+            else quantize_money(complete_total / Decimal(successful_count))
+        )
     else:
         total = estimated = savings = rate = None
         effective = None
+    mean_evaluated = (
+        None
+        if complete_total is None
+        else quantize_money(complete_total / Decimal(available_count))
+    )
+    mean_successful = (
+        None
+        if successful_complete_total is None
+        else quantize_money(
+            successful_complete_total / Decimal(cost_evaluated_success_count)
+        )
+    )
     return DeepSeekCostAggregate(
         **base,
         total_cost_usd=total,
@@ -487,11 +499,6 @@ def _sum_int(costs, field_name: str) -> int | None:
         return None
     values = [getattr(cost, field_name) for cost in costs]
     return None if any(value is None for value in values) else sum(values)
-
-
-def _mean_money(values) -> Decimal | None:
-    values = [value for value in values if value is not None]
-    return None if not values else quantize_money(sum(values) / Decimal(len(values)))
 
 
 __all__ = (

@@ -6,7 +6,7 @@ Schema v1 新增严格 `MemoryMode`、`CompressionMode`（仅 `threshold_disable
 
 `AuditCase.ablation` 缺失时保持 P0–P3 形状。存在时，Variant/组合/checkpoint/fact ID 必须唯一，reference Variant 和所有 `applicable_variant_ids` 必须可解析，turn/checkpoint 与 Compression event 上下限必须一致。Suite canonical fingerprint自然包含完整计划；P4 Trial identity另含 Variant、Subject commit、配置 fingerprint 与按 Worker 优先级解析的模型标识。`TrialResult` 的 P4 身份字段必须全有或全无，`AuditRunResult.ablation_comparisons` 必须与本地 P4 Trial逐项对应。详见 [P4 文档](p4-memory-compression-ablation.md)。
 
-输入 Suite 合同的 `schema_version` 仍为字符串 `"1.0"`；P6.3.1 的顶层 `AuditRunResult` 使用严格的结果版本 `"1.4"`，以标记代表性效率指标、DeepSeek 缓存汇总、evaluated prompt Token、定价快照、可验证成本小计和成本/节省字段。每个公共 Pydantic 合同都继承该字段，顶层 `AuditSuite` 与 `AuditRunResult` 要求调用方显式提供各自版本。所有合同拒绝未知字段，并对可变默认值使用工厂。枚举值和 ID 使用稳定英文标识；时间必须带时区，进入合同后规范化为 UTC。
+输入 Suite 合同的 `schema_version` 仍为字符串 `"1.0"`；P6.3.2 的顶层 `AuditRunResult` 使用严格的结果版本 `"1.5"`，以标记代表性效率指标、DeepSeek 缓存汇总、evaluated prompt Token、定价快照、Trial 绑定的成本小计和成本/节省字段。每个公共 Pydantic 合同都继承该字段，顶层 `AuditSuite` 与 `AuditRunResult` 要求调用方显式提供各自版本。所有合同拒绝未知字段，并对可变默认值使用工厂。枚举值和 ID 使用稳定英文标识；时间必须带时区，进入合同后规范化为 UTC。
 
 ## AuditSuite 与 AuditCase
 
