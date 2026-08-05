@@ -1091,8 +1091,11 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
                 "relative_delta": item.relative_delta,
                 "baseline_sample_count": item.baseline_sample_count,
                 "current_sample_count": item.current_sample_count,
+                "evaluation_status": item.evaluation_status.value,
+                "comparability_status": item.comparability_status.value,
                 "decision": item.decision.value,
                 "reason": item.reason,
+                "reason_codes": list(item.reason_codes),
             }
             for item in report.suite_metrics
         ],

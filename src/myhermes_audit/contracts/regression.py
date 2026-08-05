@@ -33,20 +33,27 @@ from myhermes_audit.contracts.result import (
 )
 from myhermes_audit.serialization import canonical_sha256
 from myhermes_audit.regression_decision import (
+    COMPARABILITY_REASON_CODES,
+    ComparabilityStatus,
+    EVALUATION_REASON_CODES,
+    EvaluationStatus,
     MetricDecisionInput,
+    MetricEvaluationInput,
     decide_case_regression,
     decide_metric_comparison,
     decide_report_status,
+    derive_comparability_reason_codes,
+    derive_metric_evaluation_facts,
 )
 
 
-BASELINE_SCHEMA_VERSION = "baseline-v3"
-REGRESSION_SCHEMA_VERSION = "regression-v3"
+BASELINE_SCHEMA_VERSION = "baseline-v4"
+REGRESSION_SCHEMA_VERSION = "regression-v4"
 REGRESSION_POLICY_SCHEMA_VERSION = "regression-policy-v1"
 METRIC_CONTRACT_VERSION = "p7-metrics-v1"
 
-BaselineSchemaVersion = Literal["baseline-v3"]
-RegressionSchemaVersion = Literal["regression-v3"]
+BaselineSchemaVersion = Literal["baseline-v4"]
+RegressionSchemaVersion = Literal["regression-v4"]
 RegressionPolicySchemaVersion = Literal["regression-policy-v1"]
 MetricNumber = StrictInt | StrictFloat | Decimal
 
@@ -456,6 +463,8 @@ class AuditBaseline(ContractModel):
 
 class MetricComparison(ContractModel):
     metric_name: Identifier
+    baseline_metric_present: StrictBool
+    current_metric_present: StrictBool
     baseline_value: MetricNumber | None = None
     current_value: MetricNumber | None = None
     absolute_delta: MetricNumber | None = None
@@ -464,6 +473,9 @@ class MetricComparison(ContractModel):
     current_sample_count: NonNegativeInt = 0
     baseline_denominator: NonNegativeInt | None = None
     current_denominator: NonNegativeInt | None = None
+    evaluation_status: EvaluationStatus
+    comparability_status: ComparabilityStatus
+    reason_codes: list[NonEmptyText] = Field(...)
     decision: MetricDecision
     policy_mode: PolicyMode
     direction: MetricDirection = MetricDirection.NEUTRAL
@@ -500,13 +512,38 @@ class MetricComparison(ContractModel):
 
     @model_validator(mode="after")
     def validate_comparison(self) -> "MetricComparison":
-        if self.reason is not None and (
-            not self.reason.replace("_", "").isalnum()
-            or self.reason.lower() != self.reason
-        ):
-            raise ValueError("comparison reason must be a stable reason code")
-        non_comparable = self.decision is MetricDecision.NOT_COMPARABLE
-        not_evaluated = self.decision is MetricDecision.NOT_EVALUATED
+        if len(self.reason_codes) != len(set(self.reason_codes)):
+            raise ValueError("comparison reason codes must be unique")
+        if self.reason_codes != sorted(self.reason_codes):
+            raise ValueError("comparison reason codes must be sorted")
+        allowed = COMPARABILITY_REASON_CODES | EVALUATION_REASON_CODES
+        if any(reason not in allowed for reason in self.reason_codes):
+            raise ValueError("comparison reason code is not recognized")
+        facts = derive_metric_evaluation_facts(
+            MetricEvaluationInput(
+                metric_name=self.metric_name,
+                baseline_present=self.baseline_metric_present,
+                current_present=self.current_metric_present,
+                baseline_value=self.baseline_value,
+                current_value=self.current_value,
+                baseline_sample_count=self.baseline_sample_count,
+                current_sample_count=self.current_sample_count,
+                comparability_reasons=tuple(
+                    reason
+                    for reason in self.reason_codes
+                    if reason not in EVALUATION_REASON_CODES
+                ),
+            )
+        )
+        if self.evaluation_status is not facts.evaluation_status:
+            raise ValueError("evaluation status is inconsistent with metric facts")
+        if self.comparability_status is not facts.comparability_status:
+            raise ValueError("comparability status is inconsistent with metric facts")
+        if self.reason_codes != list(facts.reason_codes):
+            raise ValueError("comparison reason codes are inconsistent with metric facts")
+        if self.comparability_status is ComparabilityStatus.COMPARABLE and self.reason_codes:
+            raise ValueError("comparable metrics cannot carry comparability reasons")
+        reason_codes = tuple(self.reason_codes)
         expected = decide_metric_comparison(
             MetricDecisionInput(
                 baseline_value=self.baseline_value,
@@ -516,9 +553,9 @@ class MetricComparison(ContractModel):
                 max_absolute_drop=self.max_absolute_drop,
                 max_relative_increase=self.max_relative_increase,
                 max_absolute_increase=self.max_absolute_increase,
-                comparable=not non_comparable,
-                sufficient_samples=not not_evaluated,
-                reason=self.reason,
+                evaluation_status=self.evaluation_status.value,
+                comparability_status=self.comparability_status.value,
+                reason_codes=reason_codes,
             )
         )
         if self.decision.value != expected.decision.value:
@@ -532,16 +569,51 @@ class MetricComparison(ContractModel):
         return self
 
 
+def derive_metric_decision(item: MetricComparison):
+    facts = derive_metric_evaluation_facts(
+        MetricEvaluationInput(
+            metric_name=item.metric_name,
+            baseline_present=item.baseline_metric_present,
+            current_present=item.current_metric_present,
+            baseline_value=item.baseline_value,
+            current_value=item.current_value,
+            baseline_sample_count=item.baseline_sample_count,
+            current_sample_count=item.current_sample_count,
+            comparability_reasons=tuple(
+                reason
+                for reason in item.reason_codes
+                if reason not in EVALUATION_REASON_CODES
+            ),
+        )
+    )
+    return decide_metric_comparison(
+        MetricDecisionInput(
+            baseline_value=item.baseline_value,
+            current_value=item.current_value,
+            direction=item.direction.value,
+            policy_mode=item.policy_mode.value,
+            max_absolute_drop=item.max_absolute_drop,
+            max_relative_increase=item.max_relative_increase,
+            max_absolute_increase=item.max_absolute_increase,
+            evaluation_status=facts.evaluation_status.value,
+            comparability_status=facts.comparability_status.value,
+            reason_codes=facts.reason_codes,
+        )
+    ).decision
+
+
 def metric_decision_counts(metrics: Sequence[MetricComparison]) -> dict[str, int]:
-    """Count decisions from the immutable comparison facts in one place."""
+    """Count freshly derived decisions, never the serialized decision field."""
+
+    decisions = [derive_metric_decision(item) for item in metrics]
 
     return {
-        "regression_count": sum(item.decision is MetricDecision.REGRESSED for item in metrics),
-        "improvement_count": sum(item.decision is MetricDecision.IMPROVED for item in metrics),
-        "unchanged_count": sum(item.decision is MetricDecision.UNCHANGED for item in metrics),
-        "warning_count": sum(item.decision is MetricDecision.WARNING for item in metrics),
-        "not_comparable_count": sum(item.decision is MetricDecision.NOT_COMPARABLE for item in metrics),
-        "not_evaluated_count": sum(item.decision is MetricDecision.NOT_EVALUATED for item in metrics),
+        "regression_count": sum(decision == MetricDecision.REGRESSED.value for decision in decisions),
+        "improvement_count": sum(decision == MetricDecision.IMPROVED.value for decision in decisions),
+        "unchanged_count": sum(decision == MetricDecision.UNCHANGED.value for decision in decisions),
+        "warning_count": sum(decision == MetricDecision.WARNING.value for decision in decisions),
+        "not_comparable_count": sum(decision == MetricDecision.NOT_COMPARABLE.value for decision in decisions),
+        "not_evaluated_count": sum(decision == MetricDecision.NOT_EVALUATED.value for decision in decisions),
     }
 
 
@@ -606,7 +678,7 @@ class CaseRegressionSummary(ContractModel):
         if sum(self.current_background_review_actions.values()) > self.background_review_decision_sample_count:
             raise ValueError("current background review action counts exceed decision samples")
         expected = decide_case_regression(
-            [item.decision.value for item in self.metrics]
+            [derive_metric_decision(item).value for item in self.metrics]
         )
         if self.decision.value != expected.decision.value:
             raise ValueError("Case decision does not match the decision helper")
@@ -630,6 +702,7 @@ class AuditRegressionReport(ContractModel):
     current_run_id: Identifier
     status: RegressionStatus
     comparability_reasons: list[NonEmptyText] = Field(default_factory=list)
+    baseline_suite_id: Identifier
     suite_id: Identifier
     baseline_suite_fingerprint: Sha256Digest
     current_suite_fingerprint: Sha256Digest
@@ -672,6 +745,7 @@ class AuditRegressionReport(ContractModel):
     suite_task_success_rate_delta: StrictFloat | None = Field(...)
     metric_contract_version: NonEmptyText = METRIC_CONTRACT_VERSION
     baseline_metric_contract_version: NonEmptyText = METRIC_CONTRACT_VERSION
+    baseline_result_schema_version: NonEmptyText
     current_result_schema_version: NonEmptyText
     current_worker_protocol_version: NonEmptyText | None = None
     suite_metrics: list[MetricComparison] = Field(default_factory=list)
@@ -719,6 +793,10 @@ class AuditRegressionReport(ContractModel):
             raise ValueError("current Worker Protocol identity is inconsistent")
         if self.current_worker_protocol_identity.status is not IdentityStatus.AVAILABLE and self.current_worker_protocol_version is not None:
             raise ValueError("current ambiguous Worker Protocol cannot expose scalar value")
+        if self.baseline_result_schema_identity.status is IdentityStatus.AVAILABLE and self.baseline_result_schema_identity.value != self.baseline_result_schema_version:
+            raise ValueError("baseline Result Schema identity is inconsistent")
+        if self.baseline_metric_contract_identity.status is IdentityStatus.AVAILABLE and self.baseline_metric_contract_identity.value != self.baseline_metric_contract_version:
+            raise ValueError("baseline metric contract identity is inconsistent")
         for sample, passed, rate, label in (
             (self.baseline_suite_task_success_sample_count, self.baseline_suite_task_success_passed_count, self.baseline_suite_task_success_rate, "baseline"),
             (self.current_suite_task_success_sample_count, self.current_suite_task_success_passed_count, self.current_suite_task_success_rate, "current"),
@@ -742,46 +820,95 @@ class AuditRegressionReport(ContractModel):
         for name, expected in expected_counts.items():
             if getattr(self, name) != expected:
                 raise ValueError(f"{name} does not match MetricComparison decisions")
-        core_reasons = [reason for reason in self.comparability_reasons if reason != "pricing_fingerprint_mismatch"]
-        for name, baseline_identity, current_identity in (
-            ("model", self.baseline_model_identity, self.current_model_identity),
-            ("configuration", self.baseline_configuration_identity, self.current_configuration_identity),
-            ("worker_protocol", self.baseline_worker_protocol_identity, self.current_worker_protocol_identity),
-            ("result_schema", self.baseline_result_schema_identity, self.current_result_schema_identity),
-            ("metric_contract", self.baseline_metric_contract_identity, self.current_metric_contract_identity),
-        ):
-            if baseline_identity.status is IdentityStatus.AMBIGUOUS or current_identity.status is IdentityStatus.AMBIGUOUS:
-                expected_reason = f"{name}_identity_ambiguous"
-            elif baseline_identity.status is IdentityStatus.MISSING or current_identity.status is IdentityStatus.MISSING:
-                expected_reason = f"{name}_identity_missing"
-            elif baseline_identity.value != current_identity.value:
-                expected_reason = f"{name}_identity_mismatch"
-            else:
-                expected_reason = None
-            if expected_reason is not None and expected_reason not in core_reasons:
-                raise ValueError("identity state is missing its comparability reason")
+        expected_reasons = list(
+            derive_comparability_reason_codes(
+                baseline_suite_id=self.baseline_suite_id,
+                current_suite_id=self.suite_id,
+                baseline_suite_fingerprint=self.baseline_suite_fingerprint,
+                current_suite_fingerprint=self.current_suite_fingerprint,
+                baseline_suite_comparison_fingerprint=self.baseline_suite_comparison_fingerprint,
+                current_suite_comparison_fingerprint=self.current_suite_comparison_fingerprint,
+                baseline_case_ids=tuple(self.baseline_declared_trial_counts_by_case),
+                current_case_ids=tuple(self.current_declared_trial_counts_by_case),
+                identities=tuple(
+                    (
+                        name,
+                        baseline_identity.status.value,
+                        baseline_identity.value,
+                        current_identity.status.value,
+                        current_identity.value,
+                    )
+                    for name, baseline_identity, current_identity in (
+                        ("model", self.baseline_model_identity, self.current_model_identity),
+                        ("configuration", self.baseline_configuration_identity, self.current_configuration_identity),
+                        ("worker_protocol", self.baseline_worker_protocol_identity, self.current_worker_protocol_identity),
+                        ("result_schema", self.baseline_result_schema_identity, self.current_result_schema_identity),
+                        ("metric_contract", self.baseline_metric_contract_identity, self.current_metric_contract_identity),
+                    )
+                ),
+                baseline_pricing_fingerprint=self.baseline_pricing_fingerprint,
+                current_pricing_fingerprint=self.current_pricing_fingerprint,
+            )
+        )
         comparable_metric_count = sum(
-            item.decision
+            derive_metric_decision(item).value
             in {
-                MetricDecision.IMPROVED,
-                MetricDecision.UNCHANGED,
-                MetricDecision.REGRESSED,
-                MetricDecision.WARNING,
+                MetricDecision.IMPROVED.value,
+                MetricDecision.UNCHANGED.value,
+                MetricDecision.REGRESSED.value,
+                MetricDecision.WARNING.value,
             }
             for item in all_metrics
         )
+        if comparable_metric_count == 0:
+            expected_reasons.append("no_comparable_core_metrics")
+        expected_reasons = sorted(set(expected_reasons))
+        saved_reasons = list(self.comparability_reasons)
+        if len(saved_reasons) != len(set(saved_reasons)):
+            raise ValueError("comparability reasons must be unique")
+        if sorted(saved_reasons) != expected_reasons:
+            raise ValueError("comparability reasons do not match derived facts")
+        core_reasons = [reason for reason in expected_reasons if reason not in {"pricing_fingerprint_mismatch", "pricing_fingerprint_missing"}]
+        pricing_reason = next(
+            (
+                reason
+                for reason in ("pricing_fingerprint_missing", "pricing_fingerprint_mismatch")
+                if reason in expected_reasons
+            ),
+            None,
+        )
+        for item in all_metrics:
+            applicable_reasons = list(core_reasons)
+            if pricing_reason is not None and item.metric_name.startswith("deepseek_cost_"):
+                applicable_reasons.append(pricing_reason)
+            expected_facts = derive_metric_evaluation_facts(
+                MetricEvaluationInput(
+                    metric_name=item.metric_name,
+                    baseline_present=item.baseline_metric_present,
+                    current_present=item.current_metric_present,
+                    baseline_value=item.baseline_value,
+                    current_value=item.current_value,
+                    baseline_sample_count=item.baseline_sample_count,
+                    current_sample_count=item.current_sample_count,
+                    comparability_reasons=tuple(applicable_reasons),
+                )
+            )
+            if item.evaluation_status is not expected_facts.evaluation_status:
+                raise ValueError("Metric evaluation status does not match report facts")
+            if item.comparability_status is not expected_facts.comparability_status:
+                raise ValueError("Metric comparability status does not match report facts")
+            if item.reason_codes != list(expected_facts.reason_codes):
+                raise ValueError("Metric reason codes do not match report facts")
         expected_status = decide_report_status(
-            regression_count=self.regression_count,
-            warning_count=self.warning_count,
+            regression_count=expected_counts["regression_count"],
+            warning_count=expected_counts["warning_count"],
             comparable_metric_count=comparable_metric_count,
             core_reason_count=len(core_reasons),
             invalid_input=self.status is RegressionStatus.INVALID_INPUT,
         )
         if self.status.value != expected_status.status or self.overall_regression_gate != expected_status.gate:
             raise ValueError("report status or gate does not match the decision helper")
-        if self.status is RegressionStatus.INVALID_INPUT and any(
-            expected_counts.values()
-        ):
+        if self.status is RegressionStatus.INVALID_INPUT and any(expected_counts.values()):
             raise ValueError("invalid input cannot carry a regression conclusion")
         if self.status is RegressionStatus.NOT_COMPARABLE and any(
             expected_counts[name]
@@ -807,7 +934,10 @@ __all__ = (
     "METRIC_CONTRACT_VERSION",
     "MetricAvailability",
     "MetricComparison",
+    "EvaluationStatus",
+    "ComparabilityStatus",
     "metric_decision_counts",
+    "derive_metric_decision",
     "MetricDecision",
     "MetricDirection",
     "MetricSnapshot",

@@ -37,18 +37,23 @@ from myhermes_audit.contracts.regression import (
     MetricDirection,
     MetricSnapshot,
     metric_decision_counts,
+    derive_metric_decision,
     PolicyMode,
     RegressionMetricPolicy,
     RegressionPolicy,
     RegressionStatus,
     METRIC_CONTRACT_VERSION,
+    BASELINE_SCHEMA_VERSION,
 )
 from myhermes_audit.serialization import canonical_sha256
 from myhermes_audit.regression_decision import (
     MetricDecisionInput,
+    MetricEvaluationInput,
     decide_case_regression,
     decide_metric_comparison,
     decide_report_status,
+    derive_comparability_reason_codes,
+    derive_metric_evaluation_facts,
 )
 
 
@@ -566,7 +571,7 @@ def build_baseline(result: AuditRunResult) -> AuditBaseline:
     case_ids = [case.case_id for case in cases]
     declared_per_case, declared_mapping = _declared_trial_mapping(cases)
     baseline_fields = {
-        "schema_version": "baseline-v3",
+        "schema_version": BASELINE_SCHEMA_VERSION,
         "source_run_id": result.run_id,
         "audit_commit": result.audit_fingerprint.audit_commit,
         "subject_commit": result.subject_fingerprint.git_commit,
@@ -626,9 +631,9 @@ def _compare_metric(
     current: MetricSnapshot | None,
     policy: RegressionMetricPolicy,
     *,
-    core_comparable: bool,
     pricing_comparable: bool,
-    reason: str | None = None,
+    pricing_reason: str | None = None,
+    comparability_reasons: Sequence[str] = (),
 ) -> MetricComparison:
     name = (current or baseline).metric_name  # type: ignore[union-attr]
     base_value = None if baseline is None else baseline.value
@@ -655,26 +660,21 @@ def _compare_metric(
         not pricing_comparable
         and (policy.require_pricing_match or name.startswith("deepseek_cost_"))
     )
-    comparable = core_comparable and not pricing_issue
-    baseline_missing = (
-        baseline is None
-        or baseline.availability is MetricAvailability.NOT_EVALUATED
-        or baseline.sample_count == 0
+    facts = derive_metric_evaluation_facts(
+        MetricEvaluationInput(
+            metric_name=name,
+            baseline_present=baseline is not None,
+            current_present=current is not None,
+            baseline_value=base_value,
+            current_value=current_value,
+            baseline_sample_count=base_samples,
+            current_sample_count=current_samples,
+            comparability_reasons=tuple(
+                [*comparability_reasons]
+                + ([pricing_reason or "pricing_fingerprint_mismatch"] if pricing_issue else [])
+            ),
+        )
     )
-    current_missing = (
-        current is None
-        or current.availability is MetricAvailability.NOT_EVALUATED
-        or current.sample_count == 0
-    )
-    sufficient_samples = not baseline_missing and not current_missing
-    if baseline_missing and current_missing:
-        missing_reason = "both_not_evaluated"
-    elif baseline_missing:
-        missing_reason = "baseline_not_evaluated"
-    elif current_missing:
-        missing_reason = "current_not_evaluated"
-    else:
-        missing_reason = None
     decision_result = decide_metric_comparison(
         MetricDecisionInput(
             baseline_value=base_value,
@@ -684,22 +684,18 @@ def _compare_metric(
             max_absolute_drop=policy.max_absolute_drop,
             max_relative_increase=policy.max_relative_increase,
             max_absolute_increase=policy.max_absolute_increase,
-            comparable=comparable,
-            sufficient_samples=sufficient_samples,
-            reason=(
-                reason
-                if not core_comparable
-                else "pricing_fingerprint_mismatch"
-                if pricing_issue
-                else missing_reason
-            ),
+            evaluation_status=facts.evaluation_status.value,
+            comparability_status=facts.comparability_status.value,
+            reason_codes=facts.reason_codes,
         )
     )
-    safe_common = common
-    if not comparable:
-        safe_common = {**common, "baseline_value": None, "current_value": None}
     return MetricComparison(
-        **safe_common,
+        **common,
+        baseline_metric_present=baseline is not None,
+        current_metric_present=current is not None,
+        evaluation_status=facts.evaluation_status,
+        comparability_status=facts.comparability_status,
+        reason_codes=list(facts.reason_codes),
         absolute_delta=decision_result.absolute_delta,
         relative_delta=decision_result.relative_delta,
         decision=MetricDecision(decision_result.decision.value),
@@ -708,13 +704,13 @@ def _compare_metric(
 
 
 def _case_decision(metrics: Sequence[MetricComparison]) -> MetricDecision:
-    result = decide_case_regression([metric.decision.value for metric in metrics])
+    result = decide_case_regression([derive_metric_decision(metric).value for metric in metrics])
     return MetricDecision(result.decision.value)
 
 
 def _case_decision_reason(metrics: Sequence[MetricComparison]) -> str | None:
     return decide_case_regression(
-        [metric.decision.value for metric in metrics]
+        [derive_metric_decision(metric).value for metric in metrics]
     ).reason
 
 
@@ -733,36 +729,55 @@ def compare_baseline(
     current_suite = _benchmark_summary(current, current.trials)
     current_cases = {item.case_id: item for item in _benchmark_cases(current)}
     baseline_cases = {item.case_id: item for item in baseline.case_summaries}
-    reasons: list[str] = []
     current_comparison_fingerprint = current.audit_fingerprint.suite_comparison_sha256
     baseline_comparison_fingerprint = baseline.suite_comparison_fingerprint
-    if baseline.suite_id != current.suite_id:
-        reasons.append("suite_id_mismatch")
-    if baseline_comparison_fingerprint is None or current_comparison_fingerprint is None:
-        if baseline.suite_fingerprint != current.audit_fingerprint.suite_sha256:
-            reasons.append("suite_fingerprint_mismatch")
-    elif baseline_comparison_fingerprint != current_comparison_fingerprint:
-        reasons.append("suite_fingerprint_mismatch")
     baseline_ids = baseline.case_ids
     current_ids = [item.case_id for item in current.cases]
-    if baseline_ids != current_ids:
-        reasons.append("case_set_or_order_mismatch")
     current_identities, identity_warnings = _identity_values(current)
-    for name, old_identity, new_identity in (
-        ("worker_protocol", baseline.worker_protocol_identity, current_identities["worker_protocol"]),
-        ("model", baseline.model_identity, current_identities["model"]),
-        ("configuration", baseline.configuration_identity, current_identities["configuration"]),
-        ("result_schema", baseline.result_schema_identity, current_identities["result_schema"]),
-        ("metric_contract", baseline.metric_contract_identity, current_identities["metric_contract"]),
-    ):
-        identity_reason = _identity_comparison(old_identity, new_identity, name)
-        if identity_reason is not None:
-            reasons.append(identity_reason)
-    pricing_comparable = baseline.pricing_fingerprint == current.deepseek_pricing_fingerprint
-    if not pricing_comparable:
-        reasons.append("pricing_fingerprint_mismatch")
-    core_reasons = [reason for reason in reasons if reason != "pricing_fingerprint_mismatch"]
-    core_comparable = not core_reasons
+    reasons = list(
+        derive_comparability_reason_codes(
+            baseline_suite_id=baseline.suite_id,
+            current_suite_id=current.suite_id,
+            baseline_suite_fingerprint=baseline.suite_fingerprint,
+            current_suite_fingerprint=current.audit_fingerprint.suite_sha256,
+            baseline_suite_comparison_fingerprint=baseline_comparison_fingerprint,
+            current_suite_comparison_fingerprint=current_comparison_fingerprint,
+            baseline_case_ids=baseline_ids,
+            current_case_ids=current_ids,
+            identities=tuple(
+                (
+                    name,
+                    old_identity.status.value,
+                    old_identity.value,
+                    new_identity.status.value,
+                    new_identity.value,
+                )
+                for name, old_identity, new_identity in (
+                    ("worker_protocol", baseline.worker_protocol_identity, current_identities["worker_protocol"]),
+                    ("model", baseline.model_identity, current_identities["model"]),
+                    ("configuration", baseline.configuration_identity, current_identities["configuration"]),
+                    ("result_schema", baseline.result_schema_identity, current_identities["result_schema"]),
+                    ("metric_contract", baseline.metric_contract_identity, current_identities["metric_contract"]),
+                )
+            ),
+            baseline_pricing_fingerprint=baseline.pricing_fingerprint,
+            current_pricing_fingerprint=current.deepseek_pricing_fingerprint,
+        )
+    )
+    pricing_comparable = "pricing_fingerprint_mismatch" not in reasons and "pricing_fingerprint_missing" not in reasons
+    pricing_reason = next(
+        (
+            reason
+            for reason in ("pricing_fingerprint_missing", "pricing_fingerprint_mismatch")
+            if reason in reasons
+        ),
+        None,
+    )
+    core_reasons = [
+        reason
+        for reason in reasons
+        if reason not in {"pricing_fingerprint_mismatch", "pricing_fingerprint_missing"}
+    ]
     policy_metrics = policy.metrics
     default_policy = RegressionMetricPolicy(mode=policy.default_mode)
     suite_metrics: list[MetricComparison] = []
@@ -774,9 +789,9 @@ def compare_baseline(
                 baseline_map.get(name),
                 current_map.get(name),
                 policy_metrics.get(name, default_policy),
-                core_comparable=core_comparable,
                 pricing_comparable=pricing_comparable,
-                reason=(core_reasons[0] if core_reasons else None),
+                pricing_reason=pricing_reason,
+                comparability_reasons=core_reasons,
             )
         )
     case_reports: list[CaseRegressionSummary] = []
@@ -792,9 +807,9 @@ def compare_baseline(
                 old_map.get(name),
                 new_map.get(name),
                 policy_metrics.get(name, default_policy),
-                core_comparable=core_comparable,
                 pricing_comparable=pricing_comparable,
-                reason=(core_reasons[0] if core_reasons else None),
+                pricing_reason=pricing_reason,
+                comparability_reasons=core_reasons,
             )
             for name in sorted(set(old_map) | set(new_map))
         ]
@@ -837,12 +852,12 @@ def compare_baseline(
         )
     counts = _report_counts(suite_metrics, case_reports)
     comparable_metric_count = sum(
-        item.decision
+        derive_metric_decision(item).value
         in {
-            MetricDecision.IMPROVED,
-            MetricDecision.UNCHANGED,
-            MetricDecision.REGRESSED,
-            MetricDecision.WARNING,
+            MetricDecision.IMPROVED.value,
+            MetricDecision.UNCHANGED.value,
+            MetricDecision.REGRESSED.value,
+            MetricDecision.WARNING.value,
         }
         for item in [
             *suite_metrics,
@@ -851,7 +866,11 @@ def compare_baseline(
     )
     if comparable_metric_count == 0:
         reasons.append("no_comparable_core_metrics")
-    core_reasons = [reason for reason in reasons if reason != "pricing_fingerprint_mismatch"]
+    core_reasons = [
+        reason
+        for reason in reasons
+        if reason not in {"pricing_fingerprint_mismatch", "pricing_fingerprint_missing"}
+    ]
     report_decision = decide_report_status(
         regression_count=counts["regression_count"],
         warning_count=counts["warning_count"],
@@ -859,7 +878,7 @@ def compare_baseline(
         core_reason_count=len(core_reasons),
     )
     status = RegressionStatus(report_decision.status)
-    warnings = sorted(set(identity_warnings + (["pricing_fingerprint_mismatch"] if not pricing_comparable else [])))
+    warnings = sorted(set(identity_warnings + ([reason for reason in ("pricing_fingerprint_missing", "pricing_fingerprint_mismatch") if reason in reasons] if not pricing_comparable else [])))
     current_model = _identity_projection(current_identities["model"])
     current_config = _identity_projection(current_identities["configuration"])
     current_protocol = _identity_projection(current_identities["worker_protocol"])
@@ -871,6 +890,7 @@ def compare_baseline(
         current_run_id=current.run_id,
         status=status,
         comparability_reasons=sorted(set(reasons)),
+        baseline_suite_id=baseline.suite_id,
         suite_id=current.suite_id,
         baseline_suite_fingerprint=baseline.suite_fingerprint,
         current_suite_fingerprint=current.audit_fingerprint.suite_sha256,
@@ -916,6 +936,7 @@ def compare_baseline(
             else current_suite.task_success_rate - baseline.suite_summary.task_success_rate
         ),
         baseline_metric_contract_version=baseline.metric_contract_version,
+        baseline_result_schema_version=baseline.result_schema_version,
         current_result_schema_version=current.schema_version,
         current_worker_protocol_version=current_protocol,
         suite_metrics=suite_metrics,

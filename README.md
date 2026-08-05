@@ -56,7 +56,7 @@ money and savings metrics `not_comparable`; other metrics remain comparable.
 P7 task success rates use only explicit boolean `task_passed` samples, with
 sample/passed counts and rates retained for both the Suite and every Case;
 unknown (`None`) values are excluded.  Baseline and Regression contracts are
-versioned independently (`baseline-v3`, `regression-v3`) and retain total
+versioned independently (`baseline-v4`, `regression-v4`) and retain total
 Trial counts separately from declared repeats per Case.  Identity conflicts
 are represented as `ambiguous` and cannot be compared; missing
 identities are represented as `missing` and also cannot satisfy the core

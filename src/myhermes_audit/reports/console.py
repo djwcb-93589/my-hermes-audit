@@ -432,7 +432,10 @@ def render_console_regression(report: AuditRegressionReport) -> str:
             f"- {metric.metric_name}: baseline={metric.baseline_value!r} "
             f"current={metric.current_value!r} delta={metric.absolute_delta!r} "
             f"samples={metric.baseline_sample_count}->{metric.current_sample_count} "
-            f"decision={metric.decision.value}"
+            f"evaluation={metric.evaluation_status.value} "
+            f"comparability={metric.comparability_status.value} "
+            f"decision={metric.decision.value} "
+            f"reasons={','.join(metric.reason_codes) or '<none>'}"
         )
     lines.append("Case changes:")
     for case in report.case_summaries:
