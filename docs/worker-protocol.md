@@ -1,14 +1,17 @@
 # Worker 文件协议
 
-## P5 Worker, P6.1 Worker and P6.2B Worker v12
+## P5 Worker, P6.1 Worker and P6.2B Worker v13
 
-## P6.2B Worker v12
+## P6.2B Worker v13
 
-`myhermes-audit-worker-v12` projects the two exact public DeepSeek cache
-fields, `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens`, through the
+`myhermes-audit-worker-v13` projects the two exact public DeepSeek cache
+fields, `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens`, plus
+`deepseek_cache_evaluated_prompt_tokens`, through the
 Observation Artifact and Worker Result. They are paired, non-negative, require
-`prompt_tokens`, and must sum to it. Missing fields mean that the cache was not
-evaluated; they are never interpreted as zero. A malformed cache pair is
+`prompt_tokens` when available, and hit plus miss must sum to the evaluated
+prompt total. `available` additionally requires that evaluated prompt total to
+equal the Trial's complete prompt total. Missing fields mean that the cache was
+not evaluated; they are never interpreted as zero. A malformed cache pair is
 isolated as a structured warning while ordinary prompt/completion/total token
 facts remain usable. No provider is inferred and the generic `cached_tokens`
 diagnostic is not used as a source.
@@ -66,12 +69,12 @@ successful or invalid. A complete timestamp set with an invalid order is
 `INVALID` and contributes a Scenario error; an unavailable span is diagnostic
 only and is not added to Scenario or Process error collections.
 
-Current default: `myhermes-audit-worker-v12`; v11 is the declared legacy
+Current default: `myhermes-audit-worker-v13`; v12 is the declared legacy
 version and is not silently accepted. P6.1 timing fields use the
 explicit observation-span, hook-span, hard-watchdog, and remaining-budget
 semantics above; v10 is legacy and is not accepted by the current parent.
 
-默认协议升级为 `myhermes-audit-worker-v12`。P5 request/result、P6.1 scenario Artifact 必须使用 v12，父子进程会严格拒绝 v11 或其他不兼容版本及不完整的 Artifact 引用。v12 额外携带 DeepSeek 公共缓存 hit/miss token 的成对事实和局部非法诊断；缺失表示不可评估，不补零。P6.1 的 Process 结果显式区分事件对齐诊断、persistence observation span、PRE/POST Hook 来源与相对偏移、Worker watchdog、fixture file-read 证据与 Agent close/Worker cleanup；缺少可靠边界不会被解释为精确成功。当前 Worker 仍可执行没有 P5/P6.1 Plan 的 P0–P5 Suite；它们不初始化 Review 或 Process 场景运行时，也不会携带对应结果。遗留 v11 envelope 不会被静默降级。
+默认协议升级为 `myhermes-audit-worker-v13`。P5 request/result、P6.1 scenario Artifact 必须使用 v13，父子进程会严格拒绝 v12 或其他不兼容版本及不完整的 Artifact 引用。v13 额外携带 DeepSeek 公共缓存 hit/miss token、已评估 prompt Token 和局部非法诊断；缺失表示不可评估，不补零，partial 不再与 Trial 全部 prompt Token 混淆。P6.1 的 Process 结果显式区分事件对齐诊断、persistence observation span、PRE/POST Hook 来源与相对偏移、Worker watchdog、fixture file-read 证据与 Agent close/Worker cleanup；缺少可靠边界不会被解释为精确成功。当前 Worker 仍可执行没有 P5/P6.1 Plan 的 P0–P5 Suite；它们不初始化 Review 或 Process 场景运行时，也不会携带对应结果。遗留 v12 envelope 不会被静默降级。
 
 P5 request 增加严格的 `background_review_plans` 与 Skill Fixture 投影；result 增加 `background_review_results`、`background_review_errors`。`review_gate_passed` 属于父进程 Validator/Orchestrator 的最终 Trial 事实，Worker 不得自行伪造它。每个有 P5 Plan 的 Trial 固定写入并交叉校验：
 
@@ -98,7 +101,7 @@ Worker 不使用 stdout 传结构化结果。每个 Trial 的 `artifacts/` 固�
 - P4 Variant 才有的 `ablation.json`
 - P5 Review Plan 才有的 `background-review-results.json`、`background-review-evidence.json`、`background-review-snapshots.json`
 
-请求和结果都使用严格 Pydantic 合同、明确的协议版本、未知字段拒绝、非负计数与有限数值。P3 因 turns 增加逻辑 `session_id`，并增加 strategy、Memory Fixture、稳定 query plan 与 Memory Artifact，协议从 v1 显式升级为 `myhermes-audit-worker-v2`；P4 升级为 v3；P5 因 Review Plan、执行结果与三份安全 Artifact 升级为 v4；P6.1 因 typed scenario 计划、结果与安全 Artifact 首次升级为 v5，随后因 Process 结果合同、字符 cursor、身份和 cleanup 事实变化升级为 v6；因 cursor reference 与 Artifact checkpoint 事实升级为 v7；因事件对齐诊断、persistence observation span、Worker watchdog、公开 Hook monotonic offsets 与 close/cleanup 投影升级为 v10；因 PRE/POST 来源拆分、显式 Wait fallback 与 watchdog 作用域升级为 v11；本轮因 DeepSeek 缓存公共 Observation 合同升级为当前默认 v12，v11 仅作为声明的 legacy 版本。请求不携带环境快照或凭据。
+请求和结果都使用严格 Pydantic 合同、明确的协议版本、未知字段拒绝、非负计数与有限数值。P3 因 turns 增加逻辑 `session_id`，并增加 strategy、Memory Fixture、稳定 query plan 与 Memory Artifact，协议从 v1 显式升级为 `myhermes-audit-worker-v2`；P4 升级为 v3；P5 因 Review Plan、执行结果与三份安全 Artifact 升级为 v4；P6.1 因 typed scenario 计划、结果与安全 Artifact 首次升级为 v5，随后因 Process 结果合同、字符 cursor、身份和 cleanup 事实变化升级为 v6；因 cursor reference 与 Artifact checkpoint 事实升级为 v7；因事件对齐诊断、persistence observation span、Worker watchdog、公开 Hook monotonic offsets 与 close/cleanup 投影升级为 v10；因 PRE/POST 来源拆分、显式 Wait fallback 与 watchdog 作用域升级为 v11；因 DeepSeek 缓存公共 Observation 合同升级为 v12；本轮因 evaluated prompt Token 分层和四状态双向约束升级为当前默认 v13，v12 仅作为声明的 legacy 版本。请求不携带环境快照或凭据。
 
 结果只保存安全运行投影：状态、逐 turn 输出、run ID、有限的计数/token/duration、Artifact 相对路径、稳定错误类别与安全摘要。它不序列化 MyHermes 对象、完整 Prompt、模型隐藏推理、完整工具参数或完整工具结果。
 

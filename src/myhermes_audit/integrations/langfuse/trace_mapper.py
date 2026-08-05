@@ -136,6 +136,11 @@ def publish_replay_observations(
         "deepseek_cache_miss_tokens": (
             None if runtime is None else runtime.prompt_cache_miss_tokens
         ),
+        "deepseek_cache_evaluated_prompt_tokens": (
+            None
+            if runtime is None
+            else runtime.deepseek_cache_evaluated_prompt_tokens
+        ),
         "deepseek_cache_hit_rate": (
             None if runtime is None else runtime.deepseek_cache_hit_rate
         ),

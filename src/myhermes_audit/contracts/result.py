@@ -73,8 +73,8 @@ from myhermes_audit.contracts.scenario import (
 from myhermes_audit.serialization import canonical_sha256
 
 
-RESULT_SCHEMA_VERSION = "1.1"
-ResultSchemaVersion = Literal["1.1"]
+RESULT_SCHEMA_VERSION = "1.2"
+ResultSchemaVersion = Literal["1.2"]
 
 
 class TrialStatus(str, Enum):
@@ -118,15 +118,17 @@ class DeepSeekCacheStatus(str, Enum):
 
 
 class DeepSeekCacheSummary(ContractModel):
-    """Strict, token-weighted cache facts for a Suite."""
+    """Strict, token-weighted cache facts for a Trial collection."""
 
     status: DeepSeekCacheStatus
     model_call_count: NonNegativeInt
     evaluated_model_call_count: NonNegativeInt
     trial_count: NonNegativeInt
+    model_call_trial_count: NonNegativeInt
     evaluated_trial_count: NonNegativeInt
     prompt_cache_hit_tokens: NonNegativeInt | None = None
     prompt_cache_miss_tokens: NonNegativeInt | None = None
+    deepseek_cache_evaluated_prompt_tokens: NonNegativeInt | None = None
     cache_hit_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
     model_call_coverage_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
     trial_coverage_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
@@ -138,12 +140,20 @@ class DeepSeekCacheSummary(ContractModel):
             raise ValueError("evaluated model calls cannot exceed model calls")
         if self.evaluated_trial_count > self.trial_count:
             raise ValueError("evaluated trials cannot exceed trial count")
+        if self.model_call_trial_count > self.trial_count:
+            raise ValueError("model-call trials cannot exceed trial count")
+        if self.evaluated_trial_count > self.model_call_trial_count:
+            raise ValueError("evaluated trials cannot exceed model-call trials")
         if self.invalid_trial_count > self.trial_count:
             raise ValueError("invalid trials cannot exceed trial count")
         if (self.prompt_cache_hit_tokens is None) != (
             self.prompt_cache_miss_tokens is None
         ):
             raise ValueError("cache token totals must be paired")
+        if (self.prompt_cache_hit_tokens is None) != (
+            self.deepseek_cache_evaluated_prompt_tokens is None
+        ):
+            raise ValueError("cache totals and evaluated prompt tokens must be paired")
         if self.status is DeepSeekCacheStatus.INVALID:
             if self.invalid_trial_count == 0:
                 raise ValueError("invalid cache summary requires invalid trials")
@@ -152,26 +162,85 @@ class DeepSeekCacheSummary(ContractModel):
                 for value in (
                     self.prompt_cache_hit_tokens,
                     self.prompt_cache_miss_tokens,
+                    self.deepseek_cache_evaluated_prompt_tokens,
                     self.cache_hit_rate,
                 )
             ):
                 raise ValueError("invalid cache summaries cannot expose totals")
+        elif self.status in (
+            DeepSeekCacheStatus.AVAILABLE,
+            DeepSeekCacheStatus.PARTIAL,
+        ) and (
+            self.prompt_cache_hit_tokens is None
+            or self.prompt_cache_miss_tokens is None
+            or self.deepseek_cache_evaluated_prompt_tokens is None
+        ):
+            raise ValueError("evaluated cache summaries require cache totals")
         elif self.prompt_cache_hit_tokens is not None:
             total = self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
-            expected = None if total == 0 else self.prompt_cache_hit_tokens / total
+            if total != self.deepseek_cache_evaluated_prompt_tokens:
+                raise ValueError("cache totals must equal evaluated prompt tokens")
+            expected = (
+                None
+                if self.deepseek_cache_evaluated_prompt_tokens == 0
+                else self.prompt_cache_hit_tokens
+                / self.deepseek_cache_evaluated_prompt_tokens
+            )
             if self.cache_hit_rate != expected:
                 raise ValueError("cache_hit_rate must match token totals")
         elif self.cache_hit_rate is not None:
             raise ValueError("cache_hit_rate requires cache token totals")
         if self.status is DeepSeekCacheStatus.NOT_EVALUATED and self.evaluated_model_call_count:
             raise ValueError("not evaluated cache cannot have evaluated calls")
+        if self.status is DeepSeekCacheStatus.NOT_EVALUATED:
+            if self.invalid_trial_count != 0:
+                raise ValueError("not evaluated cache cannot have invalid trials")
+            if any(
+                value is not None
+                for value in (
+                    self.prompt_cache_hit_tokens,
+                    self.prompt_cache_miss_tokens,
+                    self.deepseek_cache_evaluated_prompt_tokens,
+                    self.cache_hit_rate,
+                )
+            ):
+                raise ValueError("not evaluated cache cannot expose totals")
         if self.status is DeepSeekCacheStatus.AVAILABLE and (
             self.model_call_count == 0
             or self.evaluated_model_call_count != self.model_call_count
+            or self.model_call_trial_count != self.trial_count
+            or self.evaluated_trial_count != self.model_call_trial_count
         ):
             raise ValueError("available cache requires every model call")
         if self.status is DeepSeekCacheStatus.PARTIAL and not self.evaluated_model_call_count:
             raise ValueError("partial cache requires evaluated calls")
+        if self.status is DeepSeekCacheStatus.PARTIAL and (
+            self.evaluated_model_call_count == self.model_call_count
+            and self.evaluated_trial_count == self.model_call_trial_count
+            and self.model_call_trial_count == self.trial_count
+        ):
+            raise ValueError("partial cache requires a partial or unevaluated Trial")
+        if self.invalid_trial_count > 0 and self.status is not DeepSeekCacheStatus.INVALID:
+            raise ValueError("invalid trials require invalid cache status")
+        if self.status is not DeepSeekCacheStatus.INVALID and self.invalid_trial_count != 0:
+            raise ValueError("non-invalid cache summaries cannot contain invalid trials")
+        if self.model_call_trial_count == 0 and self.trial_coverage_rate is not None:
+            raise ValueError("trial coverage requires model-call trials")
+        if self.model_call_trial_count > 0:
+            expected_coverage = self.evaluated_trial_count / self.model_call_trial_count
+            if self.trial_coverage_rate != expected_coverage:
+                raise ValueError("trial coverage must use model-call trials")
+        elif self.trial_coverage_rate is not None:
+            raise ValueError("trial coverage must be unavailable without model-call trials")
+        if self.model_call_count == 0:
+            if self.model_call_coverage_rate is not None:
+                raise ValueError("model coverage must be unavailable without model calls")
+        else:
+            expected_model_coverage = (
+                self.evaluated_model_call_count / self.model_call_count
+            )
+            if self.model_call_coverage_rate != expected_model_coverage:
+                raise ValueError("model coverage must match evaluated calls")
         for rate in (self.model_call_coverage_rate, self.trial_coverage_rate):
             if rate is not None and not math.isfinite(rate):
                 raise ValueError("cache coverage rates must be finite")
@@ -278,6 +347,7 @@ class TrialRuntimeSummary(ContractModel):
     total_tokens: NonNegativeInt | None = None
     prompt_cache_hit_tokens: NonNegativeInt | None = None
     prompt_cache_miss_tokens: NonNegativeInt | None = None
+    deepseek_cache_evaluated_prompt_tokens: NonNegativeInt | None = None
     deepseek_cache_hit_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
     deepseek_cache_status: DeepSeekCacheStatus = DeepSeekCacheStatus.NOT_EVALUATED
     deepseek_cache_evaluated_model_call_count: NonNegativeInt = 0
@@ -302,6 +372,8 @@ class TrialRuntimeSummary(ContractModel):
             raise ValueError("total_tokens must equal prompt_tokens + completion_tokens")
         if self.deepseek_cache_evaluated_model_call_count > self.model_call_count:
             raise ValueError("evaluated model calls cannot exceed model_call_count")
+        if self.deepseek_cache_invalid_model_call_count > self.model_call_count:
+            raise ValueError("invalid cache calls cannot exceed model_call_count")
         if (self.prompt_cache_hit_tokens is None) != (
             self.prompt_cache_miss_tokens is None
         ):
@@ -314,6 +386,7 @@ class TrialRuntimeSummary(ContractModel):
                 for value in (
                     self.prompt_cache_hit_tokens,
                     self.prompt_cache_miss_tokens,
+                    self.deepseek_cache_evaluated_prompt_tokens,
                     self.deepseek_cache_hit_rate,
                 )
             ):
@@ -321,13 +394,26 @@ class TrialRuntimeSummary(ContractModel):
         elif self.prompt_cache_hit_tokens is not None:
             if self.prompt_tokens is None:
                 raise ValueError("cache runtime requires prompt_tokens")
+            if self.deepseek_cache_evaluated_prompt_tokens is None:
+                raise ValueError("cache runtime requires evaluated prompt tokens")
             if (
                 self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
-                != self.prompt_tokens
+                != self.deepseek_cache_evaluated_prompt_tokens
             ):
-                raise ValueError("cache runtime totals must equal prompt_tokens")
-            total = self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
-            expected = None if total == 0 else self.prompt_cache_hit_tokens / total
+                raise ValueError("cache runtime totals must equal evaluated prompt tokens")
+            if (
+                self.deepseek_cache_status is DeepSeekCacheStatus.AVAILABLE
+                and self.deepseek_cache_evaluated_prompt_tokens != self.prompt_tokens
+            ):
+                raise ValueError("available cache must cover all prompt tokens")
+            if self.deepseek_cache_evaluated_prompt_tokens > self.prompt_tokens:
+                raise ValueError("evaluated prompt tokens cannot exceed prompt tokens")
+            expected = (
+                None
+                if self.deepseek_cache_evaluated_prompt_tokens == 0
+                else self.prompt_cache_hit_tokens
+                / self.deepseek_cache_evaluated_prompt_tokens
+            )
             if self.deepseek_cache_hit_rate != expected:
                 raise ValueError("cache rate must match runtime totals")
         elif self.deepseek_cache_hit_rate is not None:
@@ -345,6 +431,36 @@ class TrialRuntimeSummary(ContractModel):
             and self.deepseek_cache_evaluated_model_call_count == 0
         ):
             raise ValueError("evaluated cache status requires evaluated calls")
+        if self.deepseek_cache_status is DeepSeekCacheStatus.PARTIAL and (
+            self.deepseek_cache_evaluated_model_call_count >= self.model_call_count
+        ):
+            raise ValueError("partial cache requires unevaluated model calls")
+        if self.deepseek_cache_status is DeepSeekCacheStatus.NOT_EVALUATED:
+            if self.deepseek_cache_invalid_model_call_count != 0:
+                raise ValueError("not evaluated cache cannot have invalid calls")
+            if any(
+                value is not None
+                for value in (
+                    self.prompt_cache_hit_tokens,
+                    self.prompt_cache_miss_tokens,
+                    self.deepseek_cache_evaluated_prompt_tokens,
+                    self.deepseek_cache_hit_rate,
+                )
+            ):
+                raise ValueError("not evaluated cache cannot expose totals")
+        elif self.deepseek_cache_status is not DeepSeekCacheStatus.INVALID:
+            if self.deepseek_cache_invalid_model_call_count != 0:
+                raise ValueError("non-invalid cache cannot contain invalid calls")
+            if (
+                self.prompt_cache_hit_tokens is None
+                or self.prompt_cache_miss_tokens is None
+                or self.deepseek_cache_evaluated_prompt_tokens is None
+            ):
+                raise ValueError("evaluated cache status requires cache totals")
+        if self.deepseek_cache_invalid_model_call_count > 0 and (
+            self.deepseek_cache_status is not DeepSeekCacheStatus.INVALID
+        ):
+            raise ValueError("invalid calls require invalid cache status")
         if (
             self.deepseek_cache_status is DeepSeekCacheStatus.AVAILABLE
             and self.deepseek_cache_evaluated_model_call_count != self.model_call_count
@@ -419,6 +535,7 @@ class TrialObservationSummary(ContractModel):
     tool_calls: list[ToolObservationSummary] = Field(default_factory=list)
     truncated: StrictBool = False
     cache_invalid_model_call_count: NonNegativeInt = 0
+    deepseek_cache_evaluated_prompt_tokens: NonNegativeInt | None = None
 
     @model_validator(mode="after")
     def validate_observations(self) -> "TrialObservationSummary":
@@ -430,6 +547,37 @@ class TrialObservationSummary(ContractModel):
             raise ValueError("tool observations must have unique tool_call_id values")
         if self.cache_invalid_model_call_count > len(self.model_calls):
             raise ValueError("invalid cache model calls cannot exceed observations")
+        evaluated_prompt_tokens = sum(
+            item.prompt_tokens
+            for item in self.model_calls
+            if item.prompt_cache_hit_tokens is not None
+            and item.prompt_cache_miss_tokens is not None
+            and item.prompt_tokens is not None
+        )
+        has_valid_cache_observation = any(
+            item.prompt_cache_hit_tokens is not None
+            and item.prompt_cache_miss_tokens is not None
+            and item.prompt_tokens is not None
+            for item in self.model_calls
+        )
+        if self.cache_invalid_model_call_count:
+            if self.deepseek_cache_evaluated_prompt_tokens is not None:
+                raise ValueError(
+                    "invalid cache observations cannot expose evaluated prompt tokens"
+                )
+        elif has_valid_cache_observation:
+            if self.deepseek_cache_evaluated_prompt_tokens is None:
+                raise ValueError(
+                    "cache observations require evaluated prompt tokens"
+                )
+            if self.deepseek_cache_evaluated_prompt_tokens != evaluated_prompt_tokens:
+                raise ValueError(
+                    "observation evaluated prompt tokens must match model calls"
+                )
+        elif self.deepseek_cache_evaluated_prompt_tokens is not None:
+            raise ValueError(
+                "unevaluated observations cannot expose evaluated prompt tokens"
+            )
         return self
 
 
@@ -455,6 +603,7 @@ class TrialResult(ContractModel):
     duration_ms: NonNegativeInt | None = None
     turns: list[TurnResult] = Field(default_factory=list)
     runtime: TrialRuntimeSummary | None = None
+    deepseek_cache_evaluated_prompt_tokens: NonNegativeInt | None = None
     observations: TrialObservationSummary | None = None
     memory_query_results: list[MemoryQueryResult] = Field(default_factory=list)
     memory_snapshots: list[MemoryStateSnapshot] = Field(default_factory=list)
@@ -512,10 +661,36 @@ class TrialResult(ContractModel):
             if item.kind is E2EScenarioKind.PROCESS_BACKGROUND
         ]
 
+    @property
+    def evaluated_prompt_tokens(self) -> int | None:
+        """Return the canonical Trial cache prompt projection."""
+
+        return self.deepseek_cache_evaluated_prompt_tokens
+
     @model_validator(mode="after")
     def validate_trial_result(self) -> "TrialResult":
         if self.trial_number < 1:
             raise ValueError("trial_number must start at 1")
+        if self.runtime is None:
+            if self.deepseek_cache_evaluated_prompt_tokens is not None:
+                raise ValueError(
+                    "cache evaluated prompt tokens require runtime summary"
+                )
+        elif (
+            self.deepseek_cache_evaluated_prompt_tokens
+            != self.runtime.deepseek_cache_evaluated_prompt_tokens
+        ):
+            raise ValueError(
+                "Trial cache evaluated prompt tokens must mirror runtime summary"
+            )
+        if (
+            self.observations is not None
+            and self.observations.deepseek_cache_evaluated_prompt_tokens
+            != self.deepseek_cache_evaluated_prompt_tokens
+        ):
+            raise ValueError(
+                "Trial cache evaluated prompt tokens must mirror observations"
+            )
         p4_identity_fields = (
             self.trial_identity,
             self.variant_id,
@@ -822,6 +997,16 @@ class CaseAggregate(ContractModel):
     tool_call_count_mean: StrictFloat | None = Field(default=None, ge=0)
     deepseek_cache_status: DeepSeekCacheStatus = DeepSeekCacheStatus.NOT_EVALUATED
     deepseek_cache_hit_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
+    deepseek_cache_hit_tokens: NonNegativeInt | None = None
+    deepseek_cache_miss_tokens: NonNegativeInt | None = None
+    deepseek_cache_evaluated_prompt_tokens: NonNegativeInt | None = None
+    deepseek_cache_model_call_coverage_rate: StrictFloat | None = Field(
+        default=None, ge=0, le=1
+    )
+    deepseek_cache_trial_coverage_rate: StrictFloat | None = Field(
+        default=None, ge=0, le=1
+    )
+    deepseek_cache: DeepSeekCacheSummary | None = None
 
     @model_validator(mode="after")
     def validate_counts(self) -> "CaseAggregate":
@@ -840,6 +1025,38 @@ class CaseAggregate(ContractModel):
         metric_names = [item.metric_name for item in self.metric_summaries]
         if len(metric_names) != len(set(metric_names)):
             raise ValueError("metric_summaries must have unique metric_name values")
+        if self.deepseek_cache is not None:
+            if self.deepseek_cache_status is not self.deepseek_cache.status:
+                raise ValueError("Case cache status must mirror DeepSeek summary")
+            if self.deepseek_cache_hit_rate != self.deepseek_cache.cache_hit_rate:
+                raise ValueError("Case cache rate must mirror DeepSeek summary")
+            if (
+                self.deepseek_cache_hit_tokens
+                != self.deepseek_cache.prompt_cache_hit_tokens
+            ):
+                raise ValueError("Case cache hit tokens must mirror DeepSeek summary")
+            if (
+                self.deepseek_cache_miss_tokens
+                != self.deepseek_cache.prompt_cache_miss_tokens
+            ):
+                raise ValueError("Case cache miss tokens must mirror DeepSeek summary")
+            if (
+                self.deepseek_cache_evaluated_prompt_tokens
+                != self.deepseek_cache.deepseek_cache_evaluated_prompt_tokens
+            ):
+                raise ValueError(
+                    "Case evaluated prompt tokens must mirror DeepSeek summary"
+                )
+            if (
+                self.deepseek_cache_model_call_coverage_rate
+                != self.deepseek_cache.model_call_coverage_rate
+            ):
+                raise ValueError("Case model coverage must mirror DeepSeek summary")
+            if (
+                self.deepseek_cache_trial_coverage_rate
+                != self.deepseek_cache.trial_coverage_rate
+            ):
+                raise ValueError("Case trial coverage must mirror DeepSeek summary")
         return self
 
 

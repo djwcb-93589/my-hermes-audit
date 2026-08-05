@@ -1649,6 +1649,9 @@ class MyHermesTrialRunner:
                     total_tokens=result.total_tokens,
                     prompt_cache_hit_tokens=result.prompt_cache_hit_tokens,
                     prompt_cache_miss_tokens=result.prompt_cache_miss_tokens,
+                    deepseek_cache_evaluated_prompt_tokens=(
+                        result.deepseek_cache_evaluated_prompt_tokens
+                    ),
                     deepseek_cache_hit_rate=result.deepseek_cache_hit_rate,
                     deepseek_cache_status=result.deepseek_cache_status,
                     deepseek_cache_evaluated_model_call_count=(
@@ -1768,6 +1771,9 @@ def _local_observations(
         ],
         truncated=observations.truncated,
         cache_invalid_model_call_count=observations.cache_invalid_model_call_count,
+        deepseek_cache_evaluated_prompt_tokens=(
+            observations.deepseek_cache_evaluated_prompt_tokens
+        ),
     )
 
 

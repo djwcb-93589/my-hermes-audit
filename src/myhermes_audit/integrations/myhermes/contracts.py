@@ -49,9 +49,9 @@ from myhermes_audit.contracts.common import (
 )
 
 
-WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v12"
-LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v11"
-WorkerProtocolVersion = Literal["myhermes-audit-worker-v12"]
+WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v13"
+LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v12"
+WorkerProtocolVersion = Literal["myhermes-audit-worker-v13"]
 
 
 class WorkerMode(str, Enum):
@@ -388,6 +388,7 @@ class ObservationBundle(ContractModel):
     tool_calls: list[ToolObservationRecord] = Field(default_factory=list)
     truncated: StrictBool = False
     cache_invalid_model_call_count: NonNegativeInt = 0
+    deepseek_cache_evaluated_prompt_tokens: NonNegativeInt | None = None
 
     @model_validator(mode="after")
     def validate_observations(self) -> "ObservationBundle":
@@ -399,6 +400,32 @@ class ObservationBundle(ContractModel):
             raise ValueError("tool observations must have unique tool_call_id values")
         if self.cache_invalid_model_call_count > len(self.model_calls):
             raise ValueError("invalid cache model calls cannot exceed observations")
+        evaluated_prompt_tokens = sum(
+            item.prompt_tokens
+            for item in self.model_calls
+            if item.prompt_cache_hit_tokens is not None
+            and item.prompt_cache_miss_tokens is not None
+            and item.prompt_tokens is not None
+        )
+        has_valid_cache_observation = any(
+            item.prompt_cache_hit_tokens is not None
+            and item.prompt_cache_miss_tokens is not None
+            and item.prompt_tokens is not None
+            for item in self.model_calls
+        )
+        if self.deepseek_cache_evaluated_prompt_tokens is not None:
+            if self.cache_invalid_model_call_count:
+                raise ValueError(
+                    "invalid cache observations cannot expose evaluated prompt tokens"
+                )
+            if not has_valid_cache_observation:
+                raise ValueError(
+                    "unevaluated observations cannot expose evaluated prompt tokens"
+                )
+            if self.deepseek_cache_evaluated_prompt_tokens != evaluated_prompt_tokens:
+                raise ValueError(
+                    "observation evaluated prompt tokens must match model calls"
+                )
         return self
 
 
@@ -656,6 +683,7 @@ class MyHermesWorkerResult(ContractModel):
     total_tokens: NonNegativeInt | None = None
     prompt_cache_hit_tokens: NonNegativeInt | None = None
     prompt_cache_miss_tokens: NonNegativeInt | None = None
+    deepseek_cache_evaluated_prompt_tokens: NonNegativeInt | None = None
     deepseek_cache_hit_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
     deepseek_cache_status: DeepSeekCacheStatus = DeepSeekCacheStatus.NOT_EVALUATED
     deepseek_cache_evaluated_model_call_count: NonNegativeInt = 0
@@ -761,6 +789,7 @@ class MyHermesWorkerResult(ContractModel):
                 for value in (
                     self.prompt_cache_hit_tokens,
                     self.prompt_cache_miss_tokens,
+                    self.deepseek_cache_evaluated_prompt_tokens,
                     self.deepseek_cache_hit_rate,
                 )
             ):
@@ -768,18 +797,27 @@ class MyHermesWorkerResult(ContractModel):
         elif self.prompt_cache_hit_tokens is not None:
             if self.prompt_tokens is None:
                 raise ValueError("cache result requires prompt_tokens")
+            if self.deepseek_cache_evaluated_prompt_tokens is None:
+                raise ValueError("cache result requires evaluated prompt tokens")
             if (
                 self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
-                != self.prompt_tokens
+                != self.deepseek_cache_evaluated_prompt_tokens
             ):
-                raise ValueError("cache result totals must equal prompt_tokens")
-            denominator = (
-                self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
-            )
+                raise ValueError(
+                    "cache result totals must equal evaluated prompt tokens"
+                )
+            if (
+                self.deepseek_cache_status is DeepSeekCacheStatus.AVAILABLE
+                and self.deepseek_cache_evaluated_prompt_tokens != self.prompt_tokens
+            ):
+                raise ValueError("available cache must cover all prompt tokens")
+            if self.deepseek_cache_evaluated_prompt_tokens > self.prompt_tokens:
+                raise ValueError("evaluated prompt tokens cannot exceed prompt_tokens")
             expected_rate = (
                 None
-                if denominator == 0
-                else self.prompt_cache_hit_tokens / denominator
+                if self.deepseek_cache_evaluated_prompt_tokens == 0
+                else self.prompt_cache_hit_tokens
+                / self.deepseek_cache_evaluated_prompt_tokens
             )
             if self.deepseek_cache_hit_rate != expected_rate:
                 raise ValueError("cache result rate must match token totals")
@@ -796,6 +834,36 @@ class MyHermesWorkerResult(ContractModel):
             and self.deepseek_cache_evaluated_model_call_count == 0
         ):
             raise ValueError("evaluated cache status requires evaluated calls")
+        if self.deepseek_cache_status is DeepSeekCacheStatus.PARTIAL and (
+            self.deepseek_cache_evaluated_model_call_count >= self.model_call_count
+        ):
+            raise ValueError("partial cache requires unevaluated model calls")
+        if self.deepseek_cache_status is DeepSeekCacheStatus.NOT_EVALUATED:
+            if self.deepseek_cache_invalid_model_call_count != 0:
+                raise ValueError("not evaluated cache cannot have invalid calls")
+            if any(
+                value is not None
+                for value in (
+                    self.prompt_cache_hit_tokens,
+                    self.prompt_cache_miss_tokens,
+                    self.deepseek_cache_evaluated_prompt_tokens,
+                    self.deepseek_cache_hit_rate,
+                )
+            ):
+                raise ValueError("not evaluated cache cannot expose totals")
+        elif self.deepseek_cache_status is not DeepSeekCacheStatus.INVALID:
+            if self.deepseek_cache_invalid_model_call_count != 0:
+                raise ValueError("non-invalid cache cannot contain invalid calls")
+            if (
+                self.prompt_cache_hit_tokens is None
+                or self.prompt_cache_miss_tokens is None
+                or self.deepseek_cache_evaluated_prompt_tokens is None
+            ):
+                raise ValueError("evaluated cache status requires cache totals")
+        if self.deepseek_cache_invalid_model_call_count > 0 and (
+            self.deepseek_cache_status is not DeepSeekCacheStatus.INVALID
+        ):
+            raise ValueError("invalid calls require invalid cache status")
         if (
             self.deepseek_cache_status is DeepSeekCacheStatus.AVAILABLE
             and self.deepseek_cache_evaluated_model_call_count != self.model_call_count

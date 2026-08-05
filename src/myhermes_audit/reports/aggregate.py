@@ -45,6 +45,16 @@ def aggregate_cases(
                 tool_call_count_mean=stats["tool_call_count_mean"],
                 deepseek_cache_status=cache.status,
                 deepseek_cache_hit_rate=cache.cache_hit_rate,
+                deepseek_cache_hit_tokens=cache.prompt_cache_hit_tokens,
+                deepseek_cache_miss_tokens=cache.prompt_cache_miss_tokens,
+                deepseek_cache_evaluated_prompt_tokens=(
+                    cache.deepseek_cache_evaluated_prompt_tokens
+                ),
+                deepseek_cache_model_call_coverage_rate=(
+                    cache.model_call_coverage_rate
+                ),
+                deepseek_cache_trial_coverage_rate=cache.trial_coverage_rate,
+                deepseek_cache=cache,
             )
         )
     return aggregates
@@ -280,6 +290,7 @@ def _aggregate_statistics(trials: Sequence[TrialResult]) -> dict[str, object]:
 def _deepseek_cache_summary(trials: Sequence[TrialResult]) -> DeepSeekCacheSummary:
     runtimes = [trial.runtime for trial in trials if trial.runtime is not None]
     model_call_count = sum(runtime.model_call_count for runtime in runtimes)
+    model_call_trial_count = sum(runtime.model_call_count > 0 for runtime in runtimes)
     evaluated_count = sum(
         runtime.deepseek_cache_evaluated_model_call_count for runtime in runtimes
     )
@@ -295,7 +306,7 @@ def _deepseek_cache_summary(trials: Sequence[TrialResult]) -> DeepSeekCacheSumma
     invalid = invalid_trial_count > 0
     if invalid:
         status = DeepSeekCacheStatus.INVALID
-        hit = miss = rate = None
+        hit = miss = evaluated_prompt = rate = None
     else:
         hit_values = [
             runtime.prompt_cache_hit_tokens
@@ -311,10 +322,24 @@ def _deepseek_cache_summary(trials: Sequence[TrialResult]) -> DeepSeekCacheSumma
             in (DeepSeekCacheStatus.AVAILABLE, DeepSeekCacheStatus.PARTIAL)
             and runtime.prompt_cache_miss_tokens is not None
         ]
+        evaluated_prompt_values = [
+            runtime.deepseek_cache_evaluated_prompt_tokens
+            for runtime in runtimes
+            if runtime.deepseek_cache_status
+            in (DeepSeekCacheStatus.AVAILABLE, DeepSeekCacheStatus.PARTIAL)
+            and runtime.deepseek_cache_evaluated_prompt_tokens is not None
+        ]
         hit = sum(hit_values) if hit_values else None
         miss = sum(miss_values) if miss_values else None
-        denominator = None if hit is None else hit + miss
-        rate = None if not denominator else hit / denominator
+        evaluated_prompt = (
+            sum(evaluated_prompt_values) if evaluated_prompt_values else None
+        )
+        if hit is None or miss is None or evaluated_prompt is None:
+            rate = None
+        else:
+            if hit + miss != evaluated_prompt:
+                raise ValueError("Trial cache totals disagree during aggregation")
+            rate = None if evaluated_prompt == 0 else hit / evaluated_prompt
         if not evaluated_count:
             status = DeepSeekCacheStatus.NOT_EVALUATED
         elif all(
@@ -329,7 +354,9 @@ def _deepseek_cache_summary(trials: Sequence[TrialResult]) -> DeepSeekCacheSumma
         None if model_call_count == 0 else evaluated_count / model_call_count
     )
     trial_coverage = (
-        None if not trials else evaluated_trial_count / len(trials)
+        None
+        if model_call_trial_count == 0
+        else evaluated_trial_count / model_call_trial_count
     )
     return DeepSeekCacheSummary(
         status=status,
@@ -339,10 +366,12 @@ def _deepseek_cache_summary(trials: Sequence[TrialResult]) -> DeepSeekCacheSumma
         evaluated_trial_count=evaluated_trial_count,
         prompt_cache_hit_tokens=hit,
         prompt_cache_miss_tokens=miss,
+        deepseek_cache_evaluated_prompt_tokens=evaluated_prompt,
         cache_hit_rate=rate,
         model_call_coverage_rate=model_coverage,
         trial_coverage_rate=trial_coverage,
         invalid_trial_count=invalid_trial_count,
+        model_call_trial_count=model_call_trial_count,
     )
 
 

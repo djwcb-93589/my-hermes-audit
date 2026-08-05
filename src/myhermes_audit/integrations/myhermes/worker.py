@@ -1113,6 +1113,13 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         observations.model_calls,
         invalid_model_call_count=observations.cache_invalid_model_call_count,
     )
+    observations = observations.model_copy(
+        update={
+            "deepseek_cache_evaluated_prompt_tokens": (
+                cache_aggregation.deepseek_cache_evaluated_prompt_tokens
+            )
+        }
+    )
     if cache_aggregation.invalid_model_call_count:
         lifecycle_warnings.append(
             WorkerWarning(
@@ -1165,6 +1172,9 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         total_tokens=total_tokens,
         prompt_cache_hit_tokens=cache_aggregation.prompt_cache_hit_tokens,
         prompt_cache_miss_tokens=cache_aggregation.prompt_cache_miss_tokens,
+        deepseek_cache_evaluated_prompt_tokens=(
+            cache_aggregation.deepseek_cache_evaluated_prompt_tokens
+        ),
         deepseek_cache_hit_rate=cache_aggregation.deepseek_cache_hit_rate,
         deepseek_cache_status=cache_aggregation.deepseek_cache_status,
         deepseek_cache_evaluated_model_call_count=(

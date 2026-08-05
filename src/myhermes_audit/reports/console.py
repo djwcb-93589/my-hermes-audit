@@ -184,8 +184,15 @@ def _cache_summary(value) -> str:
     if value is None:
         return "not evaluated"
     rate = _percent_or_missing(value.cache_hit_rate)
-    coverage = _percent_or_missing(value.trial_coverage_rate)
-    return f"{value.status.value}, rate {rate}, trial coverage {coverage}"
+    model_coverage = _percent_or_missing(value.model_call_coverage_rate)
+    return (
+        f"{value.status.value}, hit {_integer_or_missing(value.prompt_cache_hit_tokens)}, "
+        f"miss {_integer_or_missing(value.prompt_cache_miss_tokens)}, "
+        "evaluated prompt "
+        f"{_integer_or_missing(value.deepseek_cache_evaluated_prompt_tokens)}, "
+        f"rate {rate}, model coverage {model_coverage}, "
+        f"trial coverage {_percent_or_missing(value.trial_coverage_rate)}"
+    )
 
 
 def _langfuse_experiment(result: AuditRunResult) -> str:

@@ -564,6 +564,11 @@ class AuditOrchestrator:
                 duration_ms=duration_ms,
                 turns=[] if outcome is None else list(outcome.turns),
                 runtime=(None if outcome is None else outcome.runtime),
+                deepseek_cache_evaluated_prompt_tokens=(
+                    None
+                    if outcome is None or outcome.runtime is None
+                    else outcome.runtime.deepseek_cache_evaluated_prompt_tokens
+                ),
                 observations=(None if outcome is None else outcome.observations),
                 memory_query_results=(
                     [] if outcome is None else list(outcome.memory_query_results)
