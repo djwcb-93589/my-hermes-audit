@@ -91,7 +91,7 @@ Memory text, Review evidence正文, user identity, or local absolute paths.
 
 ## Comparability
 
-`AuditRegressionReport` is `regression-v6` and reports structured reasons when
+`AuditRegressionReport` is `regression-v7` and reports structured reasons when
 comparison is not valid. Core correctness comparison requires the same Suite
 ID, semantic Suite digest, ordered Case set, Result Schema identity, metric
 contract, Worker Protocol, model identity, and configuration identity. Each
@@ -107,13 +107,17 @@ actual denominator and both counts are displayed, so raw passed counts are not
 treated as a conclusion. A result with an existing failure can still improve,
 for example 80% to 88.9%; non-100% is not itself a regression.
 
-Pricing identity is deliberately independent. If pricing fingerprints differ,
-task, Tool, Memory, Review, turn, time, token, and cache observations remain
-comparable. Money, cost, savings, and effective-cost metrics are marked
-`not_comparable` with a structured reason.
+Pricing identity is deliberately independent. For a Metric whose effective
+policy requires pricing, either missing fingerprint (including both sides
+missing) yields `pricing_fingerprint_missing`; two present but different
+fingerprints yield `pricing_fingerprint_mismatch`. Equal present fingerprints
+yield no pricing reason. `None == None` is never treated as pricing identity.
+Only the affected money, cost, savings, or explicitly pricing-sensitive Metric
+is marked `not_comparable`; task, Tool, Memory, Review, turn, time, token, and
+cache observations remain comparable when their own facts are valid.
 Each `MetricComparison` carries the generated `requires_pricing_match` policy
 fact. The comparison engine and Report validator use that field; the validator
-derive it through one shared policy resolver. The resolver applies the fixed
+derives it through one shared policy resolver. The resolver applies the fixed
 DeepSeek-cost convention in addition to an explicit `require_pricing_match`
 flag; it does not use the metric prefix for mode, direction, or thresholds. An
 explicit custom policy can require pricing identity for any metric. A pricing
@@ -130,6 +134,13 @@ re-derives them from both sides' identities and rejects fabricated facts.
 `not_evaluated` means a required metric/sample fact is absent, while
 `not_comparable` means evaluated facts cannot be aligned; the latter never
 masks the former.
+
+Report reasons are finalized only after effective Metric policies,
+evaluation/comparability facts, and Metric decisions have been re-derived.
+`no_comparable_core_metrics` is added only when every core Metric is
+`not_evaluated` or `not_comparable`; a pricing-only local failure never adds
+that core reason when another core Metric is comparable. The generator and
+strict reload validator share the same pricing-reason and final-reason helpers.
 
 The complete report contains an immutable `RegressionPolicySnapshot` with the
 policy schema version, default mode, sorted explicit metric entries, and a
@@ -241,7 +252,7 @@ outside the safe contract are excluded.
 
 ## Versioning and scope
 
-Baseline and Regression contracts are `baseline-v5` and `regression-v6`.
+Baseline and Regression contracts are `baseline-v5` and `regression-v7`.
 P7 adds the
 semantic Suite comparison digest to `AuditFingerprint`, so the Audit Result
 Schema is `1.6`; Worker Protocol remains v13. Existing Trial and evaluator

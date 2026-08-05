@@ -182,6 +182,21 @@ def _signed_or_missing(value: float | None) -> str:
     return "not evaluated" if value is None else f"{value:+.4f}"
 
 
+def _fingerprint_or_missing(value: str | None) -> str:
+    return "<missing>" if value is None else value
+
+
+def _pricing_reason(metric) -> str:
+    return next(
+        (
+            reason
+            for reason in metric.reason_codes
+            if reason in {"pricing_fingerprint_missing", "pricing_fingerprint_mismatch"}
+        ),
+        "<none>",
+    )
+
+
 def _as_int(value: float | None) -> int | None:
     return None if value is None else round(value)
 
@@ -409,6 +424,9 @@ def render_console_regression(report: AuditRegressionReport) -> str:
         f"Comparability:       {'comparable' if report.status.value != 'not_comparable' else 'not comparable'}",
         f"Policy schema:        {report.regression_policy.schema_version}",
         f"Policy fingerprint:   {report.regression_policy_fingerprint}",
+        "Pricing identity:     "
+        f"{_fingerprint_or_missing(report.baseline_pricing_fingerprint)} -> "
+        f"{_fingerprint_or_missing(report.current_pricing_fingerprint)}",
         "Counts:              "
         f"regression={report.regression_count} "
         f"improvement={report.improvement_count} "
@@ -441,6 +459,7 @@ def render_console_regression(report: AuditRegressionReport) -> str:
             f"relative_increase={metric.max_relative_increase!r}, "
             f"absolute_increase={metric.max_absolute_increase!r}) "
             f"requires_pricing_match={metric.requires_pricing_match} "
+            f"pricing_reason={_pricing_reason(metric)} "
             f"decision={metric.decision.value} "
             f"reasons={','.join(metric.reason_codes) or '<none>'}"
         )

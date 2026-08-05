@@ -42,22 +42,25 @@ from myhermes_audit.regression_decision import (
     MetricPolicyFacts,
     PolicyEntryFacts,
     PolicySnapshotFacts,
+    PRICING_REASON_CODES,
     decide_case_regression,
     decide_metric_comparison,
     decide_report_status,
     derive_comparability_reason_codes,
     derive_metric_evaluation_facts,
+    derive_pricing_comparability_reason,
+    finalize_report_comparability_reasons,
     resolve_metric_policy,
 )
 
 
 BASELINE_SCHEMA_VERSION = "baseline-v5"
-REGRESSION_SCHEMA_VERSION = "regression-v6"
+REGRESSION_SCHEMA_VERSION = "regression-v7"
 REGRESSION_POLICY_SCHEMA_VERSION = "regression-policy-v1"
 METRIC_CONTRACT_VERSION = "p7-metrics-v1"
 
 BaselineSchemaVersion = Literal["baseline-v5"]
-RegressionSchemaVersion = Literal["regression-v6"]
+RegressionSchemaVersion = Literal["regression-v7"]
 RegressionPolicySchemaVersion = Literal["regression-policy-v1"]
 MetricNumber = StrictInt | StrictFloat | Decimal
 
@@ -1026,21 +1029,14 @@ class AuditRegressionReport(ContractModel):
                 ),
                 baseline_pricing_fingerprint=self.baseline_pricing_fingerprint,
                 current_pricing_fingerprint=self.current_pricing_fingerprint,
+                pricing_required=False,
             )
         )
-        core_reasons = [
+        base_core_reasons = [
             reason
             for reason in expected_reasons
-            if reason not in {"pricing_fingerprint_mismatch", "pricing_fingerprint_missing"}
+            if reason not in PRICING_REASON_CODES
         ]
-        pricing_reason = next(
-            (
-                reason
-                for reason in ("pricing_fingerprint_missing", "pricing_fingerprint_mismatch")
-                if reason in expected_reasons
-            ),
-            None,
-        )
         for item in all_metrics:
             expected_policy = resolve_metric_policy(
                 item.metric_name,
@@ -1060,10 +1056,15 @@ class AuditRegressionReport(ContractModel):
                 raise ValueError("Metric pricing applicability does not match Report policy snapshot")
             applicable_fact_codes = [
                 reason
-                for reason in core_reasons
+                for reason in base_core_reasons
                 if reason in COMPARABILITY_REASON_CODES
             ]
-            if pricing_reason is not None and item.requires_pricing_match:
+            pricing_reason = derive_pricing_comparability_reason(
+                item.requires_pricing_match,
+                self.baseline_pricing_fingerprint,
+                self.current_pricing_fingerprint,
+            )
+            if pricing_reason is not None:
                 applicable_fact_codes.append(pricing_reason)
             applicable_fact_codes = sorted(set(applicable_fact_codes))
             expected_facts = derive_metric_evaluation_facts(
@@ -1103,9 +1104,22 @@ class AuditRegressionReport(ContractModel):
             }
             for item in all_metrics
         )
-        if comparable_metric_count == 0:
-            expected_reasons.append("no_comparable_core_metrics")
-        expected_reasons = sorted(set(expected_reasons))
+        report_comparability = finalize_report_comparability_reasons(
+            expected_reasons,
+            [
+                reason
+                for item in all_metrics
+                if (
+                    reason := derive_pricing_comparability_reason(
+                        item.requires_pricing_match,
+                        self.baseline_pricing_fingerprint,
+                        self.current_pricing_fingerprint,
+                    )
+                ) is not None
+            ],
+            comparable_metric_count,
+        )
+        expected_reasons = list(report_comparability.reasons)
         saved_reasons = list(self.comparability_reasons)
         if len(saved_reasons) != len(set(saved_reasons)):
             raise ValueError("comparability reasons must be unique")
@@ -1129,7 +1143,7 @@ class AuditRegressionReport(ContractModel):
             regression_count=expected_counts["regression_count"],
             warning_count=expected_counts["warning_count"],
             comparable_metric_count=comparable_metric_count,
-            core_reason_count=len(core_reasons),
+            core_reason_count=len(report_comparability.core_reasons),
         )
         if self.status.value != expected_status.status or self.overall_regression_gate != expected_status.gate:
             raise ValueError("report status or gate does not match the decision helper")
@@ -1143,7 +1157,7 @@ class AuditRegressionReport(ContractModel):
             )
         ):
             raise ValueError("not-comparable reports cannot carry evaluated decisions")
-        if not core_reasons and self.status is RegressionStatus.NOT_COMPARABLE:
+        if not report_comparability.core_reasons and self.status is RegressionStatus.NOT_COMPARABLE:
             raise ValueError("not-comparable status requires a core reason")
         return self
 

@@ -1049,6 +1049,8 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
         "regression_policy": report.regression_policy.model_dump(mode="json"),
         "policy_facts_verified": report.policy_facts_verified,
         "comparability_facts_verified": report.comparability_facts_verified,
+        "baseline_pricing_fingerprint": report.baseline_pricing_fingerprint,
+        "current_pricing_fingerprint": report.current_pricing_fingerprint,
         "pricing_applicability_fingerprint": report.pricing_applicability_fingerprint,
         "baseline_trial_count": report.baseline_trial_count,
         "current_trial_count": report.current_trial_count,
@@ -1107,6 +1109,15 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
                 "comparability_fact_codes": list(item.comparability_fact_codes),
                 "comparability_facts_verified": item.comparability_facts_verified,
                 "policy_facts_verified": item.policy_facts_verified,
+                "pricing_reason": next(
+                    (
+                        reason
+                        for reason in item.reason_codes
+                        if reason
+                        in {"pricing_fingerprint_missing", "pricing_fingerprint_mismatch"}
+                    ),
+                    None,
+                ),
                 "decision": item.decision.value,
                 "reason": item.reason,
                 "reason_codes": list(item.reason_codes),

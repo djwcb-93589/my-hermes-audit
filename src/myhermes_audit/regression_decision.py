@@ -86,6 +86,12 @@ DECISION_REASON_CODES = frozenset(
     }
 )
 REASON_CODES = EVALUATION_REASON_CODES | COMPARABILITY_REASON_CODES | DECISION_REASON_CODES
+PRICING_REASON_CODES = frozenset(
+    {
+        "pricing_fingerprint_missing",
+        "pricing_fingerprint_mismatch",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -121,6 +127,15 @@ class ReportDecisionResult:
     status: str
     gate: bool
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ReportComparabilityFacts:
+    """Final Report reason projection after all Metric facts are verified."""
+
+    reasons: tuple[str, ...]
+    core_reasons: tuple[str, ...]
+    pricing_reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -191,6 +206,55 @@ def resolve_metric_policy(
         max_relative_increase=max_relative_increase,
         max_absolute_increase=max_absolute_increase,
         requires_pricing_match=explicit_pricing or metric_name.startswith("deepseek_cost_"),
+    )
+
+
+def derive_pricing_comparability_reason(
+    requires_pricing_match: bool,
+    baseline_pricing_fingerprint: str | None,
+    current_pricing_fingerprint: str | None,
+) -> str | None:
+    """Derive the only pricing reason applicable to one Metric."""
+
+    if not requires_pricing_match:
+        return None
+    if baseline_pricing_fingerprint is None or current_pricing_fingerprint is None:
+        return "pricing_fingerprint_missing"
+    if baseline_pricing_fingerprint != current_pricing_fingerprint:
+        return "pricing_fingerprint_mismatch"
+    return None
+
+
+def finalize_report_comparability_reasons(
+    base_reasons: Sequence[str],
+    pricing_reasons: Sequence[str],
+    comparable_metric_count: int,
+) -> ReportComparabilityFacts:
+    """Finalize Report reasons only after all effective Metric decisions exist."""
+
+    allowed = REASON_CODES | {"no_comparable_core_metrics"}
+    if any(reason not in allowed for reason in base_reasons):
+        raise ValueError("unknown Report comparability reason")
+    pricing = tuple(
+        sorted(
+            set(pricing_reasons).union(
+                reason for reason in base_reasons if reason in PRICING_REASON_CODES
+            )
+        )
+    )
+    if any(reason not in PRICING_REASON_CODES for reason in pricing):
+        raise ValueError("unknown pricing comparability reason")
+    reasons = set(base_reasons).union(pricing)
+    if comparable_metric_count == 0:
+        reasons.add("no_comparable_core_metrics")
+    final_reasons = tuple(sorted(reasons))
+    core_reasons = tuple(
+        reason for reason in final_reasons if reason not in PRICING_REASON_CODES
+    )
+    return ReportComparabilityFacts(
+        reasons=final_reasons,
+        core_reasons=core_reasons,
+        pricing_reasons=pricing,
     )
 
 
@@ -472,6 +536,7 @@ def derive_comparability_reason_codes(
     identities: Sequence[tuple[str, str, str | None, str, str | None]],
     baseline_pricing_fingerprint: str | None,
     current_pricing_fingerprint: str | None,
+    pricing_required: bool = True,
 ) -> tuple[str, ...]:
     """Recompute report comparability reasons from immutable metadata facts."""
 
@@ -492,13 +557,13 @@ def derive_comparability_reason_codes(
             reasons.append(f"{name}_identity_missing")
         elif baseline_value != current_value:
             reasons.append(f"{name}_identity_mismatch")
-    if (baseline_pricing_fingerprint is None) != (current_pricing_fingerprint is None):
-        reasons.append("pricing_fingerprint_missing")
-    elif (
-        baseline_pricing_fingerprint is not None
-        and baseline_pricing_fingerprint != current_pricing_fingerprint
-    ):
-        reasons.append("pricing_fingerprint_mismatch")
+    pricing_reason = derive_pricing_comparability_reason(
+        pricing_required,
+        baseline_pricing_fingerprint,
+        current_pricing_fingerprint,
+    )
+    if pricing_reason is not None:
+        reasons.append(pricing_reason)
     return tuple(sorted(set(reasons)))
 
 
@@ -544,6 +609,8 @@ __all__ = (
     "MetricDecisionResult",
     "PolicyEntryFacts",
     "PolicySnapshotFacts",
+    "PRICING_REASON_CODES",
+    "ReportComparabilityFacts",
     "REASON_CODES",
     "ReportDecisionResult",
     "decide_case_regression",
@@ -551,5 +618,7 @@ __all__ = (
     "decide_report_status",
     "derive_comparability_reason_codes",
     "derive_metric_evaluation_facts",
+    "derive_pricing_comparability_reason",
+    "finalize_report_comparability_reasons",
     "resolve_metric_policy",
 )

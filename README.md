@@ -56,7 +56,7 @@ money and savings metrics `not_comparable`; other metrics remain comparable.
 P7 task success rates use only explicit boolean `task_passed` samples, with
 sample/passed counts and rates retained for both the Suite and every Case;
 unknown (`None`) values are excluded.  Baseline and Regression contracts are
-versioned independently (`baseline-v5`, `regression-v6`) and retain total
+versioned independently (`baseline-v5`, `regression-v7`) and retain total
 Trial counts separately from declared repeats per Case.  Identity conflicts
 are represented as `ambiguous` and cannot be compared; missing
 identities are represented as `missing` and also cannot satisfy the core
@@ -69,6 +69,8 @@ Each complete Regression Report also stores a content-safe, fingerprinted
 `RegressionPolicySnapshot`. Metric policy fields and pricing applicability are
 re-derived from that snapshot during reload; standalone Metric/Case projections
 are marked report-only and are not a regression trust boundary.
+Pricing-sensitive metrics treat any missing pricing fingerprint as
+`not_comparable`; this remains local when other core metrics are comparable.
 Metric direction, policy thresholds, Case precedence, and report gate status are
 derived by shared pure decision helpers and revalidated when JSON is loaded.
 Comparison is read-only and does not invoke an Agent, Judge, Langfuse, or

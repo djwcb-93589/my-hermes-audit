@@ -56,6 +56,8 @@ from myhermes_audit.regression_decision import (
     decide_report_status,
     derive_comparability_reason_codes,
     derive_metric_evaluation_facts,
+    derive_pricing_comparability_reason,
+    finalize_report_comparability_reasons,
     resolve_metric_policy,
 )
 
@@ -672,7 +674,7 @@ def _compare_metric(
             current_sample_count=current_samples,
             comparability_fact_codes=tuple(
                 [*comparability_fact_codes]
-                + ([pricing_reason or "pricing_fingerprint_mismatch"] if pricing_issue else [])
+                + ([pricing_reason] if pricing_issue and pricing_reason is not None else [])
             ),
         )
     )
@@ -797,22 +799,16 @@ def compare_baseline(
             ),
             baseline_pricing_fingerprint=baseline.pricing_fingerprint,
             current_pricing_fingerprint=current.deepseek_pricing_fingerprint,
+            pricing_required=False,
         )
     )
-    pricing_comparable = "pricing_fingerprint_mismatch" not in reasons and "pricing_fingerprint_missing" not in reasons
-    pricing_reason = next(
-        (
-            reason
-            for reason in ("pricing_fingerprint_missing", "pricing_fingerprint_mismatch")
-            if reason in reasons
-        ),
-        None,
+    pricing_reason = derive_pricing_comparability_reason(
+        True,
+        baseline.pricing_fingerprint,
+        current.deepseek_pricing_fingerprint,
     )
-    core_reasons = [
-        reason
-        for reason in reasons
-        if reason not in {"pricing_fingerprint_mismatch", "pricing_fingerprint_missing"}
-    ]
+    pricing_comparable = pricing_reason is None
+    core_reasons = list(reasons)
     suite_metrics: list[MetricComparison] = []
     current_map = _snapshot_map(current_suite.metrics)
     baseline_map = _snapshot_map(baseline.suite_summary.metrics)
@@ -886,6 +882,10 @@ def compare_baseline(
             )
         )
     counts = _report_counts(suite_metrics, case_reports, policy_facts)
+    all_metrics = [
+        *suite_metrics,
+        *(metric for case in case_reports for metric in case.metrics),
+    ]
     comparable_metric_count = sum(
         derive_metric_decision(
             item,
@@ -897,23 +897,30 @@ def compare_baseline(
             MetricDecision.REGRESSED.value,
             MetricDecision.WARNING.value,
         }
-        for item in [
-            *suite_metrics,
-            *(metric for case in case_reports for metric in case.metrics),
-        ]
+        for item in all_metrics
     )
-    if comparable_metric_count == 0:
-        reasons.append("no_comparable_core_metrics")
+    report_comparability = finalize_report_comparability_reasons(
+        reasons,
+        [
+            reason
+            for item in all_metrics
+            if (
+                reason := derive_pricing_comparability_reason(
+                    item.requires_pricing_match,
+                    baseline.pricing_fingerprint,
+                    current.deepseek_pricing_fingerprint,
+                )
+            ) is not None
+        ],
+        comparable_metric_count,
+    )
+    reasons = list(report_comparability.reasons)
     pricing_applicability_fingerprint_value = pricing_applicability_fingerprint(
         policy_snapshot.policy_fingerprint,
         suite_metrics,
         case_reports,
     )
-    core_reasons = [
-        reason
-        for reason in reasons
-        if reason not in {"pricing_fingerprint_mismatch", "pricing_fingerprint_missing"}
-    ]
+    core_reasons = list(report_comparability.core_reasons)
     report_decision = decide_report_status(
         regression_count=counts["regression_count"],
         warning_count=counts["warning_count"],
@@ -921,7 +928,7 @@ def compare_baseline(
         core_reason_count=len(core_reasons),
     )
     status = RegressionStatus(report_decision.status)
-    warnings = sorted(set(identity_warnings + ([reason for reason in ("pricing_fingerprint_missing", "pricing_fingerprint_mismatch") if reason in reasons] if not pricing_comparable else [])))
+    warnings = sorted(set(identity_warnings + list(report_comparability.pricing_reasons)))
     current_model = _identity_projection(current_identities["model"])
     current_config = _identity_projection(current_identities["configuration"])
     current_protocol = _identity_projection(current_identities["worker_protocol"])
