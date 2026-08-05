@@ -130,18 +130,29 @@ cases:
     mode: single_turn
     input:
       message: >-
-        First use the file tool with action read on fixtures/process-input.txt.
-        Then use the public terminal tool with background=true to execute exactly
-        this command (without rewriting it): python -c "import sys; print('P6-WAIT', flush=True); line=sys.stdin.readline(); print('P6-INPUT-OK', flush=True)".
-        Use the returned process identity and call the public process tool with
-        process action=log and cursor=0 to observe P6-WAIT and status=running;
-        do not use poll as a replacement for this log step. Next submit the exact
-        content returned by the file read, wait for completed, use the previous
-        cursor for the final log, and report only the truthful result. Do not
-        interpret P6-WAIT as a new Process
-        status, do not request waiting_for_input, do not read the fixture with
-        cat, type, Get-Content, or any terminal command, and never include the
-        input body in the report.
+        First use the public file tool with action=read on
+        fixtures/process-input.txt. Preserve the complete text returned by that
+        file call exactly, character for character: do not add or remove
+        characters or newlines, and do not escape or rewrite it. Then use the
+        public terminal tool with background=true to execute exactly this command
+        (without rewriting it): python -c "import sys; print('P6-WAIT', flush=True); line=sys.stdin.readline(); print('P6-INPUT-OK', flush=True)".
+        After terminal start, use the actual process_id returned by terminal and
+        make exactly these public process calls in this order, with no skipped,
+        swapped, merged, or extra Process calls: (1) process action=log with
+        cursor=0 to observe P6-WAIT and status=running; (2) exactly once,
+        process action=submit with data set directly to the complete text
+        returned by the file tool. The submit data must not be empty, must not
+        be only an Enter, and submit itself sends Enter. Do not call process
+        action=write, do not write before submit, and do not split the input into
+        multiple Process calls; the single submit must contain the full fixture
+        text. Only after that submit completes, (3) process action=wait and wait
+        for completed; only after wait completes, (4) process action=log using
+        exactly the cursor returned by the first log. Do not call poll or any
+        other Process action. Report only the truthful result after Worker
+        cleanup, never substitute prose for a required tool call, and never
+        include the input body in the report. Do not interpret P6-WAIT as a new
+        Process status, do not request waiting_for_input, and do not read the
+        fixture with cat, type, Get-Content, or any terminal command.
     execution:
       enabled_toolsets: [file, terminal]
     fixture:
