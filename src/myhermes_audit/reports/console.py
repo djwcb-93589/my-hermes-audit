@@ -7,6 +7,7 @@ from myhermes_audit.contracts import (
     MetricStatus,
     TrialStatus,
 )
+from myhermes_audit.contracts.regression import AuditRegressionReport
 
 
 def render_console_summary(result: AuditRunResult) -> str:
@@ -389,4 +390,42 @@ def _ablation_summary(result: AuditRunResult) -> list[str]:
     return lines
 
 
-__all__ = ("render_console_summary",)
+def render_console_regression(report: AuditRegressionReport) -> str:
+    """Render baseline/current/delta facts, not a weighted summary score."""
+
+    lines = [
+        "P7 Regression comparison",
+        f"Status:              {report.status.value}",
+        f"Baseline:            {report.baseline_id}",
+        f"Current run:         {report.current_run_id}",
+        f"Trials:              {report.baseline_trial_count} -> {report.current_trial_count}",
+        f"Regression gate:     {'pass' if report.overall_regression_gate else 'fail'}",
+        f"Comparability:       {'comparable' if not report.comparability_reasons else 'not comparable'}",
+        "Counts:              "
+        f"regression={report.regression_count} "
+        f"improvement={report.improvement_count} "
+        f"unchanged={report.unchanged_count} "
+        f"warning={report.warning_count} "
+        f"not_comparable={report.not_comparable_count}",
+    ]
+    if report.comparability_reasons:
+        lines.append("Reasons:              " + ", ".join(report.comparability_reasons))
+    lines.append("Metric changes:")
+    for metric in report.suite_metrics:
+        lines.append(
+            f"- {metric.metric_name}: baseline={metric.baseline_value!r} "
+            f"current={metric.current_value!r} delta={metric.absolute_delta!r} "
+            f"samples={metric.baseline_sample_count}->{metric.current_sample_count} "
+            f"decision={metric.decision.value}"
+        )
+    lines.append("Case changes:")
+    for case in report.case_summaries:
+        lines.append(
+            f"- {case.case_id}: trials={case.baseline_trial_count}->{case.current_trial_count} "
+            f"pass_rate={case.baseline_pass_rate:.4f}->{case.current_pass_rate:.4f} "
+            f"delta={case.pass_rate_delta:+.4f} decision={case.decision.value}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+__all__ = ("render_console_summary", "render_console_regression")

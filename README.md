@@ -24,6 +24,40 @@ for Case provenance, metric denominators, exclusions, and the documented local
 run command. P6.4 does not alter the source Suites, Result Schema, Worker
 Protocol v13, or evaluator formulas.
 
+## P7 Repeat Runs, Baselines, and Regression Comparison
+
+P7 reuses the existing serial Suite runner.  The optional `--trials` override
+accepts an explicit integer from 1 through 100 and leaves the P6.4 YAML default
+at `trials: 1`.  Each Trial continues to receive its own Sandbox, MyHermes
+Session, workspace, Memory state, Artifact root, and database; no state is
+shared between repeats.  The override is part of the run Suite fingerprint,
+while a companion semantic Suite fingerprint allows comparisons whose declared
+repeat counts differ.
+
+```bash
+myhermes-audit run examples/representative_benchmark_v1.yaml \
+  --subject-repo ../my-hermes --subject-config ./local-config.yaml \
+  --trials 5 --output reports/representative-repeat.json
+
+myhermes-audit baseline create reports/representative-repeat.json \
+  --output baselines/representative-v1.json
+
+myhermes-audit baseline compare baselines/representative-v1.json \
+  reports/representative-current.json \
+  --policy configs/regression-policy.yaml \
+  --output reports/representative-regression.json
+```
+
+`AuditBaseline` is an immutable, content-fingerprinted projection of a
+validated result and may contain failed Trials.  `AuditRegressionReport`
+compares correctness, efficiency, cache, cost, failure, and Case-level action
+distribution facts without a weighted score.  Pricing mismatches make only
+money and savings metrics `not_comparable`; other metrics remain comparable.
+Comparison is read-only and does not invoke an Agent, Judge, Langfuse, or
+network service.  See [`docs/p7-baseline-regression.md`](docs/p7-baseline-regression.md)
+for denominators, compatibility rules, policy thresholds, and safe-data
+boundaries.
+
 ## P6.1 E2E scenarios
 
 The first P6 stage provides strict synthetic Toolchain and Process/Background

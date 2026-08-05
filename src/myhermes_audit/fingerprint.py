@@ -21,6 +21,21 @@ def suite_sha256(suite: AuditSuite) -> str:
     return canonical_sha256(suite)
 
 
+def suite_comparison_sha256(suite: AuditSuite) -> str:
+    """Return the semantic Suite digest used for repeat-run comparison.
+
+    ``defaults.trials`` is a run-size declaration, not a Case contract.  It
+    is therefore deliberately excluded from this companion digest while the
+    ordinary Suite digest continues to include it in the run identity.
+    """
+
+    payload = suite.model_dump(mode="json", exclude_none=False)
+    defaults = payload.get("defaults")
+    if isinstance(defaults, dict):
+        defaults.pop("trials", None)
+    return canonical_sha256(payload)
+
+
 def _run_git(repository: Path, *arguments: str) -> str:
     command = ["git", "--no-optional-locks", "-C", str(repository), *arguments]
     try:
@@ -138,6 +153,7 @@ def build_audit_fingerprint(
         audit_version=audit_version,
         audit_commit=audit_commit,
         suite_sha256=suite_sha256(suite),
+        suite_comparison_sha256=suite_comparison_sha256(suite),
         python_version=platform_module.python_version(),
         platform=platform_module.platform(),
         created_at=timestamp,

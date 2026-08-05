@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from myhermes_audit.contracts import MemorySnapshotPhase, MetricSource, MetricStatus
+from myhermes_audit.contracts.regression import AuditRegressionReport
 from myhermes_audit.integrations.langfuse.redaction import project_remote_content
 from myhermes_audit.ports.langfuse import LangfuseTrialRequest
 
@@ -1032,6 +1033,60 @@ def _safe_background_review_metric(metric) -> dict:
     }
 
 
+def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]:
+    """Return a content-free comparison projection for an existing mapper.
+
+    This helper performs no network publication.  It is intentionally limited
+    to IDs, statuses, counts, deltas, and safe failure codes.
+    """
+
+    return {
+        "baseline_id": report.baseline_id,
+        "current_run_id": report.current_run_id,
+        "comparability_status": report.status.value,
+        "comparability_reasons": list(report.comparability_reasons),
+        "baseline_trial_count": report.baseline_trial_count,
+        "current_trial_count": report.current_trial_count,
+        "regression_count": report.regression_count,
+        "improvement_count": report.improvement_count,
+        "unchanged_count": report.unchanged_count,
+        "warning_count": report.warning_count,
+        "not_comparable_count": report.not_comparable_count,
+        "overall_regression_gate": report.overall_regression_gate,
+        "case_pass_rates": {
+            item.case_id: {
+                "baseline": item.baseline_pass_rate,
+                "current": item.current_pass_rate,
+                "delta": item.pass_rate_delta,
+                "baseline_trial_count": item.baseline_trial_count,
+                "current_trial_count": item.current_trial_count,
+                "decision": item.decision.value,
+            }
+            for item in report.case_summaries
+        },
+        "metric_deltas": [
+            {
+                "metric_name": item.metric_name,
+                "baseline_value": _safe_regression_scalar(item.baseline_value),
+                "current_value": _safe_regression_scalar(item.current_value),
+                "absolute_delta": _safe_regression_scalar(item.absolute_delta),
+                "relative_delta": item.relative_delta,
+                "baseline_sample_count": item.baseline_sample_count,
+                "current_sample_count": item.current_sample_count,
+                "decision": item.decision.value,
+                "reason": item.reason,
+            }
+            for item in report.suite_metrics
+        ],
+    }
+
+
+def _safe_regression_scalar(value: object) -> object:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def _safe_review_evidence_kinds(value: object) -> list[str]:
     """Keep only the closed public evidence-kind vocabulary in a metric."""
 
@@ -1880,4 +1935,5 @@ __all__ = (
     "TURN_NAME",
     "VALIDATOR_NAME",
     "publish_replay_observations",
+    "project_regression_metadata",
 )

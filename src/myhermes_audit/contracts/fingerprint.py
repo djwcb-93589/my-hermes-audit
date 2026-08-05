@@ -35,6 +35,10 @@ class AuditFingerprint(ContractModel):
     audit_version: NonEmptyText
     audit_commit: GitObjectId | None = None
     suite_sha256: Sha256Digest
+    # The run fingerprint includes the declared trial override.  This
+    # companion digest describes the Suite semantics while intentionally
+    # ignoring only ``defaults.trials`` so repeat counts remain comparable.
+    suite_comparison_sha256: Sha256Digest | None = None
     python_version: NonEmptyText
     platform: NonEmptyText
     created_at: UtcDatetime

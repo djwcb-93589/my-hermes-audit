@@ -13,7 +13,14 @@ from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
-from myhermes_audit.contracts import AuditCase, AuditSuite
+from myhermes_audit.contracts import (
+    AuditBaseline,
+    AuditCase,
+    AuditRegressionReport,
+    AuditRunResult,
+    AuditSuite,
+)
+from myhermes_audit.artifacts import atomic_write_json
 from myhermes_audit.datasets import load_suite
 from myhermes_audit.errors import AuditError, ReportError, UnsupportedCaseError
 from myhermes_audit.fingerprint import suite_sha256
@@ -107,6 +114,33 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="publish hashes, lengths, statuses, and metrics without input/output content",
     )
+    run_parser.add_argument(
+        "--trials",
+        type=_trial_count_arg,
+        help="explicit positive repeat count (1-100); overrides Suite defaults",
+    )
+
+    baseline_parser = subparsers.add_parser(
+        "baseline",
+        help="create an immutable baseline or compare one with a current result",
+    )
+    baseline_subparsers = baseline_parser.add_subparsers(
+        dest="baseline_command", required=True
+    )
+    baseline_create = baseline_subparsers.add_parser(
+        "create", help="create a Baseline from a validated AuditRunResult"
+    )
+    baseline_create.add_argument("result", type=Path, help="AuditRunResult JSON")
+    baseline_create.add_argument("--output", type=Path, required=True)
+    baseline_create.add_argument("--overwrite", action="store_true")
+    baseline_compare = baseline_subparsers.add_parser(
+        "compare", help="compare a Baseline with a validated current result"
+    )
+    baseline_compare.add_argument("baseline", type=Path, help="Baseline JSON")
+    baseline_compare.add_argument("current", type=Path, help="current AuditRunResult JSON")
+    baseline_compare.add_argument("--policy", type=Path, required=True)
+    baseline_compare.add_argument("--output", type=Path)
+    baseline_compare.add_argument("--overwrite", action="store_true")
 
     sync_parser = subparsers.add_parser(
         "sync",
@@ -218,6 +252,14 @@ def _run_command(arguments: argparse.Namespace) -> int:
 
     suite_path = arguments.suite.expanduser().resolve(strict=False)
     suite = load_suite(suite_path)
+    if arguments.trials is not None:
+        suite = suite.model_copy(
+            update={
+                "defaults": suite.defaults.model_copy(
+                    update={"trials": arguments.trials}
+                )
+            }
+        )
     selected = _select_cases(suite, arguments.case_ids)
     _validate_run_integration_options(arguments)
     output = _report_path(arguments.output, suite.suite_id)
@@ -471,6 +513,123 @@ def _doctor_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _trial_count_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--trials must be an integer") from exc
+    if parsed < 1 or parsed > 100:
+        raise argparse.ArgumentTypeError("--trials must be between 1 and 100")
+    return parsed
+
+
+def _load_json_model(path: Path, model_type, *, label: str):
+    candidate = Path(path).expanduser()
+    if candidate.is_symlink():
+        raise ReportError(f"{label} input cannot be a symbolic link")
+    resolved = candidate.resolve(strict=False)
+    if not resolved.is_file():
+        raise ReportError(f"{label} input must be a regular file")
+    try:
+        if resolved.stat().st_size > 100 * 1024 * 1024:
+            raise ReportError(f"{label} input exceeds the safe size limit")
+        return model_type.model_validate_json(resolved.read_text(encoding="utf-8"))
+    except ReportError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise ReportError(f"{label} input is invalid", operation="load_json") from exc
+
+
+def _validate_baseline_output(
+    path: Path,
+    *,
+    overwrite: bool,
+    protected: tuple[Path, ...] = (),
+) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate.is_symlink():
+        raise ReportError("baseline output cannot be a symbolic link")
+    resolved = candidate.resolve(strict=False)
+    protected_paths = {
+        Path(item).expanduser().resolve(strict=False) for item in protected
+    }
+    if resolved in protected_paths:
+        raise ReportError("output cannot overwrite a Baseline or result input")
+    if resolved.exists() and not resolved.is_file():
+        raise ReportError("baseline output must be a regular file path")
+    if resolved.exists() and not overwrite:
+        raise ReportError("baseline output exists; pass --overwrite explicitly")
+    parent = resolved.parent
+    if parent.exists() and not parent.is_dir():
+        raise ReportError("baseline output parent is not a directory")
+    parent.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _baseline_create_command(arguments: argparse.Namespace) -> int:
+    from myhermes_audit.regression import build_baseline
+
+    result = _load_json_model(arguments.result, AuditRunResult, label="Audit result")
+    baseline = build_baseline(result)
+    output = _validate_baseline_output(
+        arguments.output,
+        overwrite=arguments.overwrite,
+        protected=(arguments.result,),
+    )
+    old_id = None
+    if output.exists() and arguments.overwrite:
+        try:
+            old_id = _load_json_model(output, AuditBaseline, label="existing Baseline").baseline_id
+        except ReportError:
+            old_id = "<invalid-existing-baseline>"
+    atomic_write_json(output, baseline)
+    print(f"Baseline ID:         {baseline.baseline_id}")
+    print(f"Baseline fingerprint: {baseline.baseline_fingerprint}")
+    if old_id is not None:
+        print(f"Overwrote Baseline:  {old_id} -> {baseline.baseline_id}")
+    print(f"Baseline:            {output}")
+    return 0
+
+
+def _default_regression_output(baseline: AuditBaseline, current: AuditRunResult) -> Path:
+    return (
+        Path.cwd()
+        / "reports"
+        / f"regression-{baseline.baseline_id}-{current.run_id}.json"
+    ).resolve(strict=False)
+
+
+def _baseline_compare_command(arguments: argparse.Namespace) -> int:
+    from myhermes_audit.regression import compare_baseline, load_regression_policy
+    from myhermes_audit.reports.console import render_console_regression
+
+    baseline = _load_json_model(arguments.baseline, AuditBaseline, label="Baseline")
+    current = _load_json_model(
+        arguments.current, AuditRunResult, label="current Audit result"
+    )
+    try:
+        policy = load_regression_policy(arguments.policy)
+        report = compare_baseline(baseline, current, policy)
+    except ValueError as exc:
+        raise ReportError(
+            "baseline comparison input is invalid", operation="compare"
+        ) from exc
+    output = (
+        _default_regression_output(baseline, current)
+        if arguments.output is None
+        else arguments.output
+    )
+    output = _validate_baseline_output(
+        output,
+        overwrite=arguments.overwrite,
+        protected=(arguments.baseline, arguments.current),
+    )
+    atomic_write_json(output, report)
+    sys.stdout.write(render_console_regression(report))
+    print(f"Regression report: {output}")
+    return 0 if report.overall_regression_gate else 1
+
+
 def _presence(available: bool) -> str:
     return "installed" if available else "not installed"
 
@@ -607,6 +766,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _schema_command(arguments.output)
         if arguments.command == "run":
             return _run_command(arguments)
+        if arguments.command == "baseline":
+            if arguments.baseline_command == "create":
+                return _baseline_create_command(arguments)
+            if arguments.baseline_command == "compare":
+                return _baseline_compare_command(arguments)
         if arguments.command == "sync":
             return _sync_command(arguments)
         if arguments.command == "doctor":

@@ -79,8 +79,8 @@ from myhermes_audit.contracts.scenario import (
 from myhermes_audit.serialization import canonical_sha256
 
 
-RESULT_SCHEMA_VERSION = "1.5"
-ResultSchemaVersion = Literal["1.5"]
+RESULT_SCHEMA_VERSION = "1.6"
+ResultSchemaVersion = Literal["1.6"]
 
 
 class TrialStatus(str, Enum):
