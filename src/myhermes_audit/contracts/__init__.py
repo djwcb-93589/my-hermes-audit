@@ -79,6 +79,7 @@ from myhermes_audit.contracts.cost import (
     DeepSeekCostStatus,
     DeepSeekCostSummary,
     DeepSeekPricingConfig,
+    DeepSeekPricingSnapshot,
 )
 from myhermes_audit.contracts.data import DataClassification
 from myhermes_audit.contracts.judge import (
@@ -288,6 +289,7 @@ __all__ = (
     "DeepSeekCostStatus",
     "DeepSeekCostSummary",
     "DeepSeekPricingConfig",
+    "DeepSeekPricingSnapshot",
     "CaseInput",
     "CaseMode",
     "DataClassification",

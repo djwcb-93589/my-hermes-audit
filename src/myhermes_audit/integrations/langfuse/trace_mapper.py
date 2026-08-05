@@ -1830,6 +1830,7 @@ def _cost_metadata(trial) -> dict[str, object]:
     if cost is None:
         return {
             "deepseek_cost_status": "not_evaluated",
+            "deepseek_cost_model": None,
             "deepseek_cost_currency": None,
             "deepseek_cost_pricing_fingerprint": None,
         }
@@ -1839,6 +1840,9 @@ def _cost_metadata(trial) -> dict[str, object]:
 
     return {
         "deepseek_cost_status": cost.status.value,
+        "deepseek_cost_model": (
+            None if cost.pricing_snapshot is None else cost.pricing_snapshot.model
+        ),
         "deepseek_cost_currency": cost.currency,
         "deepseek_cost_pricing_fingerprint": cost.pricing_fingerprint,
         "deepseek_cost_classified_cost_usd": amount(cost.classified_cost_usd),

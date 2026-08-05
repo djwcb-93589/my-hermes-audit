@@ -197,18 +197,32 @@ def _cache_summary(value) -> str:
 
 
 def _cost_summary(value) -> str:
-    if value is None or value.status.value == "not_evaluated":
+    if value is None:
         return "not evaluated"
-    parts = [value.status.value]
+    parts = [
+        value.status.value,
+        "Trials "
+        f"{value.trial_count} (available {value.available_trial_count}, "
+        f"partial {value.partial_trial_count}, "
+        f"not evaluated {value.not_evaluated_trial_count}, "
+        f"invalid {value.invalid_trial_count})",
+    ]
+    if value.status.value == "not_evaluated":
+        parts.append("no monetary facts")
     if value.total_cost_usd is not None:
         parts.append(f"total USD {_money(value.total_cost_usd)}")
     if value.classified_cost_usd is not None and value.total_cost_usd is None:
         parts.append(f"classified USD {_money(value.classified_cost_usd)}")
+    if value.available_total_cost_usd is not None and value.total_cost_usd is None:
+        parts.append(
+            f"available subtotal USD {_money(value.available_total_cost_usd)}"
+        )
     if value.mean_cost_per_successful_trial_usd is not None:
         parts.append(
-            "mean successful Trial USD "
+            "evaluated-success mean USD "
             f"{_money(value.mean_cost_per_successful_trial_usd)}"
         )
+        parts.append(f"evaluated successes {value.cost_evaluated_success_count}")
     if value.effective_cost_per_success_usd is not None:
         parts.append(
             "effective USD " f"{_money(value.effective_cost_per_success_usd)}"

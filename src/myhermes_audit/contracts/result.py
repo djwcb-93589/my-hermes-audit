@@ -79,8 +79,8 @@ from myhermes_audit.contracts.scenario import (
 from myhermes_audit.serialization import canonical_sha256
 
 
-RESULT_SCHEMA_VERSION = "1.3"
-ResultSchemaVersion = Literal["1.3"]
+RESULT_SCHEMA_VERSION = "1.4"
+ResultSchemaVersion = Literal["1.4"]
 
 
 class TrialStatus(str, Enum):
@@ -1288,14 +1288,19 @@ class AuditRunResult(ContractModel):
             if trial.deepseek_cost is not None
             and trial.deepseek_cost.pricing_fingerprint is not None
         }
-        if len(cost_fingerprints) > 1:
+        aggregate_cost_fingerprints = {
+            aggregate.deepseek_cost.pricing_fingerprint
+            for aggregate in [*self.cases, self.summary]
+            if aggregate.deepseek_cost is not None
+            and aggregate.deepseek_cost.pricing_fingerprint is not None
+        }
+        all_cost_fingerprints = cost_fingerprints | aggregate_cost_fingerprints
+        if len(all_cost_fingerprints) > 1:
             raise ValueError("Trials must use one DeepSeek pricing fingerprint")
-        if cost_fingerprints and self.deepseek_pricing_fingerprint != next(
-            iter(cost_fingerprints)
+        if all_cost_fingerprints and self.deepseek_pricing_fingerprint != next(
+            iter(all_cost_fingerprints)
         ):
-            raise ValueError(
-                "deepseek_pricing_fingerprint must match Trial cost summaries"
-            )
+            raise ValueError("deepseek_pricing_fingerprint must match cost summaries")
         if set(comparison_case_ids) != p4_case_ids:
             raise ValueError(
                 "ablation comparisons must cover every and only P4 Case"

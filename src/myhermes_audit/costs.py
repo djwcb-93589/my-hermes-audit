@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from typing import Any
 
 from myhermes_audit.contracts import (
@@ -11,10 +11,11 @@ from myhermes_audit.contracts import (
     DeepSeekCostStatus,
     DeepSeekCostSummary,
     DeepSeekPricingConfig,
+    DeepSeekPricingSnapshot,
     DeepSeekCacheStatus,
     TrialResult,
 )
-from myhermes_audit.contracts.cost import MILLION, MONEY_QUANTUM, RATE_QUANTUM
+from myhermes_audit.contracts.cost import charge_tokens, quantize_money, quantize_rate
 
 
 def compute_deepseek_cost(
@@ -28,6 +29,7 @@ def compute_deepseek_cost(
     except (ArithmeticError, AttributeError, TypeError, ValueError):
         return DeepSeekCostSummary(
             status=DeepSeekCostStatus.INVALID,
+            pricing_snapshot=(None if pricing is None else pricing.snapshot()),
             pricing_fingerprint=(
                 None if pricing is None else pricing.pricing_fingerprint()
             ),
@@ -51,6 +53,7 @@ def _compute_deepseek_cost(
     miss_tokens = runtime.prompt_cache_miss_tokens
     cache_status = runtime.deepseek_cache_status
     common = {
+        "subject_model": runtime.subject_model,
         "prompt_tokens": prompt_tokens,
         "prompt_cache_hit_tokens": hit_tokens,
         "prompt_cache_miss_tokens": miss_tokens,
@@ -66,16 +69,30 @@ def _compute_deepseek_cost(
             **common,
             warnings=["pricing_not_configured"],
         )
+    snapshot = pricing.snapshot()
     identity = {
-        "pricing_fingerprint": pricing.pricing_fingerprint(),
-        "currency": pricing.currency,
+        "pricing_snapshot": snapshot,
+        "pricing_fingerprint": snapshot.pricing_fingerprint,
+        "currency": snapshot.currency,
     }
-    if prompt_tokens is None or completion_tokens is None:
+    if runtime.subject_model is None:
+        return _not_evaluated(
+            pricing,
+            facts=common,
+            warnings=("subject_model_unavailable",),
+        )
+    if runtime.subject_model != pricing.model:
         return DeepSeekCostSummary(
-            status=DeepSeekCostStatus.NOT_EVALUATED,
+            status=DeepSeekCostStatus.INVALID,
             **identity,
             **common,
-            warnings=["ordinary_token_usage_unavailable"],
+            warnings=["deepseek_pricing_model_mismatch"],
+        )
+    if prompt_tokens is None or completion_tokens is None:
+        return _not_evaluated(
+            pricing,
+            facts=common,
+            warnings=("ordinary_token_usage_unavailable",),
         )
     if cache_status is DeepSeekCacheStatus.INVALID:
         return DeepSeekCostSummary(
@@ -85,11 +102,10 @@ def _compute_deepseek_cost(
             warnings=["invalid_deepseek_cache_usage"],
         )
     if cache_status is DeepSeekCacheStatus.NOT_EVALUATED:
-        return DeepSeekCostSummary(
-            status=DeepSeekCostStatus.NOT_EVALUATED,
-            **identity,
-            **common,
-            warnings=["deepseek_cache_usage_unavailable"],
+        return _not_evaluated(
+            pricing,
+            facts=common,
+            warnings=("deepseek_cache_usage_unavailable",),
         )
     if (
         evaluated_prompt_tokens is None
@@ -113,12 +129,19 @@ def _compute_deepseek_cost(
                 warnings=["available_cache_does_not_cover_prompt_tokens"],
             )
         return _available_cost(
-            pricing,
+            snapshot=identity["pricing_snapshot"],
             **common,
         )
     if cache_status is DeepSeekCacheStatus.PARTIAL:
+        if evaluated_prompt_tokens == prompt_tokens:
+            return DeepSeekCostSummary(
+                status=DeepSeekCostStatus.INVALID,
+                **identity,
+                **common,
+                warnings=["partial_cache_covers_all_prompt_tokens"],
+            )
         return _partial_cost(
-            pricing,
+            snapshot=identity["pricing_snapshot"],
             **common,
         )
     return DeepSeekCostSummary(
@@ -172,33 +195,50 @@ def aggregate_deepseek_costs(
         None if cost is None else cost.pricing_fingerprint for cost in costs
     ]
     currency_values = [None if cost is None else cost.currency for cost in costs]
+    snapshot_values = [
+        None if cost is None else cost.pricing_snapshot for cost in costs
+    ]
     fingerprints = {value for value in fingerprint_values if value is not None}
     currencies = {value for value in currency_values if value is not None}
+    snapshots = {
+        value.pricing_fingerprint
+        for value in snapshot_values
+        if value is not None
+    }
+    snapshot_models = {
+        value.model for value in snapshot_values if value is not None
+    }
     warnings: list[str] = []
     inconsistent_identity = (
         len(fingerprints) > 1
         or len(currencies) > 1
-        or (bool(fingerprints) and any(value is None for value in fingerprint_values))
-        or (bool(currencies) and any(value is None for value in currency_values))
+        or len(snapshots) > 1
+        or len(snapshot_models) > 1
     )
     if inconsistent_identity:
         warnings.append("inconsistent_pricing_identity")
     pricing_fingerprint = next(iter(fingerprints), None)
     currency = next(iter(currencies), None)
+    pricing_snapshot = next(
+        (value for value in snapshot_values if value is not None), None
+    )
     if inconsistent_identity:
         pricing_fingerprint = None
         currency = None
+        pricing_snapshot = None
     coverage = (
         None
         if token_bearing_count == 0
-        else _quantize_rate(Decimal(available_count) / Decimal(token_bearing_count))
+        else quantize_rate(Decimal(available_count) / Decimal(token_bearing_count))
     )
     base = dict(
         status=DeepSeekCostStatus.NOT_EVALUATED,
         currency=currency,
         pricing_fingerprint=pricing_fingerprint,
+        pricing_snapshot=pricing_snapshot,
         trial_count=len(trials),
         token_bearing_trial_count=token_bearing_count,
+        successful_trial_count=sum(trial.passed is True for trial in trials),
         available_trial_count=available_count,
         partial_trial_count=partial_count,
         not_evaluated_trial_count=not_evaluated_count,
@@ -238,14 +278,57 @@ def aggregate_deepseek_costs(
         and cost.total_cost_usd is not None
     ]
     successful_count = sum(trial.passed is True for trial in trials)
+    evaluated_costs = [
+        cost
+        for cost in costs
+        if cost is not None
+        and cost.status in (DeepSeekCostStatus.AVAILABLE, DeepSeekCostStatus.PARTIAL)
+    ]
+    cost_evaluated_success_count = sum(
+        trial.passed is True
+        and cost is not None
+        and cost.status is DeepSeekCostStatus.AVAILABLE
+        for trial, cost in zip(trials, costs)
+    )
+    base["cost_evaluated_success_count"] = cost_evaluated_success_count
+    base["cost_evaluated_success_total_usd"] = _sum_money(successful_complete)
+    base.update(
+        prompt_tokens=_sum_int(evaluated_costs, "prompt_tokens"),
+        prompt_cache_hit_tokens=_sum_int(
+            evaluated_costs, "prompt_cache_hit_tokens"
+        ),
+        prompt_cache_miss_tokens=_sum_int(
+            evaluated_costs, "prompt_cache_miss_tokens"
+        ),
+        evaluated_prompt_tokens=_sum_int(
+            evaluated_costs, "evaluated_prompt_tokens"
+        ),
+        unclassified_prompt_tokens=_sum_int(
+            evaluated_costs, "unclassified_prompt_tokens"
+        ),
+        completion_tokens=_sum_int(evaluated_costs, "completion_tokens"),
+        cache_hit_input_cost_usd=_sum_money(
+            cost.cache_hit_input_cost_usd for cost in evaluated_costs
+        ),
+        cache_miss_input_cost_usd=_sum_money(
+            cost.cache_miss_input_cost_usd for cost in evaluated_costs
+        ),
+        completion_cost_usd=_sum_money(
+            cost.completion_cost_usd for cost in evaluated_costs
+        ),
+    )
     complete_total = _sum_money(cost.total_cost_usd for cost in complete_costs)
     classified_total = _sum_money(classified_costs)
     mean_evaluated = _mean_money(cost.total_cost_usd for cost in complete_costs)
     mean_successful = _mean_money(successful_complete)
+    successful_complete_total = _sum_money(successful_complete)
+    base["cost_evaluated_success_count"] = cost_evaluated_success_count
+    base["cost_evaluated_success_total_usd"] = successful_complete_total
+    base["available_total_cost_usd"] = complete_total
     effective = (
         None
         if successful_count == 0 or complete_total is None
-        else _quantize_money(complete_total / Decimal(successful_count))
+        else quantize_money(complete_total / Decimal(successful_count))
     )
     status = (
         DeepSeekCostStatus.AVAILABLE
@@ -268,10 +351,11 @@ def aggregate_deepseek_costs(
         rate = (
             None
             if estimated in (None, Decimal("0")) or savings is None
-            else _quantize_rate(savings / estimated)
+            else quantize_rate(savings / estimated)
         )
     else:
         total = estimated = savings = rate = None
+        effective = None
     return DeepSeekCostAggregate(
         **base,
         total_cost_usd=total,
@@ -285,29 +369,46 @@ def aggregate_deepseek_costs(
     )
 
 
-def _available_cost(pricing: DeepSeekPricingConfig, **facts: Any) -> DeepSeekCostSummary:
-    hit_cost = _charge(facts["prompt_cache_hit_tokens"], pricing.prompt_cache_hit_usd_per_million_tokens)
-    miss_cost = _charge(facts["prompt_cache_miss_tokens"], pricing.prompt_cache_miss_usd_per_million_tokens)
-    completion_cost = _charge(facts["completion_tokens"], pricing.completion_usd_per_million_tokens)
+def _available_cost(
+    *,
+    snapshot: DeepSeekPricingSnapshot,
+    **facts: Any,
+) -> DeepSeekCostSummary:
+    hit_cost = charge_tokens(
+        facts["prompt_cache_hit_tokens"],
+        snapshot.prompt_cache_hit_usd_per_million_tokens,
+    )
+    miss_cost = charge_tokens(
+        facts["prompt_cache_miss_tokens"],
+        snapshot.prompt_cache_miss_usd_per_million_tokens,
+    )
+    completion_cost = charge_tokens(
+        facts["completion_tokens"], snapshot.completion_usd_per_million_tokens
+    )
     total = _quantized_sum(hit_cost, miss_cost, completion_cost)
     estimated = _quantized_sum(
-        _charge(facts["prompt_tokens"], pricing.prompt_cache_miss_usd_per_million_tokens),
+        charge_tokens(
+            facts["prompt_tokens"],
+            snapshot.prompt_cache_miss_usd_per_million_tokens,
+        ),
         completion_cost,
     )
-    savings = _quantize_money(estimated - total)
+    savings = quantize_money(estimated - total)
     if savings < 0:
         return DeepSeekCostSummary(
             status=DeepSeekCostStatus.INVALID,
-            pricing_fingerprint=pricing.pricing_fingerprint(),
-            currency=pricing.currency,
+            pricing_snapshot=snapshot,
+            pricing_fingerprint=snapshot.pricing_fingerprint,
+            currency=snapshot.currency,
             **facts,
             warnings=["cache_savings_would_be_negative"],
         )
-    rate = None if estimated == 0 else _quantize_rate(savings / estimated)
+    rate = None if estimated == 0 else quantize_rate(savings / estimated)
     return DeepSeekCostSummary(
         status=DeepSeekCostStatus.AVAILABLE,
-        pricing_fingerprint=pricing.pricing_fingerprint(),
-        currency=pricing.currency,
+        pricing_snapshot=snapshot,
+        pricing_fingerprint=snapshot.pricing_fingerprint,
+        currency=snapshot.currency,
         **facts,
         cache_hit_input_cost_usd=hit_cost,
         cache_miss_input_cost_usd=miss_cost,
@@ -320,14 +421,27 @@ def _available_cost(pricing: DeepSeekPricingConfig, **facts: Any) -> DeepSeekCos
     )
 
 
-def _partial_cost(pricing: DeepSeekPricingConfig, **facts: Any) -> DeepSeekCostSummary:
-    hit_cost = _charge(facts["prompt_cache_hit_tokens"], pricing.prompt_cache_hit_usd_per_million_tokens)
-    miss_cost = _charge(facts["prompt_cache_miss_tokens"], pricing.prompt_cache_miss_usd_per_million_tokens)
-    completion_cost = _charge(facts["completion_tokens"], pricing.completion_usd_per_million_tokens)
+def _partial_cost(
+    *,
+    snapshot: DeepSeekPricingSnapshot,
+    **facts: Any,
+) -> DeepSeekCostSummary:
+    hit_cost = charge_tokens(
+        facts["prompt_cache_hit_tokens"],
+        snapshot.prompt_cache_hit_usd_per_million_tokens,
+    )
+    miss_cost = charge_tokens(
+        facts["prompt_cache_miss_tokens"],
+        snapshot.prompt_cache_miss_usd_per_million_tokens,
+    )
+    completion_cost = charge_tokens(
+        facts["completion_tokens"], snapshot.completion_usd_per_million_tokens
+    )
     return DeepSeekCostSummary(
         status=DeepSeekCostStatus.PARTIAL,
-        pricing_fingerprint=pricing.pricing_fingerprint(),
-        currency=pricing.currency,
+        pricing_snapshot=snapshot,
+        pricing_fingerprint=snapshot.pricing_fingerprint,
+        currency=snapshot.currency,
         **facts,
         classified_cost_usd=_quantized_sum(hit_cost, miss_cost, completion_cost),
         cache_hit_input_cost_usd=hit_cost,
@@ -339,11 +453,15 @@ def _partial_cost(pricing: DeepSeekPricingConfig, **facts: Any) -> DeepSeekCostS
 def _not_evaluated(
     pricing: DeepSeekPricingConfig | None,
     *,
+    facts: dict[str, Any] | None = None,
     warnings: tuple[str, ...],
 ) -> DeepSeekCostSummary:
     return DeepSeekCostSummary(
         status=DeepSeekCostStatus.NOT_EVALUATED,
-        pricing_fingerprint=(None if pricing is None else pricing.pricing_fingerprint()),
+        **({} if facts is None else facts),
+        pricing_fingerprint=(
+            None if pricing is None else pricing.pricing_fingerprint()
+        ),
         currency=(None if pricing is None else pricing.currency),
         warnings=list(warnings),
     )
@@ -355,23 +473,8 @@ def _unclassified(prompt: int | None, evaluated: int | None) -> int | None:
     return prompt - evaluated
 
 
-def _charge(tokens: int, price: Decimal) -> Decimal:
-    return (Decimal(tokens) * price / MILLION).quantize(
-        MONEY_QUANTUM,
-        rounding=ROUND_HALF_UP,
-    )
-
-
-def _quantize_money(value: Decimal) -> Decimal:
-    return value.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
-
-
-def _quantize_rate(value: Decimal) -> Decimal:
-    return value.quantize(RATE_QUANTUM, rounding=ROUND_HALF_UP)
-
-
 def _quantized_sum(*values: Decimal | None) -> Decimal:
-    return _quantize_money(sum((value or Decimal("0")) for value in values))
+    return quantize_money(sum((value or Decimal("0")) for value in values))
 
 
 def _sum_money(values) -> Decimal | None:
@@ -379,9 +482,16 @@ def _sum_money(values) -> Decimal | None:
     return None if not values else _quantized_sum(*values)
 
 
+def _sum_int(costs, field_name: str) -> int | None:
+    if not costs:
+        return None
+    values = [getattr(cost, field_name) for cost in costs]
+    return None if any(value is None for value in values) else sum(values)
+
+
 def _mean_money(values) -> Decimal | None:
     values = [value for value in values if value is not None]
-    return None if not values else _quantize_money(sum(values) / Decimal(len(values)))
+    return None if not values else quantize_money(sum(values) / Decimal(len(values)))
 
 
 __all__ = (

@@ -11,16 +11,34 @@ network response.
 `DeepSeekPricingConfig`: model, `USD` currency, hit/miss prompt prices,
 completion price, pricing version, effective date, and an optional local source
 note. Prices are expressed in USD per million tokens, validated as finite
-non-negative decimal values, and money is quantized to eight decimal places
-using `Decimal`/ROUND_HALF_UP. The pricing fingerprint includes model,
+non-negative decimal values; the cache-hit price must not exceed the
+cache-miss price. Money is quantized to eight decimal places using
+`Decimal`/ROUND_HALF_UP. The pricing fingerprint includes model,
 currency, all three prices, pricing version, and effective date. The source
-note is not projected to remote metadata.
+note is not part of that pricing fingerprint or projected to remote metadata;
+the broader Suite fingerprint still covers the declared local configuration.
+
+Evaluated (available or partial) Trial and aggregate results carry a
+source-note-free
+`DeepSeekPricingSnapshot` containing the normalized model, currency, three
+prices, pricing version, effective date, and pricing fingerprint. The snapshot
+fingerprint is recomputed from those fields when JSON is loaded.
+
+Unevaluated Trials may retain only the configured currency and fingerprint for
+diagnostics; they do not carry an evaluable pricing snapshot or monetary
+amounts.
 
 No pricing means `not_evaluated`; it is not zero cost. No online price lookup,
 GLM/Volcengine pricing, provider registry, budget gate, or cache control is
 implemented.
 
-The result schema is `1.3`; older reports without cost fields are legacy data
+The runtime `subject_model` must exactly equal the configured pricing model.
+Missing runtime model identity yields `not_evaluated`; a present but different
+identifier yields `invalid` with the safe warning
+`deepseek_pricing_model_mismatch` and no monetary totals.
+
+The result schema is `1.4`; older reports without cost fields or pricing
+snapshots are legacy data
 and are never backfilled or interpreted as zero.
 
 ## Trial and aggregate status
@@ -36,10 +54,19 @@ negative/non-finite calculations are `invalid` without failing the Trial.
 For `available` Trials, total cost is hit input cost plus miss input cost plus
 completion cost. A no-cache estimate prices every prompt token as a miss.
 Savings is the estimate minus actual total; the savings rate is omitted when
-the denominator is zero. Failed or timed-out Trials with complete costs are
+the denominator is zero. Trial and aggregate contracts revalidate each
+token-by-price component and the savings relation when JSON is loaded. Failed
+or timed-out Trials with complete costs are
 included in `effective_cost_per_success_usd` (complete Trial costs divided by
 the number of successful Trials), while partial and unevaluated Trials are
-excluded and reported through coverage.
+excluded and reported through coverage. At Case/Suite level the effective
+cost is emitted only when the aggregate is fully `available`; incomplete
+coverage never treats unknown cost as zero.
+
+Partial aggregates keep classified component costs and an available-cost
+subtotal only (`available_total_cost_usd`); their complete total, no-cache
+estimate, savings, and effective cost remain `None`. The successful-sample
+mean is backed by its explicit evaluated-success count and subtotal.
 
 Suite and Case projections reuse the same aggregation component. Coverage is
 `available_trial_count / token_bearing_trial_count`; an empty denominator is
