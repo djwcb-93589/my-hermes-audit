@@ -867,7 +867,7 @@ class AuditRegressionReport(ContractModel):
 
     model_config = ConfigDict(frozen=True)
 
-    schema_version: RegressionSchemaVersion = REGRESSION_SCHEMA_VERSION
+    schema_version: RegressionSchemaVersion
     regression_policy: RegressionPolicySnapshot
     regression_policy_fingerprint: Sha256Digest
     policy_facts_verified: Literal[True]

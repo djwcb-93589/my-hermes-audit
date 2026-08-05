@@ -43,6 +43,7 @@ from myhermes_audit.contracts.regression import (
     RegressionStatus,
     METRIC_CONTRACT_VERSION,
     BASELINE_SCHEMA_VERSION,
+    REGRESSION_SCHEMA_VERSION,
     pricing_applicability_fingerprint,
 )
 from myhermes_audit.serialization import canonical_sha256
@@ -936,6 +937,7 @@ def compare_baseline(
         list(current_cases.values())
     )
     return AuditRegressionReport(
+        schema_version=REGRESSION_SCHEMA_VERSION,
         baseline_id=baseline.baseline_id,
         current_run_id=current.run_id,
         status=status,

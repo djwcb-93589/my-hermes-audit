@@ -235,16 +235,21 @@ def finalize_report_comparability_reasons(
     allowed = REASON_CODES | {"no_comparable_core_metrics"}
     if any(reason not in allowed for reason in base_reasons):
         raise ValueError("unknown Report comparability reason")
+    base = {
+        reason
+        for reason in base_reasons
+        if reason != "no_comparable_core_metrics"
+    }
     pricing = tuple(
         sorted(
             set(pricing_reasons).union(
-                reason for reason in base_reasons if reason in PRICING_REASON_CODES
+                reason for reason in base if reason in PRICING_REASON_CODES
             )
         )
     )
     if any(reason not in PRICING_REASON_CODES for reason in pricing):
         raise ValueError("unknown pricing comparability reason")
-    reasons = set(base_reasons).union(pricing)
+    reasons = base.union(pricing)
     if comparable_metric_count == 0:
         reasons.add("no_comparable_core_metrics")
     final_reasons = tuple(sorted(reasons))
