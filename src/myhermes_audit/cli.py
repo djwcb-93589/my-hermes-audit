@@ -570,7 +570,14 @@ def _baseline_create_command(arguments: argparse.Namespace) -> int:
     from myhermes_audit.regression import build_baseline
 
     result = _load_json_model(arguments.result, AuditRunResult, label="Audit result")
-    baseline = build_baseline(result)
+    try:
+        baseline = build_baseline(result)
+    except ValueError as exc:
+        raise ReportError(
+            "baseline identity or contract is invalid",
+            operation="baseline_create",
+            reason=str(exc),
+        ) from exc
     output = _validate_baseline_output(
         arguments.output,
         overwrite=arguments.overwrite,

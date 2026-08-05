@@ -18,6 +18,8 @@ from myhermes_audit.contracts.regression import (
     BenchmarkCaseSummary,
     BenchmarkSummary,
     CaseRegressionSummary,
+    IdentityEvidence,
+    IdentityStatus,
 )
 from myhermes_audit.contracts.result import (
     AuditRunResult,
@@ -34,6 +36,7 @@ from myhermes_audit.contracts.regression import (
     MetricDecision,
     MetricDirection,
     MetricSnapshot,
+    metric_decision_counts,
     PolicyMode,
     RegressionMetricPolicy,
     RegressionPolicy,
@@ -194,6 +197,59 @@ def _review_accuracy(trials: Sequence[TrialResult]) -> float | None:
         and type(metric.passed) is bool
     ]
     return None if not values else sum(value is True for value in values) / len(values)
+
+
+def _review_accuracy_sample_count(trials: Sequence[TrialResult]) -> int:
+    return sum(
+        1
+        for trial in trials
+        for metric in trial.metrics
+        if metric.source is MetricSource.BACKGROUND_REVIEW
+        and metric.status is MetricStatus.COMPLETED
+        and metric.metadata.get("metric_type") == "decision_correctness"
+        and type(metric.passed) is bool
+    )
+
+
+def _task_success_facts(trials: Sequence[TrialResult]) -> tuple[int, int, float | None]:
+    """Use only explicit bool ``task_passed`` facts; unknowns are not failures."""
+
+    values = [trial.task_passed for trial in trials if type(trial.task_passed) is bool]
+    sample_count = len(values)
+    passed_count = sum(value is True for value in values)
+    rate = None if sample_count == 0 else passed_count / sample_count
+    return sample_count, passed_count, rate
+
+
+def _declared_trials_per_case(trials: Sequence[TrialResult]) -> int:
+    """Return the number of distinct repeat numbers represented by a Case."""
+
+    return len({trial.trial_number for trial in trials})
+
+
+def _declared_trial_mapping(
+    cases: Sequence[BenchmarkCaseSummary],
+) -> tuple[int | None, dict[str, int]]:
+    mapping = {case.case_id: case.declared_trial_count for case in cases}
+    values = set(mapping.values())
+    return (next(iter(values)) if len(values) == 1 else None), mapping
+
+
+def _identity_evidence(values: set[str]) -> IdentityEvidence:
+    ordered = sorted(values)
+    if not ordered:
+        return IdentityEvidence(status=IdentityStatus.MISSING)
+    if len(ordered) == 1:
+        return IdentityEvidence(
+            status=IdentityStatus.AVAILABLE,
+            value=ordered[0],
+            values=ordered,
+        )
+    return IdentityEvidence(
+        status=IdentityStatus.AMBIGUOUS,
+        values=ordered,
+        fingerprint=canonical_sha256(ordered),
+    )
 
 
 def _build_metrics(trials: Sequence[TrialResult], summary) -> list[MetricSnapshot]:
@@ -376,8 +432,12 @@ def _benchmark_summary(result: AuditRunResult, trials: Sequence[TrialResult]) ->
     summary = result.summary if len(trials) == len(result.trials) else aggregate_audit(
         sorted({trial.case_id for trial in trials}), trials
     )
+    task_sample, task_passed, task_rate = _task_success_facts(trials)
     return BenchmarkSummary(
         summary=summary,
+        task_success_sample_count=task_sample,
+        task_success_passed_count=task_passed,
+        task_success_rate=task_rate,
         metrics=_build_metrics(trials, summary),
         failure_categories=_failure_categories(trials),
         background_review_actions=_review_actions(trials),
@@ -399,14 +459,23 @@ def _benchmark_cases(result: AuditRunResult) -> list[BenchmarkCaseSummary]:
     for aggregate in result.cases:
         trials = [trial for trial in result.trials if trial.case_id == aggregate.case_id]
         case_summary = aggregate_audit([aggregate.case_id], trials)
+        task_sample, task_passed, task_rate = _task_success_facts(trials)
         items.append(
             BenchmarkCaseSummary(
                 case_id=aggregate.case_id,
                 summary=aggregate,
+                declared_trial_count=_declared_trials_per_case(trials),
+                task_success_sample_count=task_sample,
+                task_success_passed_count=task_passed,
+                task_success_rate=task_rate,
                 metrics=_build_metrics(trials, case_summary),
                 failure_categories=_failure_categories(trials),
                 background_review_actions=_review_actions(trials),
                 background_review_decision_accuracy=_review_accuracy(trials),
+                background_review_decision_sample_count=max(
+                    _review_accuracy_sample_count(trials),
+                    sum(_review_actions(trials).values()),
+                ),
                 deepseek_cache=case_summary.deepseek_cache,
                 deepseek_cost=case_summary.deepseek_cost,
                 warnings=sorted(
@@ -422,7 +491,7 @@ def _benchmark_cases(result: AuditRunResult) -> list[BenchmarkCaseSummary]:
     return items
 
 
-def _identity_values(result: AuditRunResult) -> tuple[str | None, str | None, str | None, list[str]]:
+def _identity_values(result: AuditRunResult) -> tuple[dict[str, IdentityEvidence], list[str]]:
     models = {
         value
         for trial in result.trials
@@ -438,28 +507,59 @@ def _identity_values(result: AuditRunResult) -> tuple[str | None, str | None, st
         for trial in result.trials
         if trial.observations is not None
     }
-    warnings: list[str] = []
-    model = next(iter(models)) if len(models) == 1 else None
-    config = next(iter(configs)) if len(configs) == 1 else None
-    protocol = next(iter(protocols)) if len(protocols) == 1 else None
-    if len(models) > 1:
-        warnings.append("multiple_model_identifiers")
-    if len(configs) > 1:
-        warnings.append("multiple_configuration_fingerprints")
-    if len(protocols) > 1:
-        warnings.append("multiple_worker_protocol_versions")
-    return model, config, protocol, warnings
+    identities = {
+        "model": _identity_evidence(models),
+        "configuration": _identity_evidence(configs),
+        "worker_protocol": _identity_evidence(protocols),
+        "result_schema": _identity_evidence({result.schema_version}),
+        "metric_contract": _identity_evidence({METRIC_CONTRACT_VERSION}),
+    }
+    warnings = [
+        f"{name}_identity_ambiguous"
+        for name, evidence in identities.items()
+        if evidence.status is IdentityStatus.AMBIGUOUS
+    ]
+    return identities, warnings
+
+
+def _identity_projection(evidence: IdentityEvidence) -> str | None:
+    return evidence.value if evidence.status is IdentityStatus.AVAILABLE else None
+
+
+def _identity_comparison(
+    baseline: IdentityEvidence,
+    current: IdentityEvidence,
+    name: str,
+) -> str | None:
+    """Return a safe structural reason, or None when identities are comparable."""
+
+    if baseline.status is IdentityStatus.AMBIGUOUS or current.status is IdentityStatus.AMBIGUOUS:
+        return f"{name}_identity_ambiguous"
+    if baseline.status is not current.status:
+        return f"{name}_identity_status_mismatch"
+    if baseline.status is IdentityStatus.AVAILABLE and baseline.value != current.value:
+        return f"{name}_identity_mismatch"
+    return None
 
 
 def build_baseline(result: AuditRunResult) -> AuditBaseline:
     if not isinstance(result, AuditRunResult):
         raise ValueError("baseline input must be an AuditRunResult")
-    model, config, protocol, warnings = _identity_values(result)
+    identities, warnings = _identity_values(result)
+    ambiguous = sorted(
+        name for name, evidence in identities.items()
+        if evidence.status is IdentityStatus.AMBIGUOUS
+    )
+    if ambiguous:
+        raise ValueError(
+            "baseline identity is ambiguous: " + ", ".join(ambiguous)
+        )
     suite = _benchmark_summary(result, result.trials)
     cases = _benchmark_cases(result)
     case_ids = [case.case_id for case in cases]
+    declared_per_case, declared_mapping = _declared_trial_mapping(cases)
     baseline_fields = {
-        "schema_version": "baseline-v1",
+        "schema_version": "baseline-v2",
         "source_run_id": result.run_id,
         "audit_commit": result.audit_fingerprint.audit_commit,
         "subject_commit": result.subject_fingerprint.git_commit,
@@ -471,11 +571,19 @@ def build_baseline(result: AuditRunResult) -> AuditBaseline:
         ),
         "result_schema_version": result.schema_version,
         "metric_contract_version": METRIC_CONTRACT_VERSION,
-        "worker_protocol_version": protocol,
-        "model_identifier": model,
-        "configuration_fingerprint": config,
+        "model_identity": identities["model"],
+        "configuration_identity": identities["configuration"],
+        "worker_protocol_identity": identities["worker_protocol"],
+        "result_schema_identity": identities["result_schema"],
+        "metric_contract_identity": identities["metric_contract"],
+        "worker_protocol_version": _identity_projection(identities["worker_protocol"]),
+        "model_identifier": _identity_projection(identities["model"]),
+        "configuration_fingerprint": _identity_projection(identities["configuration"]),
         "pricing_fingerprint": result.deepseek_pricing_fingerprint,
         "declared_trial_count": result.summary.trial_count,
+        "total_trial_count": result.summary.trial_count,
+        "declared_trials_per_case": declared_per_case,
+        "declared_trial_counts_by_case": declared_mapping,
         "case_ids": case_ids,
         "suite_summary": suite,
         "case_summaries": cases,
@@ -536,22 +644,26 @@ def _compare_metric(
         baseline_denominator=base_denominator,
         current_denominator=current_denominator,
         policy_mode=policy.mode,
+        direction=policy.direction,
+        max_absolute_drop=policy.max_absolute_drop,
+        max_relative_increase=policy.max_relative_increase,
+        max_absolute_increase=policy.max_absolute_increase,
     )
     if not core_comparable:
         return MetricComparison(
-            **common,
+            **{**common, "baseline_value": None, "current_value": None},
             decision=MetricDecision.NOT_COMPARABLE,
             reason=reason or "core_contract_not_comparable",
         )
     if policy.require_pricing_match and not pricing_comparable:
         return MetricComparison(
-            **common,
+            **{**common, "baseline_value": None, "current_value": None},
             decision=MetricDecision.NOT_COMPARABLE,
             reason="pricing_fingerprint_mismatch",
         )
     if name.startswith("deepseek_cost_") and not pricing_comparable:
         return MetricComparison(
-            **common,
+            **{**common, "baseline_value": None, "current_value": None},
             decision=MetricDecision.NOT_COMPARABLE,
             reason="pricing_fingerprint_mismatch",
         )
@@ -562,20 +674,32 @@ def _compare_metric(
         or current is None
         or baseline.availability is MetricAvailability.NOT_EVALUATED
         or current.availability is MetricAvailability.NOT_EVALUATED
+        or baseline.sample_count == 0
+        or current.sample_count == 0
         or base is None
         or current_number is None
     ):
+        baseline_missing = baseline is None or baseline.availability is MetricAvailability.NOT_EVALUATED or baseline.sample_count == 0
+        current_missing = current is None or current.availability is MetricAvailability.NOT_EVALUATED or current.sample_count == 0
+        if baseline_missing and current_missing:
+            missing_side = "both"
+        elif baseline_missing:
+            missing_side = "baseline"
+        elif current_missing:
+            missing_side = "current"
+        else:
+            missing_side = "metric"
         return MetricComparison(
             **common,
-            decision=MetricDecision.NOT_COMPARABLE,
-            reason="metric_not_evaluated",
+            decision=MetricDecision.NOT_EVALUATED,
+            reason=f"{missing_side}_not_evaluated",
         )
     delta = current_number - base
     relative = None if base == 0 else delta / abs(base)
     decision = MetricDecision.UNCHANGED
     adverse = False
     if policy.mode is PolicyMode.DISABLED:
-        decision = MetricDecision.DISABLED
+        decision = MetricDecision.UNCHANGED
     elif policy.direction is MetricDirection.HIGHER_IS_BETTER:
         if delta > 0:
             decision = MetricDecision.IMPROVED
@@ -626,20 +750,12 @@ def _case_decision(metrics: Sequence[MetricComparison]) -> MetricDecision:
         return MetricDecision.IMPROVED
     if decisions and decisions <= {MetricDecision.NOT_COMPARABLE}:
         return MetricDecision.NOT_COMPARABLE
-    if decisions and decisions <= {MetricDecision.DISABLED}:
-        return MetricDecision.DISABLED
     return MetricDecision.UNCHANGED
 
 
 def _report_counts(metrics: Sequence[MetricComparison], cases: Sequence[CaseRegressionSummary]) -> dict[str, int]:
     all_metrics = [*metrics, *(metric for case in cases for metric in case.metrics)]
-    return {
-        "regression_count": sum(item.decision is MetricDecision.REGRESSED for item in all_metrics),
-        "improvement_count": sum(item.decision is MetricDecision.IMPROVED for item in all_metrics),
-        "unchanged_count": sum(item.decision is MetricDecision.UNCHANGED for item in all_metrics),
-        "warning_count": sum(item.decision is MetricDecision.WARNING for item in all_metrics),
-        "not_comparable_count": sum(item.decision is MetricDecision.NOT_COMPARABLE for item in all_metrics),
-    }
+    return metric_decision_counts(all_metrics)
 
 
 def compare_baseline(
@@ -666,18 +782,17 @@ def compare_baseline(
     current_ids = [item.case_id for item in current.cases]
     if baseline_ids != current_ids:
         reasons.append("case_set_or_order_mismatch")
-    if baseline.result_schema_version.split(".")[0] != current.schema_version.split(".")[0]:
-        reasons.append("result_schema_incompatible")
-    if baseline.metric_contract_version != METRIC_CONTRACT_VERSION:
-        reasons.append("metric_contract_incompatible")
-    _, _, current_protocol, identity_warnings = _identity_values(current)
-    if baseline.worker_protocol_version != current_protocol:
-        reasons.append("worker_protocol_mismatch")
-    current_model, current_config, _, _ = _identity_values(current)
-    if baseline.model_identifier != current_model:
-        reasons.append("model_identifier_mismatch")
-    if baseline.configuration_fingerprint != current_config:
-        reasons.append("configuration_fingerprint_mismatch")
+    current_identities, identity_warnings = _identity_values(current)
+    for name, old_identity, new_identity in (
+        ("worker_protocol", baseline.worker_protocol_identity, current_identities["worker_protocol"]),
+        ("model", baseline.model_identity, current_identities["model"]),
+        ("configuration", baseline.configuration_identity, current_identities["configuration"]),
+        ("result_schema", baseline.result_schema_identity, current_identities["result_schema"]),
+        ("metric_contract", baseline.metric_contract_identity, current_identities["metric_contract"]),
+    ):
+        identity_reason = _identity_comparison(old_identity, new_identity, name)
+        if identity_reason is not None:
+            reasons.append(identity_reason)
     pricing_comparable = baseline.pricing_fingerprint == current.deepseek_pricing_fingerprint
     if not pricing_comparable:
         reasons.append("pricing_fingerprint_mismatch")
@@ -723,16 +838,39 @@ def compare_baseline(
                 case_id=case_id,
                 baseline_trial_count=old.summary.trial_count,
                 current_trial_count=new.summary.trial_count,
-                baseline_pass_rate=old.summary.pass_rate,
-                current_pass_rate=new.summary.pass_rate,
-                pass_rate_delta=new.summary.pass_rate - old.summary.pass_rate,
+                baseline_declared_trial_count=old.declared_trial_count,
+                current_declared_trial_count=new.declared_trial_count,
+                baseline_task_success_sample_count=old.task_success_sample_count,
+                baseline_task_success_passed_count=old.task_success_passed_count,
+                baseline_task_success_rate=old.task_success_rate,
+                current_task_success_sample_count=new.task_success_sample_count,
+                current_task_success_passed_count=new.task_success_passed_count,
+                current_task_success_rate=new.task_success_rate,
+                task_success_rate_delta=(
+                    None
+                    if old.task_success_rate is None or new.task_success_rate is None
+                    else new.task_success_rate - old.task_success_rate
+                ),
+                pass_rate_delta=(
+                    None
+                    if old.task_success_rate is None or new.task_success_rate is None
+                    else new.task_success_rate - old.task_success_rate
+                ),
                 baseline_failure_categories=old.failure_categories,
                 current_failure_categories=new.failure_categories,
                 baseline_background_review_actions=old.background_review_actions,
                 current_background_review_actions=new.background_review_actions,
                 baseline_review_decision_accuracy=old.background_review_decision_accuracy,
                 current_review_decision_accuracy=new.background_review_decision_accuracy,
+                baseline_background_review_decision_sample_count=old.background_review_decision_sample_count,
+                background_review_decision_sample_count=new.background_review_decision_sample_count,
                 metrics=metrics,
+                metric_comparison_count=len(metrics),
+                decision_reason=(
+                    core_reasons[0]
+                    if _case_decision(metrics) is MetricDecision.NOT_COMPARABLE
+                    else None
+                ),
                 decision=_case_decision(metrics),
             )
         )
@@ -746,6 +884,12 @@ def compare_baseline(
     else:
         status = RegressionStatus.PASSED
     warnings = sorted(set(identity_warnings + (["pricing_fingerprint_mismatch"] if not pricing_comparable else [])))
+    current_model = _identity_projection(current_identities["model"])
+    current_config = _identity_projection(current_identities["configuration"])
+    current_protocol = _identity_projection(current_identities["worker_protocol"])
+    current_declared_per_case, current_declared_mapping = _declared_trial_mapping(
+        list(current_cases.values())
+    )
     return AuditRegressionReport(
         baseline_id=baseline.baseline_id,
         current_run_id=current.run_id,
@@ -764,10 +908,37 @@ def compare_baseline(
         current_model_identifier=current_model,
         baseline_configuration_fingerprint=baseline.configuration_fingerprint,
         current_configuration_fingerprint=current_config,
+        baseline_model_identity=baseline.model_identity,
+        current_model_identity=current_identities["model"],
+        baseline_configuration_identity=baseline.configuration_identity,
+        current_configuration_identity=current_identities["configuration"],
+        baseline_worker_protocol_identity=baseline.worker_protocol_identity,
+        current_worker_protocol_identity=current_identities["worker_protocol"],
+        baseline_result_schema_identity=baseline.result_schema_identity,
+        current_result_schema_identity=current_identities["result_schema"],
+        baseline_metric_contract_identity=baseline.metric_contract_identity,
+        current_metric_contract_identity=current_identities["metric_contract"],
         baseline_pricing_fingerprint=baseline.pricing_fingerprint,
         current_pricing_fingerprint=current.deepseek_pricing_fingerprint,
         baseline_trial_count=baseline.declared_trial_count,
         current_trial_count=current.summary.trial_count,
+        baseline_total_trial_count=baseline.total_trial_count,
+        current_total_trial_count=current.summary.trial_count,
+        baseline_declared_trials_per_case=baseline.declared_trials_per_case,
+        current_declared_trials_per_case=current_declared_per_case,
+        baseline_declared_trial_counts_by_case=baseline.declared_trial_counts_by_case,
+        current_declared_trial_counts_by_case=current_declared_mapping,
+        baseline_suite_task_success_sample_count=baseline.suite_summary.task_success_sample_count,
+        baseline_suite_task_success_passed_count=baseline.suite_summary.task_success_passed_count,
+        baseline_suite_task_success_rate=baseline.suite_summary.task_success_rate,
+        current_suite_task_success_sample_count=current_suite.task_success_sample_count,
+        current_suite_task_success_passed_count=current_suite.task_success_passed_count,
+        current_suite_task_success_rate=current_suite.task_success_rate,
+        suite_task_success_rate_delta=(
+            None
+            if baseline.suite_summary.task_success_rate is None or current_suite.task_success_rate is None
+            else current_suite.task_success_rate - baseline.suite_summary.task_success_rate
+        ),
         baseline_metric_contract_version=baseline.metric_contract_version,
         current_result_schema_version=current.schema_version,
         current_worker_protocol_version=current_protocol,

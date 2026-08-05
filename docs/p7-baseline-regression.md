@@ -63,13 +63,15 @@ inferred by parsing free-form logs and are never collapsed into “model issue�
 
 ## Baseline contract
 
-`AuditBaseline` is `baseline-v1`. It can be created from any strictly valid
+`AuditBaseline` is `baseline-v2`. It can be created from any strictly valid
 `AuditRunResult`, including a result with failed or timed-out Trials. It stores
 the source run ID, Audit and Subject commits, Suite ID and both Suite digests,
-Result Schema, Worker Protocol, model/config/pricing identities, declared Trial
-count, ordered Case IDs, suite and Case metric projections, cache/cost
+Result Schema, Worker Protocol, model/config/pricing identities, total Trial
+count and per-Case declared repeat counts, ordered Case IDs, suite and Case metric projections, cache/cost
 aggregates, failure distributions, Review action distributions, sample counts,
 and safe warnings.
+The legacy `declared_trial_count` field is retained only as an exact alias of
+`total_trial_count`; it is never interpreted as a per-Case repeat count.
 
 Baseline creation is deterministic for the same result facts. The content
 fingerprint excludes only the creation timestamp and the derived Baseline ID;
@@ -78,15 +80,26 @@ The model is frozen after load. `baseline create` rejects an existing output
 unless `--overwrite` is explicit and reports the old and new IDs when replacing
 one. It never updates Git, a remote store, or the source result.
 
+Baseline creation rejects conflicting model, configuration, Worker Protocol,
+Result Schema, or metric-contract identities before writing a file. A missing
+model, configuration, or Worker Protocol identity is retained as `missing`;
+these three are optional only when the source run did not expose them. Result
+Schema and metric-contract identities are required and always explicit. Missing
+is not rewritten as a conflict.
+
 No Baseline contains API keys, Base URLs, prompts, model responses, reasoning,
 Memory text, Review evidence正文, user identity, or local absolute paths.
 
 ## Comparability
 
-`AuditRegressionReport` is `regression-v1` and reports structured reasons when
+`AuditRegressionReport` is `regression-v2` and reports structured reasons when
 comparison is not valid. Core correctness comparison requires the same Suite
-ID, semantic Suite digest, ordered Case set, compatible Result Schema and
-metric contract, Worker Protocol, model identity, and configuration identity.
+ID, semantic Suite digest, ordered Case set, Result Schema identity, metric
+contract, Worker Protocol, model identity, and configuration identity. Each
+identity is explicitly `available`, `missing`, or `ambiguous`; ambiguous
+identities are never comparable, even when both sides are ambiguous. Optional
+missing identities are comparable only when both sides explicitly report
+`missing`.
 Audit commit, Subject commit, run ID, Trial IDs, Sandbox IDs, and run time may
 differ; Subject commit differences are the normal version-regression use case.
 
@@ -121,14 +134,18 @@ comparison engine reads these policy fields; thresholds are not hard-coded in
 the comparison decision path.
 
 Metric decisions are `improved`, `unchanged`, `regressed`, `warning`,
-`not_comparable`, or `disabled`. Every decision carries baseline/current
+`not_comparable`, or `not_evaluated`. Every decision carries baseline/current
 values, absolute and (where defined) relative deltas, and both sample counts.
 There is no composite or weighted score.
 
 ## Case-level stability
 
-The report lists baseline/current Trial counts and pass rates for every Case,
-the pass-rate delta, structured failure-category distributions, mean runtime
+The report lists baseline/current Trial counts and declared repeats for every
+Case. Task success facts are separate: explicit-bool sample count, passed count,
+rate, and rate delta. `task_passed=None` is excluded from every task-success
+denominator; the generic `CaseAggregate.pass_rate` is not used for P7 task
+success. The report also includes structured failure-category distributions,
+mean runtime
 facts, cache/cost states, and the metric decision. Background Review Cases also
 show actual action distributions and decision accuracy. This makes one
 intermittent failure (for example 1/5) distinguishable from a repeatable
@@ -157,8 +174,9 @@ myhermes-audit baseline compare \
 Both inputs are loaded strictly. Output is atomic, rejects symbolic links, and
 rejects an existing file unless `--overwrite` is provided. The compare command
 does not call a model, Judge, Langfuse, network service, or pricing API. Its
-console output includes baseline/current values, deltas, sample counts,
-decisions, Case rates, and comparability reasons rather than only PASS/FAIL.
+console output includes baseline/current values, deltas, sample counts, Case
+task-success facts, decisions, and comparability reasons rather than only
+PASS/FAIL.
 
 Exit status is zero for `passed` and `passed_with_warnings`; hard regression,
 `not_comparable`, and invalid input are non-zero. Warning behavior is determined
@@ -168,7 +186,7 @@ by the policy mode.
 
 The existing local trace mapper exposes a pure, content-free
 `project_regression_metadata()` projection containing IDs, status, counts,
-safe deltas, Case pass rates, sample counts, and reason codes. P7 does not call
+safe deltas, Case task-success facts, sample counts, and reason codes. P7 does not call
 it and does not publish a Baseline or Regression report to Langfuse. Prompt,
 output, Memory/Review正文, credentials, Base URLs, local paths, and identities
 outside the safe contract are excluded.

@@ -178,6 +178,10 @@ def _number_or_missing(value: float | None) -> str:
     return "not evaluated" if value is None else f"{value:.3f}"
 
 
+def _signed_or_missing(value: float | None) -> str:
+    return "not evaluated" if value is None else f"{value:+.4f}"
+
+
 def _as_int(value: float | None) -> int | None:
     return None if value is None else round(value)
 
@@ -398,15 +402,27 @@ def render_console_regression(report: AuditRegressionReport) -> str:
         f"Status:              {report.status.value}",
         f"Baseline:            {report.baseline_id}",
         f"Current run:         {report.current_run_id}",
-        f"Trials:              {report.baseline_trial_count} -> {report.current_trial_count}",
+        f"Total Trials:        {report.baseline_total_trial_count} -> {report.current_total_trial_count}",
+        f"Trials/Case:         {_integer_or_missing(report.baseline_declared_trials_per_case)} -> "
+        f"{_integer_or_missing(report.current_declared_trials_per_case)}",
         f"Regression gate:     {'pass' if report.overall_regression_gate else 'fail'}",
-        f"Comparability:       {'comparable' if not report.comparability_reasons else 'not comparable'}",
+        f"Comparability:       {'comparable' if report.status.value != 'not_comparable' else 'not comparable'}",
         "Counts:              "
         f"regression={report.regression_count} "
         f"improvement={report.improvement_count} "
         f"unchanged={report.unchanged_count} "
         f"warning={report.warning_count} "
         f"not_comparable={report.not_comparable_count}",
+        f"not_evaluated={report.not_evaluated_count}",
+        "Suite task success:  "
+        f"{report.baseline_total_trial_count} trials, "
+        f"{report.baseline_suite_task_success_sample_count}/"
+        f"{report.baseline_suite_task_success_passed_count} "
+        f"{_percent_or_missing(report.baseline_suite_task_success_rate)} -> "
+        f"{report.current_suite_task_success_sample_count}/"
+        f"{report.current_suite_task_success_passed_count} "
+        f"{_percent_or_missing(report.current_suite_task_success_rate)} "
+        f"delta={_signed_or_missing(report.suite_task_success_rate_delta)}",
     ]
     if report.comparability_reasons:
         lines.append("Reasons:              " + ", ".join(report.comparability_reasons))
@@ -422,8 +438,16 @@ def render_console_regression(report: AuditRegressionReport) -> str:
     for case in report.case_summaries:
         lines.append(
             f"- {case.case_id}: trials={case.baseline_trial_count}->{case.current_trial_count} "
-            f"pass_rate={case.baseline_pass_rate:.4f}->{case.current_pass_rate:.4f} "
-            f"delta={case.pass_rate_delta:+.4f} decision={case.decision.value}"
+            f"repeats={case.baseline_declared_trial_count}->{case.current_declared_trial_count} "
+            "task_success="
+            f"{case.baseline_task_success_sample_count}/"
+            f"{case.baseline_task_success_passed_count} "
+            f"{_percent_or_missing(case.baseline_task_success_rate)} -> "
+            f"{case.current_task_success_sample_count}/"
+            f"{case.current_task_success_passed_count} "
+            f"{_percent_or_missing(case.current_task_success_rate)} "
+            f"delta={_signed_or_missing(case.task_success_rate_delta)} "
+            f"decision={case.decision.value}"
         )
     return "\n".join(lines) + "\n"
 

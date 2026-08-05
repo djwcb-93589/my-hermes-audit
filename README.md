@@ -53,6 +53,13 @@ validated result and may contain failed Trials.  `AuditRegressionReport`
 compares correctness, efficiency, cache, cost, failure, and Case-level action
 distribution facts without a weighted score.  Pricing mismatches make only
 money and savings metrics `not_comparable`; other metrics remain comparable.
+P7 task success rates use only explicit boolean `task_passed` samples, with
+sample/passed counts and rates retained for both the Suite and every Case;
+unknown (`None`) values are excluded.  Baseline and Regression contracts are
+versioned independently (`baseline-v2`, `regression-v2`) and retain total
+Trial counts separately from declared repeats per Case.  Identity conflicts
+are represented as `ambiguous` and cannot be compared; missing optional
+identities remain explicitly `missing`.
 Comparison is read-only and does not invoke an Agent, Judge, Langfuse, or
 network service.  See [`docs/p7-baseline-regression.md`](docs/p7-baseline-regression.md)
 for denominators, compatibility rules, policy thresholds, and safe-data
