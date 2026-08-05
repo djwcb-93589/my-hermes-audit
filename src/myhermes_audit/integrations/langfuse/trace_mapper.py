@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Callable, Iterable
 from typing import Any
 
-from myhermes_audit.contracts import MemorySnapshotPhase, MetricSource
+from myhermes_audit.contracts import MemorySnapshotPhase, MetricSource, MetricStatus
 from myhermes_audit.integrations.langfuse.redaction import project_remote_content
 from myhermes_audit.ports.langfuse import LangfuseTrialRequest
 
@@ -100,6 +100,66 @@ def publish_replay_observations(
             None if runtime is None else runtime.tool_call_count
         ),
         "runtime_total_tokens": None if runtime is None else runtime.total_tokens,
+        "representative_task_success_rate": (
+            None if trial.task_passed is None else float(trial.task_passed)
+        ),
+        "representative_tool_correctness_rate": _trial_metric_rate(
+            trial,
+            source=MetricSource.RUNTIME,
+            metric_type="tool_trajectory",
+        ),
+        "representative_memory_evidence_hit_rate": _trial_metric_rate(
+            trial,
+            source=MetricSource.RETRIEVAL,
+            metric_type="required_evidence",
+        ),
+        "representative_background_review_decision_accuracy": _trial_metric_rate(
+            trial,
+            source=MetricSource.BACKGROUND_REVIEW,
+            metric_type="decision_correctness",
+        ),
+        "runtime_prompt_tokens": None if runtime is None else runtime.prompt_tokens,
+        "runtime_completion_tokens": (
+            None if runtime is None else runtime.completion_tokens
+        ),
+        "runtime_model_call_count": (
+            None if runtime is None else runtime.model_call_count
+        ),
+        "deepseek_cache_status": (
+            "not_evaluated"
+            if runtime is None
+            else runtime.deepseek_cache_status.value
+        ),
+        "deepseek_cache_hit_tokens": (
+            None if runtime is None else runtime.prompt_cache_hit_tokens
+        ),
+        "deepseek_cache_miss_tokens": (
+            None if runtime is None else runtime.prompt_cache_miss_tokens
+        ),
+        "deepseek_cache_hit_rate": (
+            None if runtime is None else runtime.deepseek_cache_hit_rate
+        ),
+        "deepseek_cache_evaluated_model_call_count": (
+            None
+            if runtime is None
+            else runtime.deepseek_cache_evaluated_model_call_count
+        ),
+        "deepseek_cache_model_call_coverage": (
+            None
+            if runtime is None or runtime.model_call_count == 0
+            else runtime.deepseek_cache_evaluated_model_call_count
+            / runtime.model_call_count
+        ),
+        "deepseek_cache_trial_coverage": (
+            None
+            if runtime is None
+            else float(runtime.deepseek_cache_evaluated_model_call_count > 0)
+        ),
+        "deepseek_cache_invalid_model_call_count": (
+            None
+            if runtime is None
+            else runtime.deepseek_cache_invalid_model_call_count
+        ),
         **(
             {
                 "memory_query_count": len(trial.memory_query_results),
@@ -732,6 +792,8 @@ def _publish_model_calls(parent: Any, items: list, request: LangfuseTrialRequest
                 "input": item.prompt_tokens,
                 "output": item.completion_tokens,
                 "total": item.total_tokens,
+                "prompt_cache_hit_tokens": item.prompt_cache_hit_tokens,
+                "prompt_cache_miss_tokens": item.prompt_cache_miss_tokens,
             }.items()
             if value is not None
         }
@@ -755,6 +817,11 @@ def _publish_model_calls(parent: Any, items: list, request: LangfuseTrialRequest
                 "runtime_duration_ms": item.duration_ms,
                 "tool_call_count": item.tool_call_count,
                 "error_category": item.error_category,
+                "deepseek_cache_status": (
+                    "not_evaluated"
+                    if item.prompt_cache_hit_tokens is None
+                    else "available"
+                ),
                 "post_hoc_publication": True,
             },
             model=subject_model,
@@ -996,6 +1063,21 @@ def _safe_review_status(value: object) -> str | None:
 
 def _safe_bool(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+def _trial_metric_rate(trial, *, source: MetricSource, metric_type: str) -> float | None:
+    values = [
+        metric.passed
+        for metric in trial.metrics
+        if metric.source is source
+        and metric.status is MetricStatus.COMPLETED
+        and type(metric.passed) is bool
+        and (
+            metric.metadata.get("metric_type") == metric_type
+            or metric.metadata.get("evaluator_kind") == metric_type
+        )
+    ]
+    return None if not values else float(sum(values) / len(values))
 
 
 def _safe_review_decision_checks(value: object) -> dict[str, bool]:

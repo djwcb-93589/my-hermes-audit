@@ -77,6 +77,7 @@ from myhermes_audit.integrations.myhermes.observation_reader import (
     read_observations,
 )
 from myhermes_audit.integrations.myhermes.scenarios import build_scenario_results
+from myhermes_audit.metrics import aggregate_model_cache
 from myhermes_audit.security import redact_text, sensitive_environment_values
 
 
@@ -1108,6 +1109,17 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
                 message="public Observation projection reached the P1 size limit",
             )
         )
+    cache_aggregation = aggregate_model_cache(
+        observations.model_calls,
+        invalid_model_call_count=observations.cache_invalid_model_call_count,
+    )
+    if cache_aggregation.invalid_model_call_count:
+        lifecycle_warnings.append(
+            WorkerWarning(
+                warning_type="deepseek_cache_invalid",
+                message="public DeepSeek cache token observations were invalid",
+            )
+        )
     run_ids = [turn.run_id for turn in turns if turn.run_id is not None]
     completed = failed_status is None and len(turns) == len(request.turns)
     if completed:
@@ -1146,10 +1158,21 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
             response_tool_calls,
             len(observations.tool_calls),
         ),
+        model_call_count=cache_aggregation.model_call_count,
         tool_names=tool_names,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
+        prompt_cache_hit_tokens=cache_aggregation.prompt_cache_hit_tokens,
+        prompt_cache_miss_tokens=cache_aggregation.prompt_cache_miss_tokens,
+        deepseek_cache_hit_rate=cache_aggregation.deepseek_cache_hit_rate,
+        deepseek_cache_status=cache_aggregation.deepseek_cache_status,
+        deepseek_cache_evaluated_model_call_count=(
+            cache_aggregation.evaluated_model_call_count
+        ),
+        deepseek_cache_invalid_model_call_count=(
+            cache_aggregation.invalid_model_call_count
+        ),
         duration_ms=duration_ms,
         observations_artifact=_artifact_relative(
             request.artifact_paths.observations

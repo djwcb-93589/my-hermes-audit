@@ -24,7 +24,7 @@ still `running`. Worker cleanup is a lifecycle fact, not an Agent capability.
 
 ## P5 Background Review capability projection
 
-Capability protocol `5.1` adds the P6.1 public Process action/status projection
+Capability protocol `5.2` adds the P6.1 public Process action/status projection
 without turning a Probe into a Process run. It binds only public module exports
 and safe call signatures for:
 
@@ -76,7 +76,7 @@ Background Review.
 
 `SubjectCapabilityReport` records the protocol version, Subject commit,
 individual checks, missing capabilities, bounded warnings, and a public API
-fingerprint. Capability protocol `5.1` distinguishes baseline-required checks
+fingerprint. Capability protocol `5.2` distinguishes baseline-required checks
 from optional P3/P5 capabilities, so a Subject without Memory or Background
 Review support can still run an old non-Memory/non-Review Suite. The fingerprint uses only module names, public object
 names, availability, safe call signatures, the stable Memory
@@ -84,6 +84,11 @@ kind/strategy/provider projection, and the probe protocol version; it never
 hashes MyHermes source text or function `repr`. If a Case requests an optional
 capability that is absent, runner preflight fails before any Trial Sandbox and
 reports only safe names.
+
+The required public `token_usage_observation` check also verifies the exact
+`prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` fields. Their public
+presence is a preflight capability fact; a later `None` value is ordinary
+`not_evaluated` data and is not treated as incompatibility.
 
 For the current public MyHermes surface, the report derives kinds
 `long_term`/`user_profile`, strategies `subject_native`/`disabled`, and provider

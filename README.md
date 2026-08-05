@@ -84,6 +84,10 @@ myhermes-audit validate examples/memory_compression_capability_negative_v1.yaml
 
 `my-hermes-audit` 是独立于 MyHermes 运行时的本地评测工具。报告总是从调用方指定的 `--subject-repo` 读取实际 Git fingerprint；文档不再把某个历史 MyHermes commit 当作运行基线。核心合同、数据集、Validator 与报告层不导入 `hermes.*`，MyHermes 也不感知自己正在被评测。
 
+P6.2B 的代表性效率、质量和 DeepSeek 缓存指标定义见
+[`docs/p6-2b-metrics.md`](docs/p6-2b-metrics.md)。缓存字段只被动读取
+MyHermes 公共 Observation；本阶段不计算成本，也不把缓存状态作为任务门禁。
+
 项目要求 Python 3.13 或更高版本，与 MyHermes 的 `requires-python` 保持一致。基础运行依赖仅有 Pydantic v2 与 PyYAML；Langfuse Python SDK `>=4.14.2,<5` 与 OpenAI Python SDK 均为延迟导入的可选依赖。
 
 ## 已实现

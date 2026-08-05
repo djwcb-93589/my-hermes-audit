@@ -75,6 +75,7 @@ def read_observations(
     runs: list[RunObservationRecord] = []
     model_calls: list[ModelObservationRecord] = []
     tool_calls: list[ToolObservationRecord] = []
+    cache_invalid_model_call_count = 0
     for item in collected:
         if include_run_ids is not None and item.run_id not in include_run_ids:
             continue
@@ -92,6 +93,9 @@ def read_observations(
                 )
             )
         elif isinstance(item, ModelCallObservationView):
+            cache_hit, cache_miss, cache_invalid = _cache_fields(item)
+            if cache_invalid:
+                cache_invalid_model_call_count += 1
             model_calls.append(
                 ModelObservationRecord(
                     run_id=item.run_id,
@@ -100,6 +104,8 @@ def read_observations(
                     prompt_tokens=item.prompt_tokens,
                     completion_tokens=item.completion_tokens,
                     total_tokens=item.total_tokens,
+                    prompt_cache_hit_tokens=cache_hit,
+                    prompt_cache_miss_tokens=cache_miss,
                     duration_ms=item.duration_ms,
                     tool_call_count=item.tool_call_count,
                     error_category=None,
@@ -142,7 +148,29 @@ def read_observations(
         model_calls=model_calls,
         tool_calls=tool_calls,
         truncated=truncated,
+        cache_invalid_model_call_count=cache_invalid_model_call_count,
     )
+
+
+def _cache_fields(item: object) -> tuple[int | None, int | None, bool]:
+    """Project only the public DeepSeek pair, isolating malformed rows."""
+
+    hit = getattr(item, "prompt_cache_hit_tokens", None)
+    miss = getattr(item, "prompt_cache_miss_tokens", None)
+    if hit is None and miss is None:
+        return None, None, False
+    prompt = getattr(item, "prompt_tokens", None)
+    if (
+        type(hit) is int
+        and hit >= 0
+        and type(miss) is int
+        and miss >= 0
+        and type(prompt) is int
+        and prompt >= 0
+        and hit + miss == prompt
+    ):
+        return hit, miss, False
+    return None, None, True
 
 
 __all__ = ("latest_run_id", "read_observations")

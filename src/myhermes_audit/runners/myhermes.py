@@ -1642,10 +1642,21 @@ class MyHermesTrialRunner:
                     iterations=result.iterations,
                     tool_batches=result.tool_batches,
                     tool_call_count=result.tool_call_count,
+                    model_call_count=result.model_call_count,
                     tool_names=result.tool_names,
                     prompt_tokens=result.prompt_tokens,
                     completion_tokens=result.completion_tokens,
                     total_tokens=result.total_tokens,
+                    prompt_cache_hit_tokens=result.prompt_cache_hit_tokens,
+                    prompt_cache_miss_tokens=result.prompt_cache_miss_tokens,
+                    deepseek_cache_hit_rate=result.deepseek_cache_hit_rate,
+                    deepseek_cache_status=result.deepseek_cache_status,
+                    deepseek_cache_evaluated_model_call_count=(
+                        result.deepseek_cache_evaluated_model_call_count
+                    ),
+                    deepseek_cache_invalid_model_call_count=(
+                        result.deepseek_cache_invalid_model_call_count
+                    ),
                 )
                 if include_runtime
                 else None
@@ -1734,6 +1745,8 @@ def _local_observations(
                 prompt_tokens=item.prompt_tokens,
                 completion_tokens=item.completion_tokens,
                 total_tokens=item.total_tokens,
+                prompt_cache_hit_tokens=item.prompt_cache_hit_tokens,
+                prompt_cache_miss_tokens=item.prompt_cache_miss_tokens,
                 duration_ms=item.duration_ms,
                 tool_call_count=item.tool_call_count,
                 error_category=item.error_category,
@@ -1754,6 +1767,7 @@ def _local_observations(
             for item in observations.tool_calls
         ],
         truncated=observations.truncated,
+        cache_invalid_model_call_count=observations.cache_invalid_model_call_count,
     )
 
 

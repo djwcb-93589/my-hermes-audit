@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from enum import Enum
+from typing import Literal
 
 from pydantic import (
     Field,
@@ -23,7 +24,6 @@ from myhermes_audit.contracts.common import (
     NonNegativeInt,
     PositiveInt,
     SafeRelativePath,
-    SchemaVersion,
     Sha256Digest,
     UtcDatetime,
 )
@@ -73,6 +73,10 @@ from myhermes_audit.contracts.scenario import (
 from myhermes_audit.serialization import canonical_sha256
 
 
+RESULT_SCHEMA_VERSION = "1.1"
+ResultSchemaVersion = Literal["1.1"]
+
+
 class TrialStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -102,6 +106,76 @@ class MetricStatus(str, Enum):
     SKIPPED = "skipped"
     ERROR = "error"
     NOT_APPLICABLE = "not_applicable"
+
+
+class DeepSeekCacheStatus(str, Enum):
+    """Availability of the exact DeepSeek cache token observation."""
+
+    AVAILABLE = "available"
+    PARTIAL = "partial"
+    NOT_EVALUATED = "not_evaluated"
+    INVALID = "invalid"
+
+
+class DeepSeekCacheSummary(ContractModel):
+    """Strict, token-weighted cache facts for a Suite."""
+
+    status: DeepSeekCacheStatus
+    model_call_count: NonNegativeInt
+    evaluated_model_call_count: NonNegativeInt
+    trial_count: NonNegativeInt
+    evaluated_trial_count: NonNegativeInt
+    prompt_cache_hit_tokens: NonNegativeInt | None = None
+    prompt_cache_miss_tokens: NonNegativeInt | None = None
+    cache_hit_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
+    model_call_coverage_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
+    trial_coverage_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
+    invalid_trial_count: NonNegativeInt = 0
+
+    @model_validator(mode="after")
+    def validate_cache_summary(self) -> "DeepSeekCacheSummary":
+        if self.evaluated_model_call_count > self.model_call_count:
+            raise ValueError("evaluated model calls cannot exceed model calls")
+        if self.evaluated_trial_count > self.trial_count:
+            raise ValueError("evaluated trials cannot exceed trial count")
+        if self.invalid_trial_count > self.trial_count:
+            raise ValueError("invalid trials cannot exceed trial count")
+        if (self.prompt_cache_hit_tokens is None) != (
+            self.prompt_cache_miss_tokens is None
+        ):
+            raise ValueError("cache token totals must be paired")
+        if self.status is DeepSeekCacheStatus.INVALID:
+            if self.invalid_trial_count == 0:
+                raise ValueError("invalid cache summary requires invalid trials")
+            if any(
+                value is not None
+                for value in (
+                    self.prompt_cache_hit_tokens,
+                    self.prompt_cache_miss_tokens,
+                    self.cache_hit_rate,
+                )
+            ):
+                raise ValueError("invalid cache summaries cannot expose totals")
+        elif self.prompt_cache_hit_tokens is not None:
+            total = self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
+            expected = None if total == 0 else self.prompt_cache_hit_tokens / total
+            if self.cache_hit_rate != expected:
+                raise ValueError("cache_hit_rate must match token totals")
+        elif self.cache_hit_rate is not None:
+            raise ValueError("cache_hit_rate requires cache token totals")
+        if self.status is DeepSeekCacheStatus.NOT_EVALUATED and self.evaluated_model_call_count:
+            raise ValueError("not evaluated cache cannot have evaluated calls")
+        if self.status is DeepSeekCacheStatus.AVAILABLE and (
+            self.model_call_count == 0
+            or self.evaluated_model_call_count != self.model_call_count
+        ):
+            raise ValueError("available cache requires every model call")
+        if self.status is DeepSeekCacheStatus.PARTIAL and not self.evaluated_model_call_count:
+            raise ValueError("partial cache requires evaluated calls")
+        for rate in (self.model_call_coverage_rate, self.trial_coverage_rate):
+            if rate is not None and not math.isfinite(rate):
+                raise ValueError("cache coverage rates must be finite")
+        return self
 
 
 class MetricError(ContractModel):
@@ -197,10 +271,23 @@ class TrialRuntimeSummary(ContractModel):
     iterations: NonNegativeInt = 0
     tool_batches: NonNegativeInt = 0
     tool_call_count: NonNegativeInt = 0
+    model_call_count: NonNegativeInt = 0
     tool_names: list[NonEmptyText] = Field(default_factory=list)
     prompt_tokens: NonNegativeInt | None = None
     completion_tokens: NonNegativeInt | None = None
     total_tokens: NonNegativeInt | None = None
+    prompt_cache_hit_tokens: NonNegativeInt | None = None
+    prompt_cache_miss_tokens: NonNegativeInt | None = None
+    deepseek_cache_hit_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
+    deepseek_cache_status: DeepSeekCacheStatus = DeepSeekCacheStatus.NOT_EVALUATED
+    deepseek_cache_evaluated_model_call_count: NonNegativeInt = 0
+    deepseek_cache_invalid_model_call_count: NonNegativeInt = 0
+
+    @property
+    def cache_evaluated_model_call_count(self) -> int:
+        """Compatibility alias without creating a second serialized fact."""
+
+        return self.deepseek_cache_evaluated_model_call_count
 
     @model_validator(mode="after")
     def validate_runtime_summary(self) -> "TrialRuntimeSummary":
@@ -213,6 +300,56 @@ class TrialRuntimeSummary(ContractModel):
             and self.total_tokens != self.prompt_tokens + self.completion_tokens
         ):
             raise ValueError("total_tokens must equal prompt_tokens + completion_tokens")
+        if self.deepseek_cache_evaluated_model_call_count > self.model_call_count:
+            raise ValueError("evaluated model calls cannot exceed model_call_count")
+        if (self.prompt_cache_hit_tokens is None) != (
+            self.prompt_cache_miss_tokens is None
+        ):
+            raise ValueError("cache token totals must be paired")
+        if self.deepseek_cache_status is DeepSeekCacheStatus.INVALID:
+            if self.deepseek_cache_invalid_model_call_count == 0:
+                raise ValueError("invalid cache runtime requires invalid calls")
+            if any(
+                value is not None
+                for value in (
+                    self.prompt_cache_hit_tokens,
+                    self.prompt_cache_miss_tokens,
+                    self.deepseek_cache_hit_rate,
+                )
+            ):
+                raise ValueError("invalid cache runtime cannot expose totals")
+        elif self.prompt_cache_hit_tokens is not None:
+            if self.prompt_tokens is None:
+                raise ValueError("cache runtime requires prompt_tokens")
+            if (
+                self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
+                != self.prompt_tokens
+            ):
+                raise ValueError("cache runtime totals must equal prompt_tokens")
+            total = self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
+            expected = None if total == 0 else self.prompt_cache_hit_tokens / total
+            if self.deepseek_cache_hit_rate != expected:
+                raise ValueError("cache rate must match runtime totals")
+        elif self.deepseek_cache_hit_rate is not None:
+            raise ValueError("cache rate requires cache totals")
+        if (
+            self.deepseek_cache_status is DeepSeekCacheStatus.NOT_EVALUATED
+            and self.deepseek_cache_evaluated_model_call_count != 0
+        ):
+            raise ValueError("not evaluated cache cannot have evaluated calls")
+        if (
+            self.deepseek_cache_status in (
+                DeepSeekCacheStatus.AVAILABLE,
+                DeepSeekCacheStatus.PARTIAL,
+            )
+            and self.deepseek_cache_evaluated_model_call_count == 0
+        ):
+            raise ValueError("evaluated cache status requires evaluated calls")
+        if (
+            self.deepseek_cache_status is DeepSeekCacheStatus.AVAILABLE
+            and self.deepseek_cache_evaluated_model_call_count != self.model_call_count
+        ):
+            raise ValueError("available cache requires every model call")
         return self
 
 
@@ -234,6 +371,8 @@ class ModelObservationSummary(ContractModel):
     prompt_tokens: NonNegativeInt | None = None
     completion_tokens: NonNegativeInt | None = None
     total_tokens: NonNegativeInt | None = None
+    prompt_cache_hit_tokens: NonNegativeInt | None = None
+    prompt_cache_miss_tokens: NonNegativeInt | None = None
     duration_ms: NonNegativeInt
     tool_call_count: NonNegativeInt
     error_category: Identifier | None = None
@@ -247,6 +386,18 @@ class ModelObservationSummary(ContractModel):
             and self.total_tokens != self.prompt_tokens + self.completion_tokens
         ):
             raise ValueError("model total_tokens must equal prompt plus completion")
+        if (self.prompt_cache_hit_tokens is None) != (
+            self.prompt_cache_miss_tokens is None
+        ):
+            raise ValueError("cache observation fields must be paired")
+        if self.prompt_cache_hit_tokens is not None:
+            if self.prompt_tokens is None:
+                raise ValueError("cache observations require prompt_tokens")
+            if (
+                self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
+                != self.prompt_tokens
+            ):
+                raise ValueError("cache observations must sum to prompt_tokens")
         return self
 
 
@@ -267,6 +418,7 @@ class TrialObservationSummary(ContractModel):
     model_calls: list[ModelObservationSummary] = Field(default_factory=list)
     tool_calls: list[ToolObservationSummary] = Field(default_factory=list)
     truncated: StrictBool = False
+    cache_invalid_model_call_count: NonNegativeInt = 0
 
     @model_validator(mode="after")
     def validate_observations(self) -> "TrialObservationSummary":
@@ -276,6 +428,8 @@ class TrialObservationSummary(ContractModel):
         tool_call_ids = [item.tool_call_id for item in self.tool_calls]
         if len(tool_call_ids) != len(set(tool_call_ids)):
             raise ValueError("tool observations must have unique tool_call_id values")
+        if self.cache_invalid_model_call_count > len(self.model_calls):
+            raise ValueError("invalid cache model calls cannot exceed observations")
         return self
 
 
@@ -662,6 +816,12 @@ class CaseAggregate(ContractModel):
     passed_count: NonNegativeInt
     pass_rate: StrictFloat = Field(ge=0, le=1)
     metric_summaries: list[MetricSummary] = Field(default_factory=list)
+    agent_iterations_mean: StrictFloat | None = Field(default=None, ge=0)
+    duration_mean_ms: StrictFloat | None = Field(default=None, ge=0)
+    total_tokens_mean_per_trial: StrictFloat | None = Field(default=None, ge=0)
+    tool_call_count_mean: StrictFloat | None = Field(default=None, ge=0)
+    deepseek_cache_status: DeepSeekCacheStatus = DeepSeekCacheStatus.NOT_EVALUATED
+    deepseek_cache_hit_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_counts(self) -> "CaseAggregate":
@@ -688,11 +848,57 @@ class AuditSummary(ContractModel):
     trial_count: NonNegativeInt
     passed_count: NonNegativeInt
     pass_rate: StrictFloat = Field(ge=0, le=1)
+    task_success_sample_count: NonNegativeInt = 0
     task_success_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
+    tool_correctness_sample_count: NonNegativeInt = 0
     tool_correctness_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
+    memory_required_evidence_sample_count: NonNegativeInt = 0
+    memory_required_evidence_hit_rate: StrictFloat | None = Field(
+        default=None, ge=0, le=1
+    )
+    memory_recall_at_k_sample_count: NonNegativeInt = 0
+    memory_recall_at_k_mean: StrictFloat | None = Field(default=None, ge=0, le=1)
+    memory_mrr_sample_count: NonNegativeInt = 0
+    memory_mrr_mean: StrictFloat | None = Field(default=None, ge=0, le=1)
+    background_review_decision_sample_count: NonNegativeInt = 0
+    background_review_decision_accuracy: StrictFloat | None = Field(
+        default=None, ge=0, le=1
+    )
+    conversation_turn_count_total: NonNegativeInt = 0
+    conversation_turn_count_mean: StrictFloat | None = Field(default=None, ge=0)
+    agent_iterations_total: NonNegativeInt = 0
+    agent_iterations_mean: StrictFloat | None = Field(default=None, ge=0)
+    agent_iterations_p50: NonNegativeInt | None = None
+    agent_iterations_p95: NonNegativeInt | None = None
+    duration_mean_ms: StrictFloat | None = Field(default=None, ge=0)
+    duration_sample_count: NonNegativeInt = 0
     duration_p50_ms: NonNegativeInt | None = None
     duration_p95_ms: NonNegativeInt | None = None
+    prompt_tokens_total: NonNegativeInt | None = None
+    prompt_tokens_mean_per_trial: StrictFloat | None = Field(default=None, ge=0)
+    prompt_tokens_sample_count: NonNegativeInt = 0
+    completion_tokens_total: NonNegativeInt | None = None
+    completion_tokens_mean_per_trial: StrictFloat | None = Field(default=None, ge=0)
+    completion_tokens_sample_count: NonNegativeInt = 0
     total_tokens: NonNegativeInt | None = None
+    total_tokens_mean_per_trial: StrictFloat | None = Field(default=None, ge=0)
+    total_tokens_mean_per_success: StrictFloat | None = Field(default=None, ge=0)
+    total_tokens_sample_count: NonNegativeInt = 0
+    total_tokens_success_sample_count: NonNegativeInt = 0
+    tool_call_count_total: NonNegativeInt = 0
+    tool_call_count_mean: StrictFloat | None = Field(default=None, ge=0)
+    tool_call_count_p50: NonNegativeInt | None = None
+    tool_call_count_p95: NonNegativeInt | None = None
+    tool_call_count_mean_per_success: StrictFloat | None = Field(default=None, ge=0)
+    tool_call_sample_count: NonNegativeInt = 0
+    tool_call_success_sample_count: NonNegativeInt = 0
+    failure_count: NonNegativeInt = 0
+    failure_rate: StrictFloat = Field(default=0.0, ge=0, le=1)
+    timeout_count: NonNegativeInt = 0
+    timeout_rate: StrictFloat = Field(default=0.0, ge=0, le=1)
+    environment_error_count: NonNegativeInt = 0
+    cancelled_count: NonNegativeInt = 0
+    deepseek_cache: DeepSeekCacheSummary | None = None
     metadata: JsonObject = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -715,11 +921,40 @@ class AuditSummary(ContractModel):
             raise ValueError("pass_rate must equal passed_count / trial_count")
         if self.case_count == 0 and self.trial_count != 0:
             raise ValueError("trials require at least one case")
+        if self.task_success_sample_count == 0 and self.task_success_rate is not None:
+            raise ValueError("task success rate requires samples")
+        if self.tool_correctness_sample_count == 0 and self.tool_correctness_rate is not None:
+            raise ValueError("tool correctness rate requires samples")
+        for rate_name, sample_count in (
+            ("memory_required_evidence_hit_rate", self.memory_required_evidence_sample_count),
+            ("memory_recall_at_k_mean", self.memory_recall_at_k_sample_count),
+            ("memory_mrr_mean", self.memory_mrr_sample_count),
+            ("background_review_decision_accuracy", self.background_review_decision_sample_count),
+            ("conversation_turn_count_mean", self.trial_count),
+            ("agent_iterations_mean", self.trial_count),
+            ("duration_mean_ms", self.duration_sample_count),
+            ("prompt_tokens_mean_per_trial", self.prompt_tokens_sample_count),
+            ("completion_tokens_mean_per_trial", self.completion_tokens_sample_count),
+            ("total_tokens_mean_per_trial", self.total_tokens_sample_count),
+            ("total_tokens_mean_per_success", self.total_tokens_success_sample_count),
+            ("tool_call_count_mean", self.tool_call_sample_count),
+            ("tool_call_count_mean_per_success", self.tool_call_success_sample_count),
+        ):
+            if getattr(self, rate_name) is not None and sample_count == 0:
+                raise ValueError(f"{rate_name} requires samples")
+        if self.failure_count > self.trial_count:
+            raise ValueError("failure_count cannot exceed trial_count")
+        if self.timeout_count > self.trial_count:
+            raise ValueError("timeout_count cannot exceed trial_count")
+        if self.environment_error_count > self.trial_count:
+            raise ValueError("environment_error_count cannot exceed trial_count")
+        if self.cancelled_count > self.trial_count:
+            raise ValueError("cancelled_count cannot exceed trial_count")
         return self
 
 
 class AuditRunResult(ContractModel):
-    schema_version: SchemaVersion = Field(
+    schema_version: ResultSchemaVersion = Field(
         description="Required top-level Audit result schema version."
     )
     run_id: Identifier

@@ -26,16 +26,29 @@ def render_console_summary(result: AuditRunResult) -> str:
         f"Passed:            {summary.passed_count}",
         f"Task success:      {_percent_or_missing(summary.task_success_rate)}",
         f"Tool correctness:  {_percent_or_missing(summary.tool_correctness_rate)}",
-        "Answer quality:    "
-        f"{_number_or_missing(result.judge_summary.mean_answer_quality)}",
-        "Judge coverage:    "
-        f"{result.judge_summary.completed_count}/"
-        f"{result.judge_summary.declared_count}",
-        f"Judge errors:      {result.judge_summary.error_count}",
+        f"Memory evidence:   {_percent_or_missing(summary.memory_required_evidence_hit_rate)}",
+        f"Memory Recall@K:   {_number_or_missing(summary.memory_recall_at_k_mean)}",
+        f"Memory MRR:        {_number_or_missing(summary.memory_mrr_mean)}",
+        f"Review decision:   {_percent_or_missing(summary.background_review_decision_accuracy)}",
+        f"Agent iterations:  {_number_or_missing(summary.agent_iterations_mean)} "
+        f"(P50 {_integer_or_missing(summary.agent_iterations_p50)}, "
+        f"P95 {_integer_or_missing(summary.agent_iterations_p95)})",
+        f"Duration mean:     {_duration_or_missing(_as_int(summary.duration_mean_ms))}",
         f"Duration P50:      {_duration_or_missing(summary.duration_p50_ms)}",
         f"Duration P95:      {_duration_or_missing(summary.duration_p95_ms)}",
+        f"Prompt tokens:     {_integer_or_missing(summary.prompt_tokens_total)}",
+        f"Completion tokens: {_integer_or_missing(summary.completion_tokens_total)}",
         f"Total tokens:      {_integer_or_missing(summary.total_tokens)}",
+        f"Tool calls:        {_number_or_missing(summary.tool_call_count_mean)} "
+        f"(P50 {_integer_or_missing(summary.tool_call_count_p50)}, "
+        f"P95 {_integer_or_missing(summary.tool_call_count_p95)})",
+        "DeepSeek cache:    " + _cache_summary(summary.deepseek_cache),
+        f"Failure rate:       {_percent_or_missing(summary.failure_rate)}",
+        f"Timeout rate:       {_percent_or_missing(summary.timeout_rate)}",
         "Langfuse experiment: " + _langfuse_experiment(result),
+        "Optional Judge:     "
+        f"{_number_or_missing(result.judge_summary.mean_answer_quality)} "
+        f"({result.judge_summary.completed_count}/{result.judge_summary.declared_count})",
     ]
     memory_lines = _memory_summary(result)
     if memory_lines:
@@ -161,6 +174,18 @@ def _integer_or_missing(value: int | None) -> str:
 
 def _number_or_missing(value: float | None) -> str:
     return "not evaluated" if value is None else f"{value:.3f}"
+
+
+def _as_int(value: float | None) -> int | None:
+    return None if value is None else round(value)
+
+
+def _cache_summary(value) -> str:
+    if value is None:
+        return "not evaluated"
+    rate = _percent_or_missing(value.cache_hit_rate)
+    coverage = _percent_or_missing(value.trial_coverage_rate)
+    return f"{value.status.value}, rate {rate}, trial coverage {coverage}"
 
 
 def _langfuse_experiment(result: AuditRunResult) -> str:

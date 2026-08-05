@@ -22,8 +22,8 @@ from myhermes_audit.contracts.memory import MemoryKind, RetrievalStrategy
 from myhermes_audit.contracts.background_review import ReviewKind
 
 
-CAPABILITY_PROTOCOL_VERSION = "5.1"
-CapabilityProtocolVersion = Literal["5.1"]
+CAPABILITY_PROTOCOL_VERSION = "5.2"
+CapabilityProtocolVersion = Literal["5.2"]
 
 
 class SubjectCapabilityProbeRequest(ContractModel):

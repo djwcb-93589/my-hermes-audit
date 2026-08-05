@@ -790,6 +790,7 @@ def _token_usage_observation_surface(value: object) -> bool:
     return all(
         name in fields
         for name in ("prompt_tokens", "completion_tokens", "total_tokens")
+        + ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
     )
 
 
@@ -1136,7 +1137,7 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         "hermes.observability",
         "ModelCallObservationView",
         _token_usage_observation_surface,
-        required=False,
+        required=True,
     )
     builder.check(
         "context_size_observation",

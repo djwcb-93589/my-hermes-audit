@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Literal
 
-from pydantic import Field, StrictBool, StrictStr, model_validator
+from pydantic import Field, StrictBool, StrictFloat, StrictStr, model_validator
 
 from myhermes_audit.contracts import (
     BackgroundReviewExecutionError,
@@ -36,6 +36,7 @@ from myhermes_audit.contracts import (
     TurnResult,
 )
 from myhermes_audit.contracts.suite import SkillFixture
+from myhermes_audit.contracts.result import DeepSeekCacheStatus
 from myhermes_audit.contracts.common import (
     ContractModel,
     Identifier,
@@ -48,9 +49,9 @@ from myhermes_audit.contracts.common import (
 )
 
 
-WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v11"
-LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v10"
-WorkerProtocolVersion = Literal["myhermes-audit-worker-v11"]
+WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v12"
+LEGACY_WORKER_PROTOCOL_VERSION = "myhermes-audit-worker-v11"
+WorkerProtocolVersion = Literal["myhermes-audit-worker-v12"]
 
 
 class WorkerMode(str, Enum):
@@ -332,6 +333,8 @@ class ModelObservationRecord(ContractModel):
     prompt_tokens: NonNegativeInt | None = None
     completion_tokens: NonNegativeInt | None = None
     total_tokens: NonNegativeInt | None = None
+    prompt_cache_hit_tokens: NonNegativeInt | None = None
+    prompt_cache_miss_tokens: NonNegativeInt | None = None
     duration_ms: NonNegativeInt
     tool_call_count: NonNegativeInt
     error_category: Identifier | None = None
@@ -348,6 +351,18 @@ class ModelObservationRecord(ContractModel):
             and self.total_tokens != self.prompt_tokens + self.completion_tokens
         ):
             raise ValueError("model total_tokens must equal prompt plus completion")
+        if (self.prompt_cache_hit_tokens is None) != (
+            self.prompt_cache_miss_tokens is None
+        ):
+            raise ValueError("cache observation fields must be paired")
+        if self.prompt_cache_hit_tokens is not None:
+            if self.prompt_tokens is None:
+                raise ValueError("cache observations require prompt_tokens")
+            if (
+                self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
+                != self.prompt_tokens
+            ):
+                raise ValueError("cache observations must sum to prompt_tokens")
         return self
 
 
@@ -372,6 +387,7 @@ class ObservationBundle(ContractModel):
     model_calls: list[ModelObservationRecord] = Field(default_factory=list)
     tool_calls: list[ToolObservationRecord] = Field(default_factory=list)
     truncated: StrictBool = False
+    cache_invalid_model_call_count: NonNegativeInt = 0
 
     @model_validator(mode="after")
     def validate_observations(self) -> "ObservationBundle":
@@ -381,6 +397,8 @@ class ObservationBundle(ContractModel):
         tool_call_ids = [item.tool_call_id for item in self.tool_calls]
         if len(tool_call_ids) != len(set(tool_call_ids)):
             raise ValueError("tool observations must have unique tool_call_id values")
+        if self.cache_invalid_model_call_count > len(self.model_calls):
+            raise ValueError("invalid cache model calls cannot exceed observations")
         return self
 
 
@@ -631,10 +649,17 @@ class MyHermesWorkerResult(ContractModel):
     iterations: NonNegativeInt = 0
     tool_batches: NonNegativeInt = 0
     tool_call_count: NonNegativeInt = 0
+    model_call_count: NonNegativeInt = 0
     tool_names: list[NonEmptyText] = Field(default_factory=list)
     prompt_tokens: NonNegativeInt | None = None
     completion_tokens: NonNegativeInt | None = None
     total_tokens: NonNegativeInt | None = None
+    prompt_cache_hit_tokens: NonNegativeInt | None = None
+    prompt_cache_miss_tokens: NonNegativeInt | None = None
+    deepseek_cache_hit_rate: StrictFloat | None = Field(default=None, ge=0, le=1)
+    deepseek_cache_status: DeepSeekCacheStatus = DeepSeekCacheStatus.NOT_EVALUATED
+    deepseek_cache_evaluated_model_call_count: NonNegativeInt = 0
+    deepseek_cache_invalid_model_call_count: NonNegativeInt = 0
     duration_ms: NonNegativeInt
     observations_artifact: SafeRelativePath
     transcript_artifact: SafeRelativePath
@@ -669,6 +694,12 @@ class MyHermesWorkerResult(ContractModel):
     review_gate_passed: StrictBool | None = None
     warnings: list[WorkerWarning] = Field(default_factory=list)
     error: WorkerError | None = None
+
+    @property
+    def cache_evaluated_model_call_count(self) -> int:
+        """Compatibility alias for the canonical DeepSeek-prefixed field."""
+
+        return self.deepseek_cache_evaluated_model_call_count
 
     @model_validator(mode="after")
     def validate_result(self) -> "MyHermesWorkerResult":
@@ -714,6 +745,62 @@ class MyHermesWorkerResult(ContractModel):
             and self.total_tokens != self.prompt_tokens + self.completion_tokens
         ):
             raise ValueError("total_tokens must equal prompt_tokens + completion_tokens")
+        if self.deepseek_cache_evaluated_model_call_count > self.model_call_count:
+            raise ValueError("evaluated cache calls cannot exceed model_call_count")
+        if self.deepseek_cache_invalid_model_call_count > self.model_call_count:
+            raise ValueError("invalid cache calls cannot exceed model_call_count")
+        if (self.prompt_cache_hit_tokens is None) != (
+            self.prompt_cache_miss_tokens is None
+        ):
+            raise ValueError("cache result fields must be paired")
+        if self.deepseek_cache_status is DeepSeekCacheStatus.INVALID:
+            if self.deepseek_cache_invalid_model_call_count == 0:
+                raise ValueError("invalid cache results require invalid calls")
+            if any(
+                value is not None
+                for value in (
+                    self.prompt_cache_hit_tokens,
+                    self.prompt_cache_miss_tokens,
+                    self.deepseek_cache_hit_rate,
+                )
+            ):
+                raise ValueError("invalid cache results cannot expose totals")
+        elif self.prompt_cache_hit_tokens is not None:
+            if self.prompt_tokens is None:
+                raise ValueError("cache result requires prompt_tokens")
+            if (
+                self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
+                != self.prompt_tokens
+            ):
+                raise ValueError("cache result totals must equal prompt_tokens")
+            denominator = (
+                self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
+            )
+            expected_rate = (
+                None
+                if denominator == 0
+                else self.prompt_cache_hit_tokens / denominator
+            )
+            if self.deepseek_cache_hit_rate != expected_rate:
+                raise ValueError("cache result rate must match token totals")
+        elif self.deepseek_cache_hit_rate is not None:
+            raise ValueError("cache result rate requires token totals")
+        if (
+            self.deepseek_cache_status is DeepSeekCacheStatus.NOT_EVALUATED
+            and self.deepseek_cache_evaluated_model_call_count != 0
+        ):
+            raise ValueError("not evaluated cache cannot have evaluated calls")
+        if (
+            self.deepseek_cache_status
+            in (DeepSeekCacheStatus.AVAILABLE, DeepSeekCacheStatus.PARTIAL)
+            and self.deepseek_cache_evaluated_model_call_count == 0
+        ):
+            raise ValueError("evaluated cache status requires evaluated calls")
+        if (
+            self.deepseek_cache_status is DeepSeekCacheStatus.AVAILABLE
+            and self.deepseek_cache_evaluated_model_call_count != self.model_call_count
+        ):
+            raise ValueError("available cache requires every model call")
         query_ids = [item.query_id for item in self.memory_query_results]
         if len(query_ids) != len(set(query_ids)):
             raise ValueError("worker Memory query IDs must not repeat")
@@ -803,6 +890,7 @@ __all__ = (
     "ProcessCleanupArtifact",
     "MyHermesWorkerRequest",
     "MyHermesWorkerResult",
+    "DeepSeekCacheStatus",
     "MemoryArtifact",
     "LEGACY_WORKER_PROTOCOL_VERSION",
     "MemoryQueryPlan",
