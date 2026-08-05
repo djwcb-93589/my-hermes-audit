@@ -63,7 +63,7 @@ inferred by parsing free-form logs and are never collapsed into “model issue�
 
 ## Baseline contract
 
-`AuditBaseline` is `baseline-v2`. It can be created from any strictly valid
+`AuditBaseline` is `baseline-v3`. It can be created from any strictly valid
 `AuditRunResult`, including a result with failed or timed-out Trials. It stores
 the source run ID, Audit and Subject commits, Suite ID and both Suite digests,
 Result Schema, Worker Protocol, model/config/pricing identities, total Trial
@@ -80,26 +80,25 @@ The model is frozen after load. `baseline create` rejects an existing output
 unless `--overwrite` is explicit and reports the old and new IDs when replacing
 one. It never updates Git, a remote store, or the source result.
 
-Baseline creation rejects conflicting model, configuration, Worker Protocol,
-Result Schema, or metric-contract identities before writing a file. A missing
-model, configuration, or Worker Protocol identity is retained as `missing`;
-these three are optional only when the source run did not expose them. Result
-Schema and metric-contract identities are required and always explicit. Missing
-is not rewritten as a conflict.
+Baseline creation rejects conflicting or missing model, configuration, Worker
+Protocol, Result Schema, or metric-contract identities before writing a file.
+All five are core identities and must be `available` with exactly one value;
+`missing` and `ambiguous` are retained in comparison diagnostics but cannot
+become a Baseline.
 
 No Baseline contains API keys, Base URLs, prompts, model responses, reasoning,
 Memory text, Review evidence正文, user identity, or local absolute paths.
 
 ## Comparability
 
-`AuditRegressionReport` is `regression-v2` and reports structured reasons when
+`AuditRegressionReport` is `regression-v3` and reports structured reasons when
 comparison is not valid. Core correctness comparison requires the same Suite
 ID, semantic Suite digest, ordered Case set, Result Schema identity, metric
 contract, Worker Protocol, model identity, and configuration identity. Each
 identity is explicitly `available`, `missing`, or `ambiguous`; ambiguous
-identities are never comparable, even when both sides are ambiguous. Optional
-missing identities are comparable only when both sides explicitly report
-`missing`.
+identities are never comparable, even when both sides are ambiguous. Any core
+missing identity is also not comparable; `missing == missing` is not treated as
+equality.
 Audit commit, Subject commit, run ID, Trial IDs, Sandbox IDs, and run time may
 differ; Subject commit differences are the normal version-regression use case.
 
@@ -134,8 +133,12 @@ comparison engine reads these policy fields; thresholds are not hard-coded in
 the comparison decision path.
 
 Metric decisions are `improved`, `unchanged`, `regressed`, `warning`,
-`not_comparable`, or `not_evaluated`. Every decision carries baseline/current
-values, absolute and (where defined) relative deltas, and both sample counts.
+`not_comparable`, or `not_evaluated`. The pure decision helper is the only
+place that applies direction, policy mode, and thresholds; both comparison and
+strict contract reload validation call it. Every decision carries
+baseline/current values, absolute and (where defined) relative deltas, and both
+sample counts. A disabled policy may still record `improved` or `unchanged`,
+with the reason code `policy_disabled`; it never emits warning or regression.
 There is no composite or weighted score.
 
 ## Case-level stability
@@ -150,6 +153,12 @@ facts, cache/cost states, and the metric decision. Background Review Cases also
 show actual action distributions and decision accuracy. This makes one
 intermittent failure (for example 1/5) distinguishable from a repeatable
 failure (for example 5/5), without naming a special Case rule.
+
+Case decisions use one shared precedence: hard regression, warning, improvement,
+unchanged, all-not-comparable, then all-not-evaluated. Mixed unavailable
+states receive a stable reason code. A report is `not_comparable` when no core
+metric is comparable, even if no identity mismatch exists; `passed` requires at
+least one comparable metric.
 
 ## CLI, console, and JSON
 
@@ -193,7 +202,8 @@ outside the safe contract are excluded.
 
 ## Versioning and scope
 
-Baseline and Regression contracts have independent versions. P7 adds the
+Baseline and Regression contracts are `baseline-v3` and `regression-v3`.
+P7 adds the
 semantic Suite comparison digest to `AuditFingerprint`, so the Audit Result
 Schema is `1.6`; Worker Protocol remains v13. Existing Trial and evaluator
 semantics are unchanged. P6.4 Cases and YAML are untouched.

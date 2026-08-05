@@ -32,15 +32,21 @@ from myhermes_audit.contracts.result import (
     DeepSeekCacheSummary,
 )
 from myhermes_audit.serialization import canonical_sha256
+from myhermes_audit.regression_decision import (
+    MetricDecisionInput,
+    decide_case_regression,
+    decide_metric_comparison,
+    decide_report_status,
+)
 
 
-BASELINE_SCHEMA_VERSION = "baseline-v2"
-REGRESSION_SCHEMA_VERSION = "regression-v2"
+BASELINE_SCHEMA_VERSION = "baseline-v3"
+REGRESSION_SCHEMA_VERSION = "regression-v3"
 REGRESSION_POLICY_SCHEMA_VERSION = "regression-policy-v1"
 METRIC_CONTRACT_VERSION = "p7-metrics-v1"
 
-BaselineSchemaVersion = Literal["baseline-v2"]
-RegressionSchemaVersion = Literal["regression-v2"]
+BaselineSchemaVersion = Literal["baseline-v3"]
+RegressionSchemaVersion = Literal["regression-v3"]
 RegressionPolicySchemaVersion = Literal["regression-policy-v1"]
 MetricNumber = StrictInt | StrictFloat | Decimal
 
@@ -144,6 +150,13 @@ class RegressionMetricPolicy(ContractModel):
             raise ValueError("enabled metric policies require an explicit threshold")
         if self.direction is MetricDirection.NEUTRAL:
             raise ValueError("enabled metric policies require a comparison direction")
+        if self.direction is MetricDirection.HIGHER_IS_BETTER and (
+            self.max_relative_increase is not None
+            or self.max_absolute_increase is not None
+        ):
+            raise ValueError("higher-is-better policies require max_absolute_drop")
+        if self.direction is MetricDirection.LOWER_IS_BETTER and self.max_absolute_drop is not None:
+            raise ValueError("lower-is-better policies cannot use max_absolute_drop")
         return self
 
 
@@ -402,6 +415,8 @@ class AuditBaseline(ContractModel):
             (self.configuration_identity, self.configuration_fingerprint),
             (self.worker_protocol_identity, self.worker_protocol_version),
         ):
+            if identity.status is not IdentityStatus.AVAILABLE:
+                raise ValueError("Baseline core identities must be available")
             if identity.status is IdentityStatus.AVAILABLE and scalar != identity.value:
                 raise ValueError("identity scalar projection is inconsistent")
             if identity.status is not IdentityStatus.AVAILABLE and scalar is not None:
@@ -444,7 +459,7 @@ class MetricComparison(ContractModel):
     baseline_value: MetricNumber | None = None
     current_value: MetricNumber | None = None
     absolute_delta: MetricNumber | None = None
-    relative_delta: StrictFloat | None = None
+    relative_delta: MetricNumber | None = None
     baseline_sample_count: NonNegativeInt = 0
     current_sample_count: NonNegativeInt = 0
     baseline_denominator: NonNegativeInt | None = None
@@ -475,48 +490,45 @@ class MetricComparison(ContractModel):
     def validate_relative_fact(cls, value: object) -> object:
         if value is None:
             return None
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            raise ValueError("relative delta must be finite numeric")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("relative delta must be finite numeric")
+        if isinstance(value, Decimal) and not value.is_finite():
             raise ValueError("relative delta must be finite numeric")
         return value
 
     @model_validator(mode="after")
     def validate_comparison(self) -> "MetricComparison":
-        evaluated = {
-            MetricDecision.IMPROVED,
-            MetricDecision.UNCHANGED,
-            MetricDecision.REGRESSED,
-            MetricDecision.WARNING,
-        }
-        if self.decision in {MetricDecision.NOT_COMPARABLE, MetricDecision.NOT_EVALUATED}:
-            if self.reason is None:
-                raise ValueError("non-evaluated comparisons require a reason")
-            if self.absolute_delta is not None or self.relative_delta is not None:
-                raise ValueError("non-evaluated comparisons cannot carry deltas")
-            return self
-        if self.decision in evaluated:
-            if self.baseline_value is None or self.current_value is None:
-                raise ValueError("evaluated comparisons require both values")
-            if self.baseline_sample_count == 0 or self.current_sample_count == 0:
-                raise ValueError("evaluated comparisons require samples")
-            expected_delta = float(self.current_value) - float(self.baseline_value)
-            if self.absolute_delta is None or not math.isclose(float(self.absolute_delta), expected_delta, rel_tol=1e-9, abs_tol=1e-12):
-                raise ValueError("absolute delta is inconsistent")
-            expected_relative = None if float(self.baseline_value) == 0 else expected_delta / abs(float(self.baseline_value))
-            if expected_relative is None:
-                if self.relative_delta is not None:
-                    raise ValueError("zero baseline requires null relative delta")
-            elif self.relative_delta is None or not math.isclose(self.relative_delta, expected_relative, rel_tol=1e-9, abs_tol=1e-12):
-                raise ValueError("relative delta is inconsistent")
-            if self.reason is not None:
-                raise ValueError("evaluated comparisons cannot carry a reason")
-            if self.decision is MetricDecision.REGRESSED and self.policy_mode is not PolicyMode.FAILURE:
-                raise ValueError("hard regression requires failure policy")
-            if self.decision is MetricDecision.WARNING and self.policy_mode is not PolicyMode.WARNING:
-                raise ValueError("warning decision requires warning policy")
-            if self.decision in {MetricDecision.REGRESSED, MetricDecision.WARNING, MetricDecision.IMPROVED} and self.direction is MetricDirection.NEUTRAL:
-                raise ValueError("directional decision requires a direction")
-        if self.policy_mode is PolicyMode.DISABLED and self.decision is not MetricDecision.UNCHANGED:
-            raise ValueError("disabled policy must produce unchanged decision")
+        if self.reason is not None and (
+            not self.reason.replace("_", "").isalnum()
+            or self.reason.lower() != self.reason
+        ):
+            raise ValueError("comparison reason must be a stable reason code")
+        non_comparable = self.decision is MetricDecision.NOT_COMPARABLE
+        not_evaluated = self.decision is MetricDecision.NOT_EVALUATED
+        expected = decide_metric_comparison(
+            MetricDecisionInput(
+                baseline_value=self.baseline_value,
+                current_value=self.current_value,
+                direction=self.direction.value,
+                policy_mode=self.policy_mode.value,
+                max_absolute_drop=self.max_absolute_drop,
+                max_relative_increase=self.max_relative_increase,
+                max_absolute_increase=self.max_absolute_increase,
+                comparable=not non_comparable,
+                sufficient_samples=not not_evaluated,
+                reason=self.reason,
+            )
+        )
+        if self.decision.value != expected.decision.value:
+            raise ValueError("Metric decision does not match the decision helper")
+        if self.absolute_delta != expected.absolute_delta:
+            raise ValueError("absolute delta is inconsistent with the decision helper")
+        if self.relative_delta != expected.relative_delta:
+            raise ValueError("relative delta is inconsistent with the decision helper")
+        if self.reason != expected.reason:
+            raise ValueError("comparison reason is inconsistent with the decision helper")
         return self
 
 
@@ -593,14 +605,18 @@ class CaseRegressionSummary(ContractModel):
             raise ValueError("baseline background review action counts exceed decision samples")
         if sum(self.current_background_review_actions.values()) > self.background_review_decision_sample_count:
             raise ValueError("current background review action counts exceed decision samples")
-        decisions = {item.decision for item in self.metrics}
-        if MetricDecision.REGRESSED in decisions and self.decision is not MetricDecision.REGRESSED:
-            raise ValueError("Case decision must expose hard regression")
-        if MetricDecision.WARNING in decisions and MetricDecision.REGRESSED not in decisions and self.decision is not MetricDecision.WARNING:
-            raise ValueError("Case decision must expose warning")
-        if decisions and decisions <= {MetricDecision.NOT_COMPARABLE}:
-            if self.decision is not MetricDecision.NOT_COMPARABLE or self.decision_reason is None:
-                raise ValueError("not-comparable Case requires a reason")
+        expected = decide_case_regression(
+            [item.decision.value for item in self.metrics]
+        )
+        if self.decision.value != expected.decision.value:
+            raise ValueError("Case decision does not match the decision helper")
+        if self.decision_reason is not None and (
+            not self.decision_reason.replace("_", "").isalnum()
+            or self.decision_reason.lower() != self.decision_reason
+        ):
+            raise ValueError("Case decision reason must be a stable reason code")
+        if self.decision_reason != expected.reason:
+            raise ValueError("Case decision reason does not match the decision helper")
         return self
 
 
@@ -671,6 +687,11 @@ class AuditRegressionReport(ContractModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> "AuditRegressionReport":
+        if any(
+            not reason.replace("_", "").isalnum() or reason.lower() != reason
+            for reason in self.comparability_reasons
+        ):
+            raise ValueError("comparability reasons must be stable reason codes")
         if self.baseline_trial_count != self.baseline_total_trial_count or self.current_trial_count != self.current_total_trial_count:
             raise ValueError("legacy and explicit total trial counts must match")
         case_ids = {item.case_id for item in self.case_summaries}
@@ -722,23 +743,56 @@ class AuditRegressionReport(ContractModel):
             if getattr(self, name) != expected:
                 raise ValueError(f"{name} does not match MetricComparison decisions")
         core_reasons = [reason for reason in self.comparability_reasons if reason != "pricing_fingerprint_mismatch"]
-        hard = self.regression_count > 0
-        warning = self.warning_count > 0
-        if self.status is RegressionStatus.PASSED:
-            if hard or warning or core_reasons or not self.overall_regression_gate:
-                raise ValueError("passed status contradicts regression facts")
-        elif self.status is RegressionStatus.PASSED_WITH_WARNINGS:
-            if hard or not warning or core_reasons or not self.overall_regression_gate:
-                raise ValueError("warning status contradicts regression facts")
-        elif self.status is RegressionStatus.REGRESSED:
-            if not hard or self.overall_regression_gate or core_reasons:
-                raise ValueError("regressed reports must fail the regression gate")
-        elif self.status is RegressionStatus.NOT_COMPARABLE:
-            if not core_reasons or self.overall_regression_gate:
-                raise ValueError("not-comparable reports require core reasons and a closed gate")
-        elif self.status is RegressionStatus.INVALID_INPUT:
-            if self.overall_regression_gate or self.regression_count or self.warning_count:
-                raise ValueError("invalid input cannot carry a regression conclusion")
+        for name, baseline_identity, current_identity in (
+            ("model", self.baseline_model_identity, self.current_model_identity),
+            ("configuration", self.baseline_configuration_identity, self.current_configuration_identity),
+            ("worker_protocol", self.baseline_worker_protocol_identity, self.current_worker_protocol_identity),
+            ("result_schema", self.baseline_result_schema_identity, self.current_result_schema_identity),
+            ("metric_contract", self.baseline_metric_contract_identity, self.current_metric_contract_identity),
+        ):
+            if baseline_identity.status is IdentityStatus.AMBIGUOUS or current_identity.status is IdentityStatus.AMBIGUOUS:
+                expected_reason = f"{name}_identity_ambiguous"
+            elif baseline_identity.status is IdentityStatus.MISSING or current_identity.status is IdentityStatus.MISSING:
+                expected_reason = f"{name}_identity_missing"
+            elif baseline_identity.value != current_identity.value:
+                expected_reason = f"{name}_identity_mismatch"
+            else:
+                expected_reason = None
+            if expected_reason is not None and expected_reason not in core_reasons:
+                raise ValueError("identity state is missing its comparability reason")
+        comparable_metric_count = sum(
+            item.decision
+            in {
+                MetricDecision.IMPROVED,
+                MetricDecision.UNCHANGED,
+                MetricDecision.REGRESSED,
+                MetricDecision.WARNING,
+            }
+            for item in all_metrics
+        )
+        expected_status = decide_report_status(
+            regression_count=self.regression_count,
+            warning_count=self.warning_count,
+            comparable_metric_count=comparable_metric_count,
+            core_reason_count=len(core_reasons),
+            invalid_input=self.status is RegressionStatus.INVALID_INPUT,
+        )
+        if self.status.value != expected_status.status or self.overall_regression_gate != expected_status.gate:
+            raise ValueError("report status or gate does not match the decision helper")
+        if self.status is RegressionStatus.INVALID_INPUT and any(
+            expected_counts.values()
+        ):
+            raise ValueError("invalid input cannot carry a regression conclusion")
+        if self.status is RegressionStatus.NOT_COMPARABLE and any(
+            expected_counts[name]
+            for name in (
+                "regression_count",
+                "warning_count",
+                "improvement_count",
+                "unchanged_count",
+            )
+        ):
+            raise ValueError("not-comparable reports cannot carry evaluated decisions")
         if not core_reasons and self.status is RegressionStatus.NOT_COMPARABLE:
             raise ValueError("not-comparable status requires a core reason")
         return self

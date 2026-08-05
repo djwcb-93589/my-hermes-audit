@@ -44,6 +44,12 @@ from myhermes_audit.contracts.regression import (
     METRIC_CONTRACT_VERSION,
 )
 from myhermes_audit.serialization import canonical_sha256
+from myhermes_audit.regression_decision import (
+    MetricDecisionInput,
+    decide_case_regression,
+    decide_metric_comparison,
+    decide_report_status,
+)
 
 
 def _number(value: object) -> float | Decimal | int | None:
@@ -535,9 +541,9 @@ def _identity_comparison(
 
     if baseline.status is IdentityStatus.AMBIGUOUS or current.status is IdentityStatus.AMBIGUOUS:
         return f"{name}_identity_ambiguous"
-    if baseline.status is not current.status:
-        return f"{name}_identity_status_mismatch"
-    if baseline.status is IdentityStatus.AVAILABLE and baseline.value != current.value:
+    if baseline.status is IdentityStatus.MISSING or current.status is IdentityStatus.MISSING:
+        return f"{name}_identity_missing"
+    if baseline.value != current.value:
         return f"{name}_identity_mismatch"
     return None
 
@@ -546,20 +552,21 @@ def build_baseline(result: AuditRunResult) -> AuditBaseline:
     if not isinstance(result, AuditRunResult):
         raise ValueError("baseline input must be an AuditRunResult")
     identities, warnings = _identity_values(result)
-    ambiguous = sorted(
+    incomplete = sorted(
         name for name, evidence in identities.items()
-        if evidence.status is IdentityStatus.AMBIGUOUS
+        if evidence.status is not IdentityStatus.AVAILABLE
     )
-    if ambiguous:
+    if incomplete:
         raise ValueError(
-            "baseline identity is ambiguous: " + ", ".join(ambiguous)
+            "baseline core identity is missing or ambiguous: "
+            + ", ".join(incomplete)
         )
     suite = _benchmark_summary(result, result.trials)
     cases = _benchmark_cases(result)
     case_ids = [case.case_id for case in cases]
     declared_per_case, declared_mapping = _declared_trial_mapping(cases)
     baseline_fields = {
-        "schema_version": "baseline-v2",
+        "schema_version": "baseline-v3",
         "source_run_id": result.run_id,
         "audit_commit": result.audit_fingerprint.audit_commit,
         "subject_commit": result.subject_fingerprint.git_commit,
@@ -614,11 +621,6 @@ def _snapshot_map(items: Iterable[MetricSnapshot]) -> dict[str, MetricSnapshot]:
     return {item.metric_name: item for item in items}
 
 
-def _numeric_float(value: object) -> float | None:
-    number = _number(value)
-    return None if number is None else float(number)
-
-
 def _compare_metric(
     baseline: MetricSnapshot | None,
     current: MetricSnapshot | None,
@@ -649,108 +651,71 @@ def _compare_metric(
         max_relative_increase=policy.max_relative_increase,
         max_absolute_increase=policy.max_absolute_increase,
     )
-    if not core_comparable:
-        return MetricComparison(
-            **{**common, "baseline_value": None, "current_value": None},
-            decision=MetricDecision.NOT_COMPARABLE,
-            reason=reason or "core_contract_not_comparable",
-        )
-    if policy.require_pricing_match and not pricing_comparable:
-        return MetricComparison(
-            **{**common, "baseline_value": None, "current_value": None},
-            decision=MetricDecision.NOT_COMPARABLE,
-            reason="pricing_fingerprint_mismatch",
-        )
-    if name.startswith("deepseek_cost_") and not pricing_comparable:
-        return MetricComparison(
-            **{**common, "baseline_value": None, "current_value": None},
-            decision=MetricDecision.NOT_COMPARABLE,
-            reason="pricing_fingerprint_mismatch",
-        )
-    base = _numeric_float(base_value)
-    current_number = _numeric_float(current_value)
-    if (
+    pricing_issue = (
+        not pricing_comparable
+        and (policy.require_pricing_match or name.startswith("deepseek_cost_"))
+    )
+    comparable = core_comparable and not pricing_issue
+    baseline_missing = (
         baseline is None
-        or current is None
         or baseline.availability is MetricAvailability.NOT_EVALUATED
-        or current.availability is MetricAvailability.NOT_EVALUATED
         or baseline.sample_count == 0
+    )
+    current_missing = (
+        current is None
+        or current.availability is MetricAvailability.NOT_EVALUATED
         or current.sample_count == 0
-        or base is None
-        or current_number is None
-    ):
-        baseline_missing = baseline is None or baseline.availability is MetricAvailability.NOT_EVALUATED or baseline.sample_count == 0
-        current_missing = current is None or current.availability is MetricAvailability.NOT_EVALUATED or current.sample_count == 0
-        if baseline_missing and current_missing:
-            missing_side = "both"
-        elif baseline_missing:
-            missing_side = "baseline"
-        elif current_missing:
-            missing_side = "current"
-        else:
-            missing_side = "metric"
-        return MetricComparison(
-            **common,
-            decision=MetricDecision.NOT_EVALUATED,
-            reason=f"{missing_side}_not_evaluated",
+    )
+    sufficient_samples = not baseline_missing and not current_missing
+    if baseline_missing and current_missing:
+        missing_reason = "both_not_evaluated"
+    elif baseline_missing:
+        missing_reason = "baseline_not_evaluated"
+    elif current_missing:
+        missing_reason = "current_not_evaluated"
+    else:
+        missing_reason = None
+    decision_result = decide_metric_comparison(
+        MetricDecisionInput(
+            baseline_value=base_value,
+            current_value=current_value,
+            direction=policy.direction.value,
+            policy_mode=policy.mode.value,
+            max_absolute_drop=policy.max_absolute_drop,
+            max_relative_increase=policy.max_relative_increase,
+            max_absolute_increase=policy.max_absolute_increase,
+            comparable=comparable,
+            sufficient_samples=sufficient_samples,
+            reason=(
+                reason
+                if not core_comparable
+                else "pricing_fingerprint_mismatch"
+                if pricing_issue
+                else missing_reason
+            ),
         )
-    delta = current_number - base
-    relative = None if base == 0 else delta / abs(base)
-    decision = MetricDecision.UNCHANGED
-    adverse = False
-    if policy.mode is PolicyMode.DISABLED:
-        decision = MetricDecision.UNCHANGED
-    elif policy.direction is MetricDirection.HIGHER_IS_BETTER:
-        if delta > 0:
-            decision = MetricDecision.IMPROVED
-        elif delta < 0:
-            adverse = (
-                policy.max_absolute_drop is not None
-                and -delta > policy.max_absolute_drop
-            )
-            decision = MetricDecision.REGRESSED if adverse and policy.mode is PolicyMode.FAILURE else (
-                MetricDecision.WARNING if adverse else MetricDecision.UNCHANGED
-            )
-    elif policy.direction is MetricDirection.LOWER_IS_BETTER:
-        if delta < 0:
-            decision = MetricDecision.IMPROVED
-        elif delta > 0:
-            adverse = (
-                (
-                    policy.max_absolute_increase is not None
-                    and delta > policy.max_absolute_increase
-                )
-                or (
-                    policy.max_relative_increase is not None
-                    and current_number > 0
-                    and (
-                        relative is None
-                        or relative > policy.max_relative_increase
-                    )
-                )
-            )
-            decision = MetricDecision.REGRESSED if adverse and policy.mode is PolicyMode.FAILURE else (
-                MetricDecision.WARNING if adverse else MetricDecision.UNCHANGED
-            )
+    )
+    safe_common = common
+    if not comparable:
+        safe_common = {**common, "baseline_value": None, "current_value": None}
     return MetricComparison(
-        **common,
-        absolute_delta=delta,
-        relative_delta=relative,
-        decision=decision,
+        **safe_common,
+        absolute_delta=decision_result.absolute_delta,
+        relative_delta=decision_result.relative_delta,
+        decision=MetricDecision(decision_result.decision.value),
+        reason=decision_result.reason,
     )
 
 
 def _case_decision(metrics: Sequence[MetricComparison]) -> MetricDecision:
-    decisions = {metric.decision for metric in metrics}
-    if MetricDecision.REGRESSED in decisions:
-        return MetricDecision.REGRESSED
-    if MetricDecision.WARNING in decisions:
-        return MetricDecision.WARNING
-    if MetricDecision.IMPROVED in decisions:
-        return MetricDecision.IMPROVED
-    if decisions and decisions <= {MetricDecision.NOT_COMPARABLE}:
-        return MetricDecision.NOT_COMPARABLE
-    return MetricDecision.UNCHANGED
+    result = decide_case_regression([metric.decision.value for metric in metrics])
+    return MetricDecision(result.decision.value)
+
+
+def _case_decision_reason(metrics: Sequence[MetricComparison]) -> str | None:
+    return decide_case_regression(
+        [metric.decision.value for metric in metrics]
+    ).reason
 
 
 def _report_counts(metrics: Sequence[MetricComparison], cases: Sequence[CaseRegressionSummary]) -> dict[str, int]:
@@ -866,23 +831,34 @@ def compare_baseline(
                 background_review_decision_sample_count=new.background_review_decision_sample_count,
                 metrics=metrics,
                 metric_comparison_count=len(metrics),
-                decision_reason=(
-                    core_reasons[0]
-                    if _case_decision(metrics) is MetricDecision.NOT_COMPARABLE
-                    else None
-                ),
+                decision_reason=_case_decision_reason(metrics),
                 decision=_case_decision(metrics),
             )
         )
     counts = _report_counts(suite_metrics, case_reports)
-    if not core_comparable:
-        status = RegressionStatus.NOT_COMPARABLE
-    elif counts["regression_count"]:
-        status = RegressionStatus.REGRESSED
-    elif counts["warning_count"]:
-        status = RegressionStatus.PASSED_WITH_WARNINGS
-    else:
-        status = RegressionStatus.PASSED
+    comparable_metric_count = sum(
+        item.decision
+        in {
+            MetricDecision.IMPROVED,
+            MetricDecision.UNCHANGED,
+            MetricDecision.REGRESSED,
+            MetricDecision.WARNING,
+        }
+        for item in [
+            *suite_metrics,
+            *(metric for case in case_reports for metric in case.metrics),
+        ]
+    )
+    if comparable_metric_count == 0:
+        reasons.append("no_comparable_core_metrics")
+    core_reasons = [reason for reason in reasons if reason != "pricing_fingerprint_mismatch"]
+    report_decision = decide_report_status(
+        regression_count=counts["regression_count"],
+        warning_count=counts["warning_count"],
+        comparable_metric_count=comparable_metric_count,
+        core_reason_count=len(core_reasons),
+    )
+    status = RegressionStatus(report_decision.status)
     warnings = sorted(set(identity_warnings + (["pricing_fingerprint_mismatch"] if not pricing_comparable else [])))
     current_model = _identity_projection(current_identities["model"])
     current_config = _identity_projection(current_identities["configuration"])
@@ -945,10 +921,7 @@ def compare_baseline(
         suite_metrics=suite_metrics,
         case_summaries=case_reports,
         **counts,
-        overall_regression_gate=status in {
-            RegressionStatus.PASSED,
-            RegressionStatus.PASSED_WITH_WARNINGS,
-        },
+        overall_regression_gate=report_decision.gate,
         warnings=warnings,
     )
 
