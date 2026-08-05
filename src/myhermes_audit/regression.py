@@ -38,22 +38,25 @@ from myhermes_audit.contracts.regression import (
     MetricSnapshot,
     metric_decision_counts,
     derive_metric_decision,
-    PolicyMode,
-    RegressionMetricPolicy,
     RegressionPolicy,
+    RegressionPolicySnapshot,
     RegressionStatus,
     METRIC_CONTRACT_VERSION,
     BASELINE_SCHEMA_VERSION,
+    pricing_applicability_fingerprint,
 )
 from myhermes_audit.serialization import canonical_sha256
 from myhermes_audit.regression_decision import (
     MetricDecisionInput,
     MetricEvaluationInput,
+    MetricPolicyFacts,
+    PolicySnapshotFacts,
     decide_case_regression,
     decide_metric_comparison,
     decide_report_status,
     derive_comparability_reason_codes,
     derive_metric_evaluation_facts,
+    resolve_metric_policy,
 )
 
 
@@ -629,7 +632,7 @@ def _snapshot_map(items: Iterable[MetricSnapshot]) -> dict[str, MetricSnapshot]:
 def _compare_metric(
     baseline: MetricSnapshot | None,
     current: MetricSnapshot | None,
-    policy: RegressionMetricPolicy,
+    policy_facts: MetricPolicyFacts,
     *,
     pricing_comparable: bool,
     pricing_reason: str | None = None,
@@ -650,13 +653,13 @@ def _compare_metric(
         current_sample_count=current_samples,
         baseline_denominator=base_denominator,
         current_denominator=current_denominator,
-        policy_mode=policy.mode,
-        direction=policy.direction,
-        max_absolute_drop=policy.max_absolute_drop,
-        max_relative_increase=policy.max_relative_increase,
-        max_absolute_increase=policy.max_absolute_increase,
+        policy_mode=policy_facts.mode,
+        direction=policy_facts.direction,
+        max_absolute_drop=policy_facts.max_absolute_drop,
+        max_relative_increase=policy_facts.max_relative_increase,
+        max_absolute_increase=policy_facts.max_absolute_increase,
     )
-    requires_pricing_match = policy.require_pricing_match or name.startswith("deepseek_cost_")
+    requires_pricing_match = policy_facts.requires_pricing_match
     pricing_issue = not pricing_comparable and requires_pricing_match
     facts = derive_metric_evaluation_facts(
         MetricEvaluationInput(
@@ -677,11 +680,11 @@ def _compare_metric(
         MetricDecisionInput(
             baseline_value=base_value,
             current_value=current_value,
-            direction=policy.direction.value,
-            policy_mode=policy.mode.value,
-            max_absolute_drop=policy.max_absolute_drop,
-            max_relative_increase=policy.max_relative_increase,
-            max_absolute_increase=policy.max_absolute_increase,
+            direction=policy_facts.direction,
+            policy_mode=policy_facts.mode,
+            max_absolute_drop=policy_facts.max_absolute_drop,
+            max_relative_increase=policy_facts.max_relative_increase,
+            max_absolute_increase=policy_facts.max_absolute_increase,
             evaluation_status=facts.evaluation_status.value,
             comparability_status=facts.comparability_status.value,
             reason_codes=facts.reason_codes,
@@ -694,6 +697,7 @@ def _compare_metric(
         comparability_fact_codes=list(facts.comparability_fact_codes),
         requires_pricing_match=requires_pricing_match,
         comparability_facts_verified=False,
+        policy_facts_verified=False,
         evaluation_status=facts.evaluation_status,
         comparability_status=facts.comparability_status,
         reason_codes=list(facts.reason_codes),
@@ -704,20 +708,44 @@ def _compare_metric(
     )
 
 
-def _case_decision(metrics: Sequence[MetricComparison]) -> MetricDecision:
-    result = decide_case_regression([derive_metric_decision(metric).value for metric in metrics])
+def _case_decision(
+    metrics: Sequence[MetricComparison],
+    policy_facts: PolicySnapshotFacts,
+) -> MetricDecision:
+    result = decide_case_regression(
+        [
+            derive_metric_decision(
+                metric,
+                resolve_metric_policy(metric.metric_name, policy_facts),
+            ).value
+            for metric in metrics
+        ]
+    )
     return MetricDecision(result.decision.value)
 
 
-def _case_decision_reason(metrics: Sequence[MetricComparison]) -> str | None:
+def _case_decision_reason(
+    metrics: Sequence[MetricComparison],
+    policy_facts: PolicySnapshotFacts,
+) -> str | None:
     return decide_case_regression(
-        [derive_metric_decision(metric).value for metric in metrics]
+        [
+            derive_metric_decision(
+                metric,
+                resolve_metric_policy(metric.metric_name, policy_facts),
+            ).value
+            for metric in metrics
+        ]
     ).reason
 
 
-def _report_counts(metrics: Sequence[MetricComparison], cases: Sequence[CaseRegressionSummary]) -> dict[str, int]:
+def _report_counts(
+    metrics: Sequence[MetricComparison],
+    cases: Sequence[CaseRegressionSummary],
+    policy_facts: PolicySnapshotFacts,
+) -> dict[str, int]:
     all_metrics = [*metrics, *(metric for case in cases for metric in case.metrics)]
-    return metric_decision_counts(all_metrics)
+    return metric_decision_counts(all_metrics, policy_facts)
 
 
 def compare_baseline(
@@ -725,8 +753,14 @@ def compare_baseline(
     current: AuditRunResult,
     policy: RegressionPolicy,
 ) -> AuditRegressionReport:
-    if not isinstance(baseline, AuditBaseline) or not isinstance(current, AuditRunResult):
-        raise ValueError("compare inputs must be a validated baseline and AuditRunResult")
+    if (
+        not isinstance(baseline, AuditBaseline)
+        or not isinstance(current, AuditRunResult)
+        or not isinstance(policy, RegressionPolicy)
+    ):
+        raise ValueError("compare inputs must be validated baseline, AuditRunResult, and RegressionPolicy")
+    policy_snapshot = RegressionPolicySnapshot.from_policy(policy)
+    policy_facts = policy_snapshot.to_facts()
     current_suite = _benchmark_summary(current, current.trials)
     current_cases = {item.case_id: item for item in _benchmark_cases(current)}
     baseline_cases = {item.case_id: item for item in baseline.case_summaries}
@@ -779,8 +813,6 @@ def compare_baseline(
         for reason in reasons
         if reason not in {"pricing_fingerprint_mismatch", "pricing_fingerprint_missing"}
     ]
-    policy_metrics = policy.metrics
-    default_policy = RegressionMetricPolicy(mode=policy.default_mode)
     suite_metrics: list[MetricComparison] = []
     current_map = _snapshot_map(current_suite.metrics)
     baseline_map = _snapshot_map(baseline.suite_summary.metrics)
@@ -789,7 +821,7 @@ def compare_baseline(
             _compare_metric(
                 baseline_map.get(name),
                 current_map.get(name),
-                policy_metrics.get(name, default_policy),
+                resolve_metric_policy(name, policy_facts),
                 pricing_comparable=pricing_comparable,
                 pricing_reason=pricing_reason,
                 comparability_fact_codes=core_reasons,
@@ -807,7 +839,7 @@ def compare_baseline(
             _compare_metric(
                 old_map.get(name),
                 new_map.get(name),
-                policy_metrics.get(name, default_policy),
+                resolve_metric_policy(name, policy_facts),
                 pricing_comparable=pricing_comparable,
                 pricing_reason=pricing_reason,
                 comparability_fact_codes=core_reasons,
@@ -846,15 +878,19 @@ def compare_baseline(
                 baseline_background_review_decision_sample_count=old.background_review_decision_sample_count,
                 background_review_decision_sample_count=new.background_review_decision_sample_count,
                 comparability_facts_verified=False,
+                policy_facts_verified=False,
                 metrics=metrics,
                 metric_comparison_count=len(metrics),
-                decision_reason=_case_decision_reason(metrics),
-                decision=_case_decision(metrics),
+                decision_reason=_case_decision_reason(metrics, policy_facts),
+                decision=_case_decision(metrics, policy_facts),
             )
         )
-    counts = _report_counts(suite_metrics, case_reports)
+    counts = _report_counts(suite_metrics, case_reports, policy_facts)
     comparable_metric_count = sum(
-        derive_metric_decision(item).value
+        derive_metric_decision(
+            item,
+            resolve_metric_policy(item.metric_name, policy_facts),
+        ).value
         in {
             MetricDecision.IMPROVED.value,
             MetricDecision.UNCHANGED.value,
@@ -868,17 +904,10 @@ def compare_baseline(
     )
     if comparable_metric_count == 0:
         reasons.append("no_comparable_core_metrics")
-    pricing_applicability_fingerprint = canonical_sha256(
-        [
-            {
-                "metric_name": item.metric_name,
-                "requires_pricing_match": item.requires_pricing_match,
-            }
-            for item in [
-                *suite_metrics,
-                *(metric for case in case_reports for metric in case.metrics),
-            ]
-        ]
+    pricing_applicability_fingerprint_value = pricing_applicability_fingerprint(
+        policy_snapshot.policy_fingerprint,
+        suite_metrics,
+        case_reports,
     )
     core_reasons = [
         reason
@@ -903,6 +932,10 @@ def compare_baseline(
         baseline_id=baseline.baseline_id,
         current_run_id=current.run_id,
         status=status,
+        regression_policy=policy_snapshot,
+        regression_policy_fingerprint=policy_snapshot.policy_fingerprint,
+        policy_facts_verified=True,
+        comparability_facts_verified=True,
         comparability_reasons=sorted(set(reasons)),
         baseline_suite_id=baseline.suite_id,
         suite_id=current.suite_id,
@@ -930,7 +963,7 @@ def compare_baseline(
         current_metric_contract_identity=current_identities["metric_contract"],
         baseline_pricing_fingerprint=baseline.pricing_fingerprint,
         current_pricing_fingerprint=current.deepseek_pricing_fingerprint,
-        pricing_applicability_fingerprint=pricing_applicability_fingerprint,
+        pricing_applicability_fingerprint=pricing_applicability_fingerprint_value,
         baseline_trial_count=baseline.declared_trial_count,
         current_trial_count=current.summary.trial_count,
         baseline_total_trial_count=baseline.total_trial_count,

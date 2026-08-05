@@ -91,7 +91,7 @@ Memory text, Review evidence正文, user identity, or local absolute paths.
 
 ## Comparability
 
-`AuditRegressionReport` is `regression-v5` and reports structured reasons when
+`AuditRegressionReport` is `regression-v6` and reports structured reasons when
 comparison is not valid. Core correctness comparison requires the same Suite
 ID, semantic Suite digest, ordered Case set, Result Schema identity, metric
 contract, Worker Protocol, model identity, and configuration identity. Each
@@ -113,9 +113,11 @@ comparable. Money, cost, savings, and effective-cost metrics are marked
 `not_comparable` with a structured reason.
 Each `MetricComparison` carries the generated `requires_pricing_match` policy
 fact. The comparison engine and Report validator use that field; the validator
-does not infer pricing applicability from a metric-name prefix. Default cost
-policies set it to true, and an explicit custom policy can set it for any
-metric. A pricing mismatch remains local to metrics whose fact is true.
+derive it through one shared policy resolver. The resolver applies the fixed
+DeepSeek-cost convention in addition to an explicit `require_pricing_match`
+flag; it does not use the metric prefix for mode, direction, or thresholds. An
+explicit custom policy can require pricing identity for any metric. A pricing
+mismatch remains local to metrics whose effective fact is true.
 
 Metric evaluation is a one-way chain: raw baseline/current values and sample
 counts first derive `evaluation_status`; independent `comparability_fact_codes`
@@ -123,11 +125,24 @@ and applicable pricing facts then derive `comparability_status` and the exact
 finite `reason_codes`. Only after those facts are established are deltas and
 Metric decisions calculated. `reason_codes` are verification output, never
 input to fact derivation. `MetricComparison` and Case projections mark their
-comparability facts as report-only; the complete `AuditRegressionReport`
+comparability and policy facts as report-only; the complete `AuditRegressionReport`
 re-derives them from both sides' identities and rejects fabricated facts.
 `not_evaluated` means a required metric/sample fact is absent, while
 `not_comparable` means evaluated facts cannot be aligned; the latter never
 masks the former.
+
+The complete report contains an immutable `RegressionPolicySnapshot` with the
+policy schema version, default mode, sorted explicit metric entries, and a
+fingerprint over those safe fields. The Report validator resolves every
+Suite/Case metric through the same pure resolver used by comparison, then
+checks mode, direction, thresholds, and effective pricing applicability before
+deriving decisions, Case outcomes, counts, and status. The pricing
+applicability fingerprint is bound to the policy fingerprint and each
+Suite/Case metric identity. The snapshot contains no paths, prompts, model
+text, credentials, or environment values.
+Because the policy contract has no direction/threshold fields for an implicit
+default entry, a non-disabled `default_mode` is rejected; enabled behavior must
+be represented by an explicit, fully validated metric policy entry.
 
 ## RegressionPolicy
 
@@ -218,14 +233,15 @@ by the policy mode.
 
 The existing local trace mapper exposes a pure, content-free
 `project_regression_metadata()` projection containing IDs, status, counts,
-safe deltas, Case task-success facts, sample counts, and reason codes. P7 does not call
-it and does not publish a Baseline or Regression report to Langfuse. Prompt,
+safe deltas, Case task-success facts, sample counts, reason codes, and the
+content-free policy snapshot/fingerprint. P7 does not call it and does not
+publish a Baseline or Regression report to Langfuse. Prompt,
 output, Memory/Review正文, credentials, Base URLs, local paths, and identities
 outside the safe contract are excluded.
 
 ## Versioning and scope
 
-Baseline and Regression contracts are `baseline-v5` and `regression-v5`.
+Baseline and Regression contracts are `baseline-v5` and `regression-v6`.
 P7 adds the
 semantic Suite comparison digest to `AuditFingerprint`, so the Audit Result
 Schema is `1.6`; Worker Protocol remains v13. Existing Trial and evaluator

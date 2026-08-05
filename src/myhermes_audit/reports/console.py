@@ -407,6 +407,8 @@ def render_console_regression(report: AuditRegressionReport) -> str:
         f"{_integer_or_missing(report.current_declared_trials_per_case)}",
         f"Regression gate:     {'pass' if report.overall_regression_gate else 'fail'}",
         f"Comparability:       {'comparable' if report.status.value != 'not_comparable' else 'not comparable'}",
+        f"Policy schema:        {report.regression_policy.schema_version}",
+        f"Policy fingerprint:   {report.regression_policy_fingerprint}",
         "Counts:              "
         f"regression={report.regression_count} "
         f"improvement={report.improvement_count} "
@@ -434,6 +436,10 @@ def render_console_regression(report: AuditRegressionReport) -> str:
             f"samples={metric.baseline_sample_count}->{metric.current_sample_count} "
             f"evaluation={metric.evaluation_status.value} "
             f"comparability={metric.comparability_status.value} "
+            f"policy={metric.policy_mode.value}/{metric.direction.value} "
+            f"thresholds=(drop={metric.max_absolute_drop!r}, "
+            f"relative_increase={metric.max_relative_increase!r}, "
+            f"absolute_increase={metric.max_absolute_increase!r}) "
             f"requires_pricing_match={metric.requires_pricing_match} "
             f"decision={metric.decision.value} "
             f"reasons={','.join(metric.reason_codes) or '<none>'}"

@@ -124,6 +124,77 @@ class ReportDecisionResult:
 
 
 @dataclass(frozen=True)
+class MetricPolicyFacts:
+    """Effective policy facts resolved from one immutable policy snapshot."""
+
+    metric_name: str
+    mode: str
+    direction: str
+    max_absolute_drop: object = None
+    max_relative_increase: object = None
+    max_absolute_increase: object = None
+    requires_pricing_match: bool = False
+
+
+@dataclass(frozen=True)
+class PolicyEntryFacts:
+    metric_name: str
+    mode: str
+    direction: str
+    max_absolute_drop: object = None
+    max_relative_increase: object = None
+    max_absolute_increase: object = None
+    require_pricing_match: bool = False
+
+
+@dataclass(frozen=True)
+class PolicySnapshotFacts:
+    schema_version: str
+    default_mode: str
+    metrics: tuple[PolicyEntryFacts, ...]
+
+
+def resolve_metric_policy(
+    metric_name: str,
+    snapshot: PolicySnapshotFacts,
+) -> MetricPolicyFacts:
+    """Resolve one effective metric policy from a validated snapshot.
+
+    The DeepSeek cost prefix is a fixed metric-family convention for pricing
+    applicability only; all policy modes, directions, and thresholds still
+    come from the snapshot (or its disabled default).
+    """
+
+    entry = next(
+        (item for item in snapshot.metrics if item.metric_name == metric_name),
+        None,
+    )
+    if entry is None:
+        mode = snapshot.default_mode
+        direction = "neutral"
+        max_absolute_drop = None
+        max_relative_increase = None
+        max_absolute_increase = None
+        explicit_pricing = False
+    else:
+        mode = entry.mode
+        direction = entry.direction
+        max_absolute_drop = entry.max_absolute_drop
+        max_relative_increase = entry.max_relative_increase
+        max_absolute_increase = entry.max_absolute_increase
+        explicit_pricing = entry.require_pricing_match
+    return MetricPolicyFacts(
+        metric_name=metric_name,
+        mode=mode,
+        direction=direction,
+        max_absolute_drop=max_absolute_drop,
+        max_relative_increase=max_relative_increase,
+        max_absolute_increase=max_absolute_increase,
+        requires_pricing_match=explicit_pricing or metric_name.startswith("deepseek_cost_"),
+    )
+
+
+@dataclass(frozen=True)
 class MetricEvaluationInput:
     """Raw metric facts and independently projected contract fact codes."""
 
@@ -468,8 +539,11 @@ __all__ = (
     "EvaluationStatus",
     "MetricEvaluationFacts",
     "MetricEvaluationInput",
+    "MetricPolicyFacts",
     "MetricDecisionInput",
     "MetricDecisionResult",
+    "PolicyEntryFacts",
+    "PolicySnapshotFacts",
     "REASON_CODES",
     "ReportDecisionResult",
     "decide_case_regression",
@@ -477,4 +551,5 @@ __all__ = (
     "decide_report_status",
     "derive_comparability_reason_codes",
     "derive_metric_evaluation_facts",
+    "resolve_metric_policy",
 )

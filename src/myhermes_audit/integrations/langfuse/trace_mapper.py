@@ -1037,7 +1037,7 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
     """Return a content-free comparison projection for an existing mapper.
 
     This helper performs no network publication.  It is intentionally limited
-    to IDs, statuses, counts, deltas, and safe failure codes.
+    to IDs, statuses, counts, deltas, safe policy facts, and failure codes.
     """
 
     return {
@@ -1045,6 +1045,10 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
         "current_run_id": report.current_run_id,
         "comparability_status": report.status.value,
         "comparability_reasons": list(report.comparability_reasons),
+        "regression_policy_fingerprint": report.regression_policy_fingerprint,
+        "regression_policy": report.regression_policy.model_dump(mode="json"),
+        "policy_facts_verified": report.policy_facts_verified,
+        "comparability_facts_verified": report.comparability_facts_verified,
         "pricing_applicability_fingerprint": report.pricing_applicability_fingerprint,
         "baseline_trial_count": report.baseline_trial_count,
         "current_trial_count": report.current_trial_count,
@@ -1095,8 +1099,14 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
                 "evaluation_status": item.evaluation_status.value,
                 "comparability_status": item.comparability_status.value,
                 "requires_pricing_match": item.requires_pricing_match,
+                "policy_mode": item.policy_mode.value,
+                "direction": item.direction.value,
+                "max_absolute_drop": item.max_absolute_drop,
+                "max_relative_increase": item.max_relative_increase,
+                "max_absolute_increase": item.max_absolute_increase,
                 "comparability_fact_codes": list(item.comparability_fact_codes),
                 "comparability_facts_verified": item.comparability_facts_verified,
+                "policy_facts_verified": item.policy_facts_verified,
                 "decision": item.decision.value,
                 "reason": item.reason,
                 "reason_codes": list(item.reason_codes),

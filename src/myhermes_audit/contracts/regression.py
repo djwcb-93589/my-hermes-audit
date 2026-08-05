@@ -39,21 +39,25 @@ from myhermes_audit.regression_decision import (
     EvaluationStatus,
     MetricDecisionInput,
     MetricEvaluationInput,
+    MetricPolicyFacts,
+    PolicyEntryFacts,
+    PolicySnapshotFacts,
     decide_case_regression,
     decide_metric_comparison,
     decide_report_status,
     derive_comparability_reason_codes,
     derive_metric_evaluation_facts,
+    resolve_metric_policy,
 )
 
 
 BASELINE_SCHEMA_VERSION = "baseline-v5"
-REGRESSION_SCHEMA_VERSION = "regression-v5"
+REGRESSION_SCHEMA_VERSION = "regression-v6"
 REGRESSION_POLICY_SCHEMA_VERSION = "regression-policy-v1"
 METRIC_CONTRACT_VERSION = "p7-metrics-v1"
 
 BaselineSchemaVersion = Literal["baseline-v5"]
-RegressionSchemaVersion = Literal["regression-v5"]
+RegressionSchemaVersion = Literal["regression-v6"]
 RegressionPolicySchemaVersion = Literal["regression-policy-v1"]
 MetricNumber = StrictInt | StrictFloat | Decimal
 
@@ -171,6 +175,14 @@ class RegressionPolicy(ContractModel):
     metrics: dict[NonEmptyText, RegressionMetricPolicy] = Field(default_factory=dict)
     default_mode: PolicyMode = PolicyMode.DISABLED
 
+    @model_validator(mode="after")
+    def validate_default_policy(self) -> "RegressionPolicy":
+        # A default policy has no direction or threshold fields of its own;
+        # only the disabled default can therefore be a complete policy fact.
+        if self.default_mode is not PolicyMode.DISABLED:
+            raise ValueError("non-disabled default_mode requires an explicit metric policy")
+        return self
+
     @classmethod
     def conservative_default(cls) -> "RegressionPolicy":
         """Return the documented conservative policy without hidden thresholds."""
@@ -260,6 +272,109 @@ class RegressionPolicy(ContractModel):
         ):
             metrics[name] = warning_lower()
         return cls(metrics=metrics)
+
+
+class RegressionPolicySnapshotEntry(ContractModel):
+    """One canonical, content-safe entry in a Report policy snapshot."""
+
+    metric_name: Identifier
+    mode: PolicyMode
+    direction: MetricDirection
+    max_absolute_drop: StrictFloat | None = Field(default=None, ge=0)
+    max_relative_increase: StrictFloat | None = Field(default=None, ge=0)
+    max_absolute_increase: StrictFloat | None = Field(default=None, ge=0)
+    require_pricing_match: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_entry_policy(self) -> "RegressionPolicySnapshotEntry":
+        RegressionMetricPolicy(
+            mode=self.mode,
+            direction=self.direction,
+            max_absolute_drop=self.max_absolute_drop,
+            max_relative_increase=self.max_relative_increase,
+            max_absolute_increase=self.max_absolute_increase,
+            require_pricing_match=self.require_pricing_match,
+        )
+        return self
+
+
+class RegressionPolicySnapshot(ContractModel):
+    """Immutable policy facts used by one complete Regression Report."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: RegressionPolicySchemaVersion = REGRESSION_POLICY_SCHEMA_VERSION
+    default_mode: PolicyMode
+    metrics: list[RegressionPolicySnapshotEntry]
+    policy_fingerprint: Sha256Digest
+
+    @staticmethod
+    def _fingerprint_payload(
+        schema_version: str,
+        default_mode: PolicyMode,
+        metrics: Sequence[RegressionPolicySnapshotEntry],
+    ) -> dict[str, object]:
+        return {
+            "schema_version": schema_version,
+            "default_mode": default_mode.value,
+            "metrics": [item.model_dump(mode="json") for item in metrics],
+        }
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> "RegressionPolicySnapshot":
+        if self.default_mode is not PolicyMode.DISABLED:
+            raise ValueError("non-disabled default_mode has no complete default policy facts")
+        names = [item.metric_name for item in self.metrics]
+        if len(names) != len(set(names)):
+            raise ValueError("policy snapshot metric names must be unique")
+        if names != sorted(names):
+            raise ValueError("policy snapshot metric names must be sorted")
+        expected = canonical_sha256(
+            self._fingerprint_payload(self.schema_version, self.default_mode, self.metrics)
+        )
+        if self.policy_fingerprint != expected:
+            raise ValueError("policy snapshot fingerprint is inconsistent")
+        return self
+
+    @classmethod
+    def from_policy(cls, policy: RegressionPolicy) -> "RegressionPolicySnapshot":
+        metrics = [
+            RegressionPolicySnapshotEntry(
+                metric_name=name,
+                mode=item.mode,
+                direction=item.direction,
+                max_absolute_drop=item.max_absolute_drop,
+                max_relative_increase=item.max_relative_increase,
+                max_absolute_increase=item.max_absolute_increase,
+                require_pricing_match=item.require_pricing_match,
+            )
+            for name, item in sorted(policy.metrics.items())
+        ]
+        payload = cls._fingerprint_payload(policy.schema_version, policy.default_mode, metrics)
+        return cls(
+            schema_version=policy.schema_version,
+            default_mode=policy.default_mode,
+            metrics=metrics,
+            policy_fingerprint=canonical_sha256(payload),
+        )
+
+    def to_facts(self) -> PolicySnapshotFacts:
+        return PolicySnapshotFacts(
+            schema_version=self.schema_version,
+            default_mode=self.default_mode.value,
+            metrics=tuple(
+                PolicyEntryFacts(
+                    metric_name=item.metric_name,
+                    mode=item.mode.value,
+                    direction=item.direction.value,
+                    max_absolute_drop=item.max_absolute_drop,
+                    max_relative_increase=item.max_relative_increase,
+                    max_absolute_increase=item.max_absolute_increase,
+                    require_pricing_match=item.require_pricing_match,
+                )
+                for item in self.metrics
+            ),
+        )
 
 
 class MetricSnapshot(ContractModel):
@@ -475,6 +590,7 @@ class MetricComparison(ContractModel):
     comparability_fact_codes: list[NonEmptyText] = Field(...)
     requires_pricing_match: StrictBool
     comparability_facts_verified: Literal[False]
+    policy_facts_verified: Literal[False]
     evaluation_status: EvaluationStatus
     comparability_status: ComparabilityStatus
     reason_codes: list[NonEmptyText] = Field(...)
@@ -574,7 +690,10 @@ class MetricComparison(ContractModel):
         return self
 
 
-def derive_metric_decision(item: MetricComparison):
+def derive_metric_decision(
+    item: MetricComparison,
+    policy_facts: MetricPolicyFacts | None = None,
+):
     facts = derive_metric_evaluation_facts(
         MetricEvaluationInput(
             metric_name=item.metric_name,
@@ -587,15 +706,24 @@ def derive_metric_decision(item: MetricComparison):
             comparability_fact_codes=tuple(item.comparability_fact_codes),
         )
     )
+    effective_policy = policy_facts or MetricPolicyFacts(
+        metric_name=item.metric_name,
+        mode=item.policy_mode.value,
+        direction=item.direction.value,
+        max_absolute_drop=item.max_absolute_drop,
+        max_relative_increase=item.max_relative_increase,
+        max_absolute_increase=item.max_absolute_increase,
+        requires_pricing_match=item.requires_pricing_match,
+    )
     return decide_metric_comparison(
         MetricDecisionInput(
             baseline_value=item.baseline_value,
             current_value=item.current_value,
-            direction=item.direction.value,
-            policy_mode=item.policy_mode.value,
-            max_absolute_drop=item.max_absolute_drop,
-            max_relative_increase=item.max_relative_increase,
-            max_absolute_increase=item.max_absolute_increase,
+            direction=effective_policy.direction,
+            policy_mode=effective_policy.mode,
+            max_absolute_drop=effective_policy.max_absolute_drop,
+            max_relative_increase=effective_policy.max_relative_increase,
+            max_absolute_increase=effective_policy.max_absolute_increase,
             evaluation_status=facts.evaluation_status.value,
             comparability_status=facts.comparability_status.value,
             reason_codes=facts.reason_codes,
@@ -603,10 +731,19 @@ def derive_metric_decision(item: MetricComparison):
     ).decision
 
 
-def metric_decision_counts(metrics: Sequence[MetricComparison]) -> dict[str, int]:
+def metric_decision_counts(
+    metrics: Sequence[MetricComparison],
+    policy_facts: PolicySnapshotFacts | None = None,
+) -> dict[str, int]:
     """Count freshly derived decisions, never the serialized decision field."""
 
-    decisions = [derive_metric_decision(item) for item in metrics]
+    decisions = [
+        derive_metric_decision(
+            item,
+            None if policy_facts is None else resolve_metric_policy(item.metric_name, policy_facts),
+        )
+        for item in metrics
+    ]
 
     return {
         "regression_count": sum(decision == MetricDecision.REGRESSED.value for decision in decisions),
@@ -644,6 +781,7 @@ class CaseRegressionSummary(ContractModel):
     baseline_background_review_decision_sample_count: NonNegativeInt
     background_review_decision_sample_count: NonNegativeInt
     comparability_facts_verified: Literal[False]
+    policy_facts_verified: Literal[False]
     decision_reason: NonEmptyText | None = None
     decision: MetricDecision
 
@@ -687,12 +825,50 @@ class CaseRegressionSummary(ContractModel):
         return self
 
 
+def pricing_applicability_fingerprint(
+    policy_fingerprint: str,
+    suite_metrics: Sequence[MetricComparison],
+    case_summaries: Sequence[CaseRegressionSummary],
+) -> Sha256Digest:
+    """Fingerprint effective pricing facts with policy and scope identity."""
+
+    metrics: list[dict[str, object]] = [
+        {
+            "scope": "suite",
+            "case_id": None,
+            "metric_name": item.metric_name,
+            "requires_pricing_match": item.requires_pricing_match,
+        }
+        for item in suite_metrics
+    ]
+    metrics.extend(
+        {
+            "scope": "case",
+            "case_id": case.case_id,
+            "metric_name": item.metric_name,
+            "requires_pricing_match": item.requires_pricing_match,
+        }
+        for case in case_summaries
+        for item in case.metrics
+    )
+    return canonical_sha256(
+        {
+            "policy_fingerprint": policy_fingerprint,
+            "metrics": metrics,
+        }
+    )
+
+
 class AuditRegressionReport(ContractModel):
     """Strict comparison facts; deliberately contains no weighted score."""
 
     model_config = ConfigDict(frozen=True)
 
     schema_version: RegressionSchemaVersion = REGRESSION_SCHEMA_VERSION
+    regression_policy: RegressionPolicySnapshot
+    regression_policy_fingerprint: Sha256Digest
+    policy_facts_verified: Literal[True]
+    comparability_facts_verified: Literal[True]
     baseline_id: Identifier
     current_run_id: Identifier
     status: RegressionStatus
@@ -811,22 +987,17 @@ class AuditRegressionReport(ContractModel):
                 raise ValueError("suite task success delta requires both rates")
         elif self.suite_task_success_rate_delta is None or not math.isclose(self.suite_task_success_rate_delta, expected_suite_delta, rel_tol=1e-9, abs_tol=1e-12):
             raise ValueError("suite task success delta is inconsistent")
+        if self.regression_policy_fingerprint != self.regression_policy.policy_fingerprint:
+            raise ValueError("Report policy fingerprint does not match its snapshot")
         all_metrics = [*self.suite_metrics, *(metric for case in self.case_summaries for metric in case.metrics)]
-        expected_pricing_applicability = canonical_sha256(
-            [
-                {
-                    "metric_name": item.metric_name,
-                    "requires_pricing_match": item.requires_pricing_match,
-                }
-                for item in all_metrics
-            ]
+        policy_facts = self.regression_policy.to_facts()
+        expected_pricing_applicability = pricing_applicability_fingerprint(
+            self.regression_policy_fingerprint,
+            self.suite_metrics,
+            self.case_summaries,
         )
         if self.pricing_applicability_fingerprint != expected_pricing_applicability:
             raise ValueError("pricing applicability facts are inconsistent")
-        expected_counts = metric_decision_counts(all_metrics)
-        for name, expected in expected_counts.items():
-            if getattr(self, name) != expected:
-                raise ValueError(f"{name} does not match MetricComparison decisions")
         expected_reasons = list(
             derive_comparability_reason_codes(
                 baseline_suite_id=self.baseline_suite_id,
@@ -857,25 +1028,11 @@ class AuditRegressionReport(ContractModel):
                 current_pricing_fingerprint=self.current_pricing_fingerprint,
             )
         )
-        comparable_metric_count = sum(
-            derive_metric_decision(item).value
-            in {
-                MetricDecision.IMPROVED.value,
-                MetricDecision.UNCHANGED.value,
-                MetricDecision.REGRESSED.value,
-                MetricDecision.WARNING.value,
-            }
-            for item in all_metrics
-        )
-        if comparable_metric_count == 0:
-            expected_reasons.append("no_comparable_core_metrics")
-        expected_reasons = sorted(set(expected_reasons))
-        saved_reasons = list(self.comparability_reasons)
-        if len(saved_reasons) != len(set(saved_reasons)):
-            raise ValueError("comparability reasons must be unique")
-        if sorted(saved_reasons) != expected_reasons:
-            raise ValueError("comparability reasons do not match derived facts")
-        core_reasons = [reason for reason in expected_reasons if reason not in {"pricing_fingerprint_mismatch", "pricing_fingerprint_missing"}]
+        core_reasons = [
+            reason
+            for reason in expected_reasons
+            if reason not in {"pricing_fingerprint_mismatch", "pricing_fingerprint_missing"}
+        ]
         pricing_reason = next(
             (
                 reason
@@ -885,6 +1042,22 @@ class AuditRegressionReport(ContractModel):
             None,
         )
         for item in all_metrics:
+            expected_policy = resolve_metric_policy(
+                item.metric_name,
+                policy_facts,
+            )
+            if item.policy_mode.value != expected_policy.mode:
+                raise ValueError("Metric policy mode does not match Report policy snapshot")
+            if item.direction.value != expected_policy.direction:
+                raise ValueError("Metric policy direction does not match Report policy snapshot")
+            if item.max_absolute_drop != expected_policy.max_absolute_drop:
+                raise ValueError("Metric absolute threshold does not match Report policy snapshot")
+            if item.max_relative_increase != expected_policy.max_relative_increase:
+                raise ValueError("Metric relative threshold does not match Report policy snapshot")
+            if item.max_absolute_increase != expected_policy.max_absolute_increase:
+                raise ValueError("Metric increase threshold does not match Report policy snapshot")
+            if item.requires_pricing_match != expected_policy.requires_pricing_match:
+                raise ValueError("Metric pricing applicability does not match Report policy snapshot")
             applicable_fact_codes = [
                 reason
                 for reason in core_reasons
@@ -913,9 +1086,40 @@ class AuditRegressionReport(ContractModel):
                 raise ValueError("Metric comparability facts do not match report facts")
             if item.reason_codes != list(expected_facts.reason_codes):
                 raise ValueError("Metric reason codes do not match report facts")
+        expected_counts = metric_decision_counts(all_metrics, policy_facts)
+        for name, expected in expected_counts.items():
+            if getattr(self, name) != expected:
+                raise ValueError(f"{name} does not match MetricComparison decisions")
+        comparable_metric_count = sum(
+            derive_metric_decision(
+                item,
+                resolve_metric_policy(item.metric_name, policy_facts),
+            ).value
+            in {
+                MetricDecision.IMPROVED.value,
+                MetricDecision.UNCHANGED.value,
+                MetricDecision.REGRESSED.value,
+                MetricDecision.WARNING.value,
+            }
+            for item in all_metrics
+        )
+        if comparable_metric_count == 0:
+            expected_reasons.append("no_comparable_core_metrics")
+        expected_reasons = sorted(set(expected_reasons))
+        saved_reasons = list(self.comparability_reasons)
+        if len(saved_reasons) != len(set(saved_reasons)):
+            raise ValueError("comparability reasons must be unique")
+        if sorted(saved_reasons) != expected_reasons:
+            raise ValueError("comparability reasons do not match derived facts")
         for case in self.case_summaries:
             expected_case = decide_case_regression(
-                [derive_metric_decision(item).value for item in case.metrics]
+                [
+                    derive_metric_decision(
+                        item,
+                        resolve_metric_policy(item.metric_name, policy_facts),
+                    ).value
+                    for item in case.metrics
+                ]
             )
             if case.decision.value != expected_case.decision.value:
                 raise ValueError("Case decision does not match report-derived facts")
@@ -960,9 +1164,12 @@ __all__ = (
     "MetricDecision",
     "MetricDirection",
     "MetricSnapshot",
+    "pricing_applicability_fingerprint",
     "PolicyMode",
     "RegressionMetricPolicy",
     "RegressionPolicy",
+    "RegressionPolicySnapshot",
+    "RegressionPolicySnapshotEntry",
     "REGRESSION_POLICY_SCHEMA_VERSION",
     "REGRESSION_SCHEMA_VERSION",
     "RegressionSchemaVersion",
