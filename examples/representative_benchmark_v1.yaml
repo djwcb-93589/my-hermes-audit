@@ -1,0 +1,554 @@
+schema_version: "1.0"
+suite_id: representative-benchmark-v1
+name: MyHermes representative Agent benchmark
+description: >-
+  A compact, deterministic synthetic benchmark composed of representative
+  Toolchain, Memory Retrieval, and Background Review Cases. It reuses the
+  existing public contracts and evaluators without adding a cross-Suite
+  composition mechanism.
+tags:
+  - representative
+  - benchmark
+  - p6.4
+  - synthetic
+defaults:
+  trials: 1
+  timeout_seconds: 180
+  preserve_sandbox: false
+  metadata:
+    data_classification: synthetic
+cases:
+  - case_id: toolchain-text-export
+    name: Read a fixture and publish a text Artifact
+    description: Use the file Tool for both the fixture read and Artifact write.
+    metadata:
+      benchmark_family: toolchain
+      source_suite: e2e-toolchain-v1
+      source_case_id: toolchain-text-export
+    mode: single_turn
+    input:
+      message: >-
+        Read fixtures/toolchain-text-source.txt with the public file
+        tool. Summarize the verified synthetic result in one short line and
+        write that line to exports/toolchain-text-output.txt using
+        the same public file tool. Report the final result only after the write
+        succeeds.
+    execution:
+      enabled_toolsets: [file]
+    fixture:
+      files:
+        - path: workspace/fixtures/toolchain-text-source.txt
+          content: "Verified synthetic Toolchain input: the export channel is green."
+    expected:
+      files:
+        - path: workspace/exports/toolchain-text-output.txt
+          exists: true
+          content_contains: [green]
+      texts:
+        - target: final_output
+          contains: green
+          case_sensitive: false
+      tool_trajectories:
+        - required_tools: [file]
+          required_successful_tools: [file]
+          minimum_tool_calls: 2
+    scenarios:
+      - scenario_id: toolchain-text
+        kind: toolchain
+        timeout_seconds: 120
+        required: true
+        required_toolsets: [file]
+        required_tool_calls:
+          - tool_name: file
+        forbidden_tool_calls: []
+        input_artifacts: [workspace/fixtures/toolchain-text-source.txt]
+        output_artifacts: [workspace/exports/toolchain-text-output.txt]
+        trace_requirements:
+          - tool_name: file
+            minimum_calls: 2
+            minimum_successful_calls: 2
+            required: true
+        checkpoints:
+          - kind: output
+            checkpoint_id: text-output-written
+            target_artifact_id: workspace/exports/toolchain-text-output.txt
+            required_markers: [green]
+            forbidden_markers: [forbidden synthetic marker]
+            minimum_content_char_length: 1
+            required: true
+    evaluators:
+      - evaluator_id: toolchain-text-deterministic
+        kind: deterministic
+        required: true
+        config: {expectation_group: all}
+      - evaluator_id: toolchain-text-trajectory
+        kind: tool_trajectory
+        required: true
+      - evaluator_id: toolchain-text-scenario
+        kind: scenario
+        required: true
+
+  - case_id: toolchain-json-export
+    name: Transform a JSON fixture into a JSON Artifact
+    description: Read JSON with the file Tool and publish a strict JSON object.
+    metadata:
+      benchmark_family: toolchain
+      source_suite: e2e-toolchain-v1
+      source_case_id: toolchain-json-export
+    mode: single_turn
+    input:
+      message: >-
+        Read fixtures/toolchain-json-source.json with the public file
+        tool. Create exports/toolchain-json-output.json containing a
+        JSON object with the same project and state values, using the public
+        file tool to write it. Confirm completion only after the Artifact is
+        written.
+    execution:
+      enabled_toolsets: [file]
+    fixture:
+      files:
+        - path: workspace/fixtures/toolchain-json-source.json
+          content: '{"project":"synthetic-p6","state":"ready","count":2}'
+    expected:
+      files:
+        - path: workspace/exports/toolchain-json-output.json
+          exists: true
+          content_contains: [synthetic-p6, ready]
+      json_values:
+        - target: workspace/exports/toolchain-json-output.json
+          match: subset
+          root_type: object
+          values:
+            - path: project
+              expected: synthetic-p6
+            - path: state
+              expected: ready
+      texts:
+        - target: final_output
+          contains: ready
+          case_sensitive: false
+      tool_trajectories:
+        - required_tools: [file]
+          required_successful_tools: [file]
+          minimum_tool_calls: 2
+    scenarios:
+      - scenario_id: toolchain-json
+        kind: toolchain
+        timeout_seconds: 120
+        required: true
+        required_toolsets: [file]
+        required_tool_calls:
+          - tool_name: file
+        forbidden_tool_calls: []
+        input_artifacts: [workspace/fixtures/toolchain-json-source.json]
+        output_artifacts: [workspace/exports/toolchain-json-output.json]
+        trace_requirements:
+          - tool_name: file
+            minimum_calls: 2
+            minimum_successful_calls: 2
+            required: true
+        checkpoints:
+          - kind: output
+            checkpoint_id: json-output-written
+            target_artifact_id: workspace/exports/toolchain-json-output.json
+            required_markers: [ready]
+            forbidden_markers: []
+            minimum_content_char_length: 1
+            required: true
+    evaluators:
+      - evaluator_id: toolchain-json-deterministic
+        kind: deterministic
+        required: true
+        config: {expectation_group: all}
+      - evaluator_id: toolchain-json-trajectory
+        kind: tool_trajectory
+        required: true
+      - evaluator_id: toolchain-json-scenario
+        kind: scenario
+        required: true
+
+  - case_id: memory-explicit-fact
+    name: Recall an explicit synthetic fact
+    metadata:
+      benchmark_family: memory_retrieval
+      source_suite: memory-retrieval-v1
+      source_case_id: memory-explicit-fact
+    mode: single_turn
+    input:
+      message: What is the synthetic launch code?
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: fact-launch-code
+            kind: long_term
+            content: The synthetic launch code is ORION-731.
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: ORION-731
+          case_sensitive: true
+      memories:
+        - query_id: explicit-fact-before
+          query:
+            query: synthetic launch code
+            top_k: 5
+          required_memory_ids: [fact-launch-code]
+          required_kinds: [long_term]
+          minimum_matches: 1
+    evaluators:
+      - evaluator_id: explicit-fact-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: explicit-fact-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-temporal-order
+    name: Preserve native temporal declaration order
+    metadata:
+      benchmark_family: memory_retrieval
+      source_suite: memory-retrieval-v1
+      source_case_id: memory-temporal-order
+    mode: single_turn
+    input:
+      message: What is the current synthetic deployment region?
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: region-old
+            kind: long_term
+            content: "Older synthetic record: deployment region was WEST-1."
+            source: audit-fixture
+          - memory_id: region-current
+            kind: long_term
+            content: "Newer synthetic record: deployment region is EAST-9."
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: EAST-9
+          case_sensitive: true
+      memories:
+        - query_id: temporal-before
+          query:
+            query: current deployment region
+            top_k: 5
+          required_memory_ids: [region-old, region-current]
+          required_kinds: [long_term]
+          minimum_matches: 2
+    evaluators:
+      - evaluator_id: temporal-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: temporal-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-irrelevant-distractors
+    name: Retain evidence among irrelevant synthetic entries
+    metadata:
+      benchmark_family: memory_retrieval
+      source_suite: memory-retrieval-v1
+      source_case_id: memory-irrelevant-distractors
+    mode: single_turn
+    input:
+      message: State the synthetic archive key.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      memory:
+        items:
+          - memory_id: distractor-fruit
+            kind: long_term
+            content: Synthetic cafeteria fruit is pear.
+            source: audit-fixture
+          - memory_id: archive-key
+            kind: long_term
+            content: The synthetic archive key is ATLAS-44.
+            source: audit-fixture
+          - memory_id: distractor-weather
+            kind: long_term
+            content: Synthetic weather marker is cloudy.
+            source: audit-fixture
+    expected:
+      texts:
+        - target: final_output
+          contains: ATLAS-44
+          case_sensitive: true
+      memories:
+        - query_id: distractor-before
+          query:
+            query: archive key
+            top_k: 3
+          required_memory_ids: [archive-key]
+          required_kinds: [long_term]
+          minimum_matches: 1
+    evaluators:
+      - evaluator_id: distractor-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: distractor-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-cross-session
+    name: Share persistent Memory across isolated logical Sessions
+    metadata:
+      benchmark_family: memory_retrieval
+      source_suite: memory-retrieval-v1
+      source_case_id: memory-cross-session
+    mode: scripted_multi_turn
+    input:
+      turns:
+        - role: user
+          session_id: session-a
+          message: Remember with the memory tool that the synthetic project code is ORION-X.
+        - role: user
+          session_id: session-b
+          message: What is the synthetic project code?
+    execution:
+      enabled_toolsets: [memory]
+      memory_strategy: subject_native
+    expected:
+      texts:
+        - target: final_output
+          contains: ORION-X
+          case_sensitive: true
+      tool_trajectories:
+        - required_tools: [memory]
+          required_successful_tools: [memory]
+          minimum_tool_calls: 1
+      memories:
+        - query_id: cross-session-after
+          phase: after_conversation
+          query:
+            query: synthetic project code
+            top_k: 5
+          required_kinds: [long_term]
+          minimum_matches: 0
+      memory_states:
+        - state_id: cross-session-write
+          required_added_content:
+            - content: ORION-X
+              match: contains
+              kind: long_term
+          allow_other_changes: false
+    evaluators:
+      - evaluator_id: cross-session-answer
+        kind: deterministic
+        required: true
+        config: {expectation_group: texts}
+      - evaluator_id: cross-session-tool
+        kind: tool_trajectory
+        required: true
+      - evaluator_id: cross-session-memory
+        kind: retrieval
+        required: true
+
+  - case_id: memory-review-insufficient-evidence
+    name: Keep one-off unverified Memory evidence as a no-op
+    description: A single foreground report cannot establish a durable preference.
+    metadata:
+      benchmark_family: background_review
+      source_suite: background-review-v1
+      source_case_id: memory-review-insufficient-evidence
+    mode: single_turn
+    input:
+      session_id: p5-memory-noop
+      message: >-
+        This is a one-off synthetic formatting request. Do not record any
+        durable preference, even if a later assistant report describes one.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      files: []
+      memory:
+        items:
+          - memory_id: p5-existing-memory
+            kind: user_profile
+            content: The synthetic user prefers weekly status summaries.
+            source: audit-fixture
+      background_review_plans:
+        - review_id: p5-memory-noop-review
+          kind: memory
+          foreground_session_id: p5-memory-noop
+          trigger_after_turn: 1
+          timeout_seconds: 90
+          lifecycle: normal
+          repeat_count: 1
+    expected:
+      background_reviews:
+        - review_id: p5-memory-noop-review
+          expected_action: no_op
+          must_change: []
+          must_not_change:
+            - target_type: memory
+              target_id: p5-existing-memory
+          required_evidence_kinds:
+            - user_message
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: true
+          protected_targets:
+            - target_type: memory
+              target_id: p5-existing-memory
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: p5-memory-noop-gate
+        kind: background_review
+        required: true
+
+  - case_id: skill-review-verified-update
+    name: Update one curated Skill from a verified failure-switch-success chain
+    description: >-
+      A recurring export goal, a failed preferred method, and a verified
+      reusable fallback establish a live Skill update; the assistant report
+      remains unverified evidence.
+    metadata:
+      benchmark_family: background_review
+      source_suite: background-review-v1
+      source_case_id: skill-review-verified-update
+    mode: single_turn
+    input:
+      session_id: p5-skill-update
+      message: >-
+        For this stable, reusable synthetic export process, first use the public
+        skill_view tool to read the existing curated Skill p5-curated-export.
+        Use that existing Skill as the method for this export. Then use the
+        file tool to attempt the preferred path
+        fixtures/p5-missing-export-source.txt. When that preferred read fails,
+        switch to the real fallback file fixtures/p5-export-source.txt and
+        complete the export using the fallback result. Base the completion
+        report only on actual tool results. The user explicitly wants the
+        verified fallback method used for the same export in the future.
+    execution:
+      enabled_toolsets: [file, skill_read]
+    fixture:
+      files:
+        - path: workspace/fixtures/p5-export-source.txt
+          content: >-
+            Verified reusable fallback export method: use the synthetic fallback
+            exporter for recurring exports. The fallback export completed
+            successfully and its checksum matched the expected value.
+      skills:
+        - skill_id: p5-curated-export
+          name: p5-curated-export
+          content: >-
+            For recurring synthetic exports, use only the preferred primary
+            method at fixtures/p5-missing-export-source.txt.
+          source: local
+          managed_by: curator
+          pinned: false
+          metadata: {}
+      background_review_plans:
+        - review_id: p5-skill-update-review
+          kind: skill
+          foreground_session_id: p5-skill-update
+          trigger_after_turn: 1
+          timeout_seconds: 90
+          lifecycle: normal
+          repeat_count: 1
+    expected:
+      tool_trajectories:
+        - required_tools:
+            - skill_view
+          required_successful_tools:
+            - skill_view
+          minimum_tool_calls: 1
+      background_reviews:
+        - review_id: p5-skill-update-review
+          # A Skill body transition is a live-state replacement, although the
+          # business operation is an update to the curated method.
+          expected_action: replace
+          expected_target:
+            target_type: skill
+            target_id: p5-curated-export
+          must_change:
+            - target_type: skill
+              target_id: p5-curated-export
+          must_not_change: []
+          required_evidence_kinds:
+            - user_message
+            - tool_error
+            - assistant_decision_unverified
+            - tool_observation
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: false
+          protected_targets: []
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: p5-skill-view-trace-gate
+        kind: tool_trajectory
+        required: true
+      - evaluator_id: p5-skill-update-gate
+        kind: background_review
+        required: true
+
+  - case_id: memory-review-conflicting-evidence
+    name: Do not write Memory when user correction conflicts with an assistant report
+    description: >-
+      A verified foreground correction outranks an unverified assistant report;
+      the Review must preserve the protected synthetic Memory state.
+    metadata:
+      benchmark_family: background_review
+      source_suite: background-review-v1
+      source_case_id: memory-review-conflicting-evidence
+    mode: single_turn
+    input:
+      session_id: p5-memory-conflict
+      message: >-
+        The earlier assistant statement about a permanent synthetic preference
+        was wrong. Treat it as one-off and do not save it as Memory.
+    execution:
+      enabled_toolsets: []
+      memory_strategy: subject_native
+    fixture:
+      files: []
+      memory:
+        items:
+          - memory_id: p5-conflict-protected-memory
+            kind: long_term
+            content: The approved synthetic support channel is green.
+            source: audit-fixture
+      background_review_plans:
+        - review_id: p5-memory-conflict-review
+          kind: memory
+          foreground_session_id: p5-memory-conflict
+          trigger_after_turn: 1
+          timeout_seconds: 90
+          lifecycle: normal
+          repeat_count: 1
+    expected:
+      background_reviews:
+        - review_id: p5-memory-conflict-review
+          expected_action: no_op
+          must_change: []
+          must_not_change:
+            - target_type: memory
+              target_id: p5-conflict-protected-memory
+          required_evidence_kinds:
+            - user_message
+            - assistant_report_unverified
+          forbidden_evidence_kinds: []
+          must_be_no_op: true
+          protected_targets:
+            - target_type: memory
+              target_id: p5-conflict-protected-memory
+          expected_stale_rejection: false
+    evaluators:
+      - evaluator_id: p5-memory-conflict-gate
+        kind: background_review
+        required: true

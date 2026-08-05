@@ -1,5 +1,29 @@
 # my-hermes-audit
 
+## P6.4 Representative Agent Benchmark
+
+The representative benchmark is the compact, synthetic entry point at
+[`examples/representative_benchmark_v1.yaml`](examples/representative_benchmark_v1.yaml).
+It contains exactly nine Cases copied from the established Toolchain, Memory
+Retrieval, and Background Review Suites: two Toolchain, four Memory Retrieval,
+and three Background Review Cases. Their original inputs, fixtures, expected
+facts, Scenarios, evidence windows, and required Evaluators remain unchanged;
+the new Case metadata records each source Suite and Case ID.
+
+It reuses the existing task-success, tool-trajectory, Memory evidence/
+Recall@K/MRR, Background Review decision, runtime, cache, and P6.3 cost
+projections. There is no composite score, required Judge, benchmark-specific
+Langfuse path, Case include mechanism, repeated-Trial mode, Baseline, or CI
+threshold. The default is one synthetic Trial, 180 seconds, no Sandbox
+preservation, and no DeepSeek pricing, so cache observations remain available
+while cost status is legitimately `not_evaluated`. Local pricing can be added
+in a copied Suite through the existing `defaults.deepseek_pricing` contract.
+
+See [`docs/p6-representative-benchmark.md`](docs/p6-representative-benchmark.md)
+for Case provenance, metric denominators, exclusions, and the documented local
+run command. P6.4 does not alter the source Suites, Result Schema, Worker
+Protocol v13, or evaluator formulas.
+
 ## P6.1 E2E scenarios
 
 The first P6 stage provides strict synthetic Toolchain and Process/Background
