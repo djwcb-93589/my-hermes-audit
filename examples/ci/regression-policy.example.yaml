@@ -1,0 +1,81 @@
+schema_version: regression-policy-v1
+default_mode: disabled
+metrics:
+  task_success_rate:
+    mode: failure
+    direction: higher_is_better
+    max_absolute_drop: 0.05
+  tool_correctness_rate:
+    mode: failure
+    direction: higher_is_better
+    max_absolute_drop: 0.05
+  memory_required_evidence_hit_rate:
+    mode: failure
+    direction: higher_is_better
+    max_absolute_drop: 0.05
+  memory_recall_at_k_mean:
+    mode: warning
+    direction: higher_is_better
+    max_absolute_drop: 0.05
+  memory_mrr_mean:
+    mode: warning
+    direction: higher_is_better
+    max_absolute_drop: 0.05
+  background_review_decision_accuracy:
+    mode: failure
+    direction: higher_is_better
+    max_absolute_drop: 0.05
+  failure_rate:
+    mode: failure
+    direction: lower_is_better
+    max_absolute_increase: 0.02
+  timeout_rate:
+    mode: failure
+    direction: lower_is_better
+    max_absolute_increase: 0.02
+  environment_error_rate:
+    mode: failure
+    direction: lower_is_better
+    max_absolute_increase: 0.02
+  cancelled_rate:
+    mode: failure
+    direction: lower_is_better
+    max_absolute_increase: 0.02
+  agent_iterations_mean:
+    mode: warning
+    direction: lower_is_better
+    max_relative_increase: 0.20
+  duration_mean_ms:
+    mode: warning
+    direction: lower_is_better
+    max_relative_increase: 0.20
+  prompt_tokens_mean_per_trial:
+    mode: warning
+    direction: lower_is_better
+    max_relative_increase: 0.20
+  completion_tokens_mean_per_trial:
+    mode: warning
+    direction: lower_is_better
+    max_relative_increase: 0.20
+  total_tokens_mean_per_trial:
+    mode: warning
+    direction: lower_is_better
+    max_relative_increase: 0.20
+  tool_call_count_mean:
+    mode: warning
+    direction: lower_is_better
+    max_relative_increase: 0.20
+  deepseek_cache_hit_rate:
+    mode: warning
+    direction: higher_is_better
+    max_absolute_drop: 0.05
+  deepseek_cost_effective_cost_per_success_usd:
+    mode: warning
+    direction: lower_is_better
+    max_relative_increase: 0.20
+    require_pricing_match: true
+  deepseek_cost_cache_savings_usd:
+    mode: warning
+    direction: higher_is_better
+    max_absolute_drop: 0.05
+    require_pricing_match: true

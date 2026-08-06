@@ -1,12 +1,8 @@
-"""Human-readable P1 console summary without unsupported placeholder scores."""
+"""Human-readable, fact-only console summaries without composite scores."""
 
 from __future__ import annotations
 
-from myhermes_audit.contracts import (
-    AuditRunResult,
-    MetricStatus,
-    TrialStatus,
-)
+from myhermes_audit.contracts import AuditRunResult
 from myhermes_audit.contracts.regression import (
     AuditRegressionReport,
     BASELINE_SCHEMA_VERSION,
@@ -15,162 +11,109 @@ from myhermes_audit.regression_decision import derive_metric_role, resolve_metri
 
 
 def render_console_summary(result: AuditRunResult) -> str:
+    """Render stored run facts in the P8 operational reading order.
+
+    This function intentionally does not re-aggregate Trials, infer process
+    facts, or calculate a headline score.  Detailed event evidence remains in
+    the strict JSON artifact and optional Markdown renderer.
+    """
+
     summary = result.summary
+    publication = result.langfuse_publish_result
+    judge = result.judge_summary
     lines = [
         f"MyHermes Audit: {result.suite_id}",
         "",
-        f"Subject commit:    {result.subject_fingerprint.git_commit}",
-        "Suite semantics:   "
+        "Run identity:",
+        f"- Run ID: {result.run_id}",
+        f"- Subject commit: {result.subject_fingerprint.git_commit}",
+        "- Suite semantics: "
         + (
             result.audit_fingerprint.suite_comparison_sha256
             or result.audit_fingerprint.suite_sha256
         ),
-        f"Run config:        {result.run_configuration_fingerprint}",
-        "Trial configs:     " + _trial_configuration_fingerprints(result),
-        "Local execution:   "
+        f"- Run config: {result.run_configuration_fingerprint}",
+        "",
+        "Task:",
+        f"- Cases: {summary.case_count}",
+        f"- Trials: {summary.trial_count}",
+        f"- Passed: {summary.passed_count}",
+        f"- Task success: {_percent_or_missing(summary.task_success_rate)}",
+        "",
+        "Tool correctness:",
+        f"- Required tool correctness: {_percent_or_missing(summary.tool_correctness_rate)}",
+        "",
+        "Memory:",
+        f"- Evidence hit: {_percent_or_missing(summary.memory_required_evidence_hit_rate)}",
+        f"- Recall@K: {_number_or_missing(summary.memory_recall_at_k_mean)}",
+        f"- MRR: {_number_or_missing(summary.memory_mrr_mean)}",
+        "",
+        "Background Review:",
+        f"- Decision accuracy: {_percent_or_missing(summary.background_review_decision_accuracy)}",
+        "",
+        "Agent iterations:",
+        f"- Mean: {_number_or_missing(summary.agent_iterations_mean)}",
+        f"- P50/P95: {_integer_or_missing(summary.agent_iterations_p50)} / {_integer_or_missing(summary.agent_iterations_p95)}",
+        "",
+        "Duration:",
+        f"- Mean: {_duration_or_missing(_as_int(summary.duration_mean_ms))}",
+        f"- P50/P95: {_duration_or_missing(summary.duration_p50_ms)} / {_duration_or_missing(summary.duration_p95_ms)}",
+        "",
+        "Tokens:",
+        f"- Prompt: {_integer_or_missing(summary.prompt_tokens_total)}",
+        f"- Completion: {_integer_or_missing(summary.completion_tokens_total)}",
+        f"- Total: {_integer_or_missing(summary.total_tokens)}",
+        "",
+        "Tools:",
+        f"- Calls mean: {_number_or_missing(summary.tool_call_count_mean)}",
+        f"- Calls P50/P95: {_integer_or_missing(summary.tool_call_count_p50)} / {_integer_or_missing(summary.tool_call_count_p95)}",
+        "",
+        "DeepSeek cache:",
+        "- " + _cache_summary(summary.deepseek_cache),
+        "",
+        "DeepSeek cost:",
+        "- " + _cost_summary(summary.deepseek_cost),
+        "",
+        "Failure / timeout:",
+        f"- Failures: {summary.failure_count} ({_percent_or_missing(summary.failure_rate)})",
+        f"- Timeouts: {summary.timeout_count} ({_percent_or_missing(summary.timeout_rate)})",
+        f"- Environment errors: {summary.environment_error_count}",
+        f"- Cancelled: {summary.cancelled_count}",
+        "",
+        "Optional Judge:",
+        "- Status: " + _judge_status(judge),
+        f"- Declared/completed/errors: {judge.declared_count}/{judge.completed_count}/{judge.error_count}",
+        f"- Answer quality: {_number_or_missing(judge.mean_answer_quality)}",
+        "",
+        "Langfuse:",
+        "- Status: " + _langfuse_status(result),
+        "- Published trials: "
         + (
-            "unknown"
+            "not evaluated"
+            if publication is None
+            else f"{publication.published_trial_count}/{summary.trial_count}"
+        ),
+        "- Score publication: "
+        + (
+            "not evaluated"
+            if publication is None
+            else (
+                f"confirmed {publication.published_score_count}; "
+                f"skipped {publication.skipped_score_count}; "
+                f"uncertain {publication.uncertain_score_count}; "
+                f"failed {publication.failed_score_count}"
+            )
+        ),
+        "",
+        "Final status:",
+        "- Local execution: "
+        + (
+            "not evaluated"
             if result.local_execution_status is None
             else result.local_execution_status.value
         ),
-        f"Cases:             {summary.case_count}",
-        f"Trials:            {summary.trial_count}",
-        f"Passed:            {summary.passed_count}",
-        f"Task success:      {_percent_or_missing(summary.task_success_rate)}",
-        f"Tool correctness:  {_percent_or_missing(summary.tool_correctness_rate)}",
-        f"Memory evidence:   {_percent_or_missing(summary.memory_required_evidence_hit_rate)}",
-        f"Memory Recall@K:   {_number_or_missing(summary.memory_recall_at_k_mean)}",
-        f"Memory MRR:        {_number_or_missing(summary.memory_mrr_mean)}",
-        f"Review decision:   {_percent_or_missing(summary.background_review_decision_accuracy)}",
-        f"Agent iterations:  {_number_or_missing(summary.agent_iterations_mean)} "
-        f"(P50 {_integer_or_missing(summary.agent_iterations_p50)}, "
-        f"P95 {_integer_or_missing(summary.agent_iterations_p95)})",
-        f"Duration mean:     {_duration_or_missing(_as_int(summary.duration_mean_ms))}",
-        f"Duration P50:      {_duration_or_missing(summary.duration_p50_ms)}",
-        f"Duration P95:      {_duration_or_missing(summary.duration_p95_ms)}",
-        f"Prompt tokens:     {_integer_or_missing(summary.prompt_tokens_total)}",
-        f"Completion tokens: {_integer_or_missing(summary.completion_tokens_total)}",
-        f"Total tokens:      {_integer_or_missing(summary.total_tokens)}",
-        f"Tool calls:        {_number_or_missing(summary.tool_call_count_mean)} "
-        f"(P50 {_integer_or_missing(summary.tool_call_count_p50)}, "
-        f"P95 {_integer_or_missing(summary.tool_call_count_p95)})",
-        "DeepSeek cache:    " + _cache_summary(summary.deepseek_cache),
-        "DeepSeek cost:     " + _cost_summary(summary.deepseek_cost),
-        f"Failure rate:       {_percent_or_missing(summary.failure_rate)}",
-        f"Timeout rate:       {_percent_or_missing(summary.timeout_rate)}",
-        "Langfuse experiment: " + _langfuse_experiment(result),
-        "Optional Judge:     "
-        f"{_number_or_missing(result.judge_summary.mean_answer_quality)} "
-        f"({result.judge_summary.completed_count}/{result.judge_summary.declared_count})",
     ]
-    memory_lines = _memory_summary(result)
-    if memory_lines:
-        lines.extend(memory_lines)
-    ablation_lines = _ablation_summary(result)
-    if ablation_lines:
-        lines.extend(ablation_lines)
-    scenario_lines = _scenario_summary(result)
-    if scenario_lines:
-        lines.extend(scenario_lines)
-    if result.integration_errors:
-        lines.append(f"Langfuse errors:   {len(result.integration_errors)}")
-    publication = result.langfuse_publish_result
-    if publication is not None:
-        remote_status = result.remote_publication_status or publication.status
-        manifest_path = (
-            "unavailable"
-            if publication.publication_manifest is None
-            else publication.publication_manifest.path
-        )
-        lines.extend(
-            (
-                f"Remote publication: {remote_status.value}",
-                f"Langfuse dataset:   {publication.dataset_sync_status.value}",
-                "Langfuse traces:    "
-                f"{publication.published_trial_count}/{summary.trial_count}",
-                f"Experiment status: {publication.experiment_status.value}",
-                "Experiment association: "
-                + (
-                    "unsupported by installed SDK"
-                    if publication.experiment_status.value == "unsupported"
-                    else (
-                        f"{publication.associated_experiment_item_count}/"
-                        f"{summary.trial_count}"
-                    )
-                ),
-                "Score publication:",
-                f"- confirmed: {publication.published_score_count}",
-                f"- skipped: {publication.skipped_score_count}",
-                f"- uncertain: {publication.uncertain_score_count}",
-                f"- failed: {publication.failed_score_count}",
-                "Publication Manifest: " + manifest_path,
-            )
-        )
-    failures = [trial for trial in result.trials if trial.passed is not True]
-    if failures:
-        lines.extend(("", "Failures:"))
-        for trial in failures:
-            variant = "" if trial.variant_id is None else f"/{trial.variant_id}"
-            lines.append(
-                f"- {trial.case_id}{variant} trial {trial.trial_number}: "
-                f"{_failure(trial)}"
-            )
     return "\n".join(lines) + "\n"
-
-
-def _failure(trial) -> str:
-    if trial.status is not TrialStatus.COMPLETED:
-        if trial.error is not None:
-            return f"{trial.status.value}: {trial.error.error_type}"
-        return trial.status.value
-    failed_metrics = [
-        metric
-        for metric in trial.metrics
-        if metric.metadata.get("required") is True
-        and (
-            metric.status is MetricStatus.ERROR
-            or (
-                metric.status is MetricStatus.COMPLETED
-                and metric.passed is False
-            )
-        )
-    ]
-    if failed_metrics:
-        return ", ".join(metric.metric_name for metric in failed_metrics)
-    return "required evaluator did not pass"
-
-
-def _scenario_summary(result: AuditRunResult) -> list[str]:
-    scenarios = [item for trial in result.trials for item in trial.scenario_results]
-    if not scenarios:
-        return []
-    process = [item for item in scenarios if item.kind.value == "process_background"]
-    output_chars = sum(
-        read.new_output_char_length
-        for item in process
-        for read in item.incremental_reads
-    )
-    return [
-        f"Toolchain scenarios: {sum(item.kind.value == 'toolchain' for item in scenarios)}",
-        f"Process scenarios:   {len(process)}",
-        "Process gate:         "
-        + _gate_or_missing(next((trial.process_gate_passed for trial in result.trials if trial.process_gate_passed is not None), None)),
-        "Final process status:  "
-        + (process[-1].final_status.value if process and process[-1].final_status is not None else "not evaluated"),
-        f"Incremental output chars: {output_chars}",
-        "Process cleanup:      "
-        + _gate_or_missing(
-            all(item.worker_cleanup_result.complete for item in process if item.worker_cleanup_result is not None)
-            if process and all(item.worker_cleanup_result is not None for item in process)
-            else None
-        ),
-    ]
-
-
-def _gate_or_missing(value: bool | None) -> str:
-    if value is None:
-        return "not evaluated"
-    return "passed" if value else "failed"
 
 
 def _percent_or_missing(value: float | None) -> str:
@@ -210,6 +153,25 @@ def _pricing_reason(metric) -> str:
 
 def _as_int(value: float | None) -> int | None:
     return None if value is None else round(value)
+
+
+def _judge_status(summary) -> str:
+    if summary.declared_count == 0:
+        return "disabled"
+    if summary.error_count:
+        return "error"
+    if summary.completed_count:
+        return "completed"
+    if summary.skipped_count:
+        return "skipped"
+    return "not evaluated"
+
+
+def _langfuse_status(result: AuditRunResult) -> str:
+    publication = result.langfuse_publish_result
+    if publication is None:
+        return "not published"
+    return publication.status.value
 
 
 def _cache_summary(value) -> str:
@@ -292,132 +254,6 @@ def _money(value) -> str:
 
 def _percent_decimal(value) -> str:
     return f"{value * 100:.1f}%"
-
-
-def _langfuse_experiment(result: AuditRunResult) -> str:
-    identity = result.experiment_identity
-    publication = result.langfuse_publish_result
-    if identity is None or publication is None:
-        return "not published"
-    value = f"{identity.experiment_name} ({publication.status.value})"
-    if identity.url is not None:
-        value += f" {identity.url}"
-    return value
-
-
-def _memory_summary(result: AuditRunResult) -> list[str]:
-    query_results = [
-        item
-        for trial in result.trials
-        for item in trial.memory_query_results
-    ]
-    memory_metrics = [
-        metric
-        for trial in result.trials
-        for metric in trial.metrics
-        if metric.source.value == "retrieval"
-    ]
-    if not query_results and not memory_metrics:
-        return []
-    evidence = [
-        metric
-        for metric in memory_metrics
-        if metric.metadata.get("metric_type") == "required_evidence"
-    ]
-    recalls = [
-        float(metric.value)
-        for metric in memory_metrics
-        if metric.metadata.get("metric_type") == "recall_at_k"
-        and metric.status is MetricStatus.COMPLETED
-        and type(metric.value) in (int, float)
-    ]
-    mrrs = [
-        float(metric.value)
-        for metric in memory_metrics
-        if metric.metadata.get("metric_type") == "mrr"
-        and metric.status is MetricStatus.COMPLETED
-        and type(metric.value) in (int, float)
-    ]
-    state_gates = [
-        trial.memory_state_gate_passed
-        for trial in result.trials
-        if trial.memory_state_gate_passed is not None
-    ]
-    evidence_rate = (
-        "not evaluated"
-        if not evidence
-        else f"{sum(item.passed is True for item in evidence) / len(evidence) * 100:.1f}%"
-    )
-    state_rate = (
-        "not evaluated"
-        if not state_gates
-        else f"{sum(item is True for item in state_gates)}/{len(state_gates)}"
-    )
-    return [
-        f"Memory queries:     {len(query_results)}/{len(evidence)} completed",
-        f"Memory evidence:    {evidence_rate}",
-        f"Memory Recall@K:    {_mean_or_missing(recalls)}",
-        f"Memory MRR:         {_mean_or_missing(mrrs)}",
-        f"Memory state gate:  {state_rate}",
-    ]
-
-
-def _mean_or_missing(values: list[float]) -> str:
-    return "not evaluated" if not values else f"{sum(values) / len(values):.3f}"
-
-
-def _ablation_summary(result: AuditRunResult) -> list[str]:
-    if not result.ablation_comparisons:
-        return []
-    lines = [f"Ablation cases:     {len(result.ablation_comparisons)}"]
-    for comparison in result.ablation_comparisons:
-        lines.append(
-            f"Ablation {comparison.case_id}: reference="
-            f"{comparison.reference_variant_id}, "
-            "comparability="
-            f"structural:{comparison.structural_comparability.status.value},"
-            f"token:{comparison.token_comparability.status.value},"
-            "answer_quality:"
-            f"{comparison.answer_quality_comparability.status.value},"
-            f"duration:{comparison.duration_comparability.status.value}"
-        )
-        for variant in comparison.variant_results:
-            fact_loss = (
-                "not evaluated"
-                if variant.required_fact_loss_rate is None
-                else f"{variant.required_fact_loss_rate * 100:.1f}%"
-            )
-            tokens = (
-                "not evaluated"
-                if variant.total_tokens is None
-                else str(variant.total_tokens)
-            )
-            lines.append(
-                f"- {variant.variant_id}: memory={variant.memory_mode.value}, "
-                "requested_compression_mode="
-                f"{variant.requested_compression_mode.value}, task="
-                f"{variant.task_success_rate * 100:.1f}%, "
-                f"fact_loss={fact_loss}, distortions="
-                f"{variant.distortion_count}, tokens={tokens}, "
-                "duration="
-                + (
-                    "not evaluated"
-                    if variant.duration_ms is None
-                    else f"{variant.duration_ms}ms"
-                )
-            )
-        for label, assessment in (
-            ("structural", comparison.structural_comparability),
-            ("token", comparison.token_comparability),
-            ("answer_quality", comparison.answer_quality_comparability),
-            ("duration", comparison.duration_comparability),
-        ):
-            if assessment.reasons:
-                lines.append(
-                    f"  {label} not comparable: "
-                    + ", ".join(item.value for item in assessment.reasons)
-                )
-    return lines
 
 
 def render_console_regression(report: AuditRegressionReport) -> str:
@@ -513,23 +349,6 @@ def render_console_regression(report: AuditRegressionReport) -> str:
             f"decision={case.decision.value}"
         )
     return "\n".join(lines) + "\n"
-
-
-def _trial_configuration_fingerprints(result: AuditRunResult) -> str:
-    """Render Trial-scoped identities without treating Case differences as a conflict."""
-
-    values = sorted(
-        {
-            trial.configuration_fingerprint
-            for trial in result.trials
-            if trial.configuration_fingerprint is not None
-        }
-    )
-    if not values:
-        return "unavailable"
-    if len(values) == 1:
-        return values[0]
-    return f"{len(values)} distinct Case/Variant hashes: " + ", ".join(values)
 
 
 __all__ = ("render_console_summary", "render_console_regression")

@@ -12,12 +12,12 @@ the new Case metadata records each source Suite and Case ID.
 
 It reuses the existing task-success, tool-trajectory, Memory evidence/
 Recall@K/MRR, Background Review decision, runtime, cache, and P6.3 cost
-projections. There is no composite score, required Judge, benchmark-specific
-Langfuse path, Case include mechanism, repeated-Trial mode, Baseline, or CI
-threshold. The default is one synthetic Trial, 180 seconds, no Sandbox
-preservation, and no DeepSeek pricing, so cache observations remain available
-while cost status is legitimately `not_evaluated`. Local pricing can be added
-in a copied Suite through the existing `defaults.deepseek_pricing` contract.
+projections. The Suite itself introduces no composite score, required Judge,
+benchmark-specific Langfuse path, Case include mechanism, or CI threshold. The
+default is one synthetic Trial, 180 seconds, no Sandbox preservation, and no
+DeepSeek pricing, so cache observations remain available while cost status is
+legitimately `not_evaluated`. Local pricing can be added in a copied Suite
+through the existing `defaults.deepseek_pricing` contract.
 
 See [`docs/p6-representative-benchmark.md`](docs/p6-representative-benchmark.md)
 for Case provenance, metric denominators, exclusions, and the documented local
@@ -93,6 +93,44 @@ Comparison is read-only and does not invoke an Agent, Judge, Langfuse, or
 network service.  See [`docs/p7-baseline-regression.md`](docs/p7-baseline-regression.md)
 for denominators, compatibility rules, policy thresholds, and safe-data
 boundaries.
+
+## P8 Representative Reports, CI, and Formal Acceptance
+
+P8 adds a strict presentation and operating layer over existing facts. The
+independent `report-v1` renderer accepts only a validated `AuditRunResult`,
+`AuditBaseline`, or `AuditRegressionReport`; it never recalculates a metric,
+invokes a model/Judge/Langfuse, or writes a score. Markdown output is atomic,
+requires `.md`, and refuses overwrite unless explicitly requested.
+
+```bash
+# One representative Result and its fact-only Markdown
+uv run myhermes-audit run examples/representative_benchmark_v1.yaml \
+  --subject-repo ../my-hermes --subject-config ./local-config.yaml \
+  --output reports/representative-current.json
+uv run myhermes-audit report render reports/representative-current.json \
+  --output reports/representative-current.md
+
+# Deliberate repeated Baseline and read-only comparison
+uv run myhermes-audit run examples/representative_benchmark_v1.yaml \
+  --subject-repo ../my-hermes --subject-config ./local-config.yaml \
+  --trials 5 --output reports/representative-repeat.json
+uv run myhermes-audit baseline create reports/representative-repeat.json \
+  --output baselines/representative-v1.json
+uv run myhermes-audit baseline compare baselines/representative-v1.json \
+  reports/representative-current.json --policy configs/regression-policy.yaml \
+  --output reports/representative-regression.json
+uv run myhermes-audit report render reports/representative-regression.json \
+  --input-type regression --output reports/representative-regression.md
+```
+
+The checked-in workflows split deterministic push/PR contract checks from
+manual credentialed representative and Regression jobs; P8 intentionally adds
+no schedule/Cron and never updates a Baseline automatically. See
+[`docs/p8-reporting-ci.md`](docs/p8-reporting-ci.md),
+[`baselines/README.md`](baselines/README.md), and
+[`docs/p8-production-acceptance.md`](docs/p8-production-acceptance.md) for
+safe-data boundaries, CI Secrets/artifacts, exit semantics, and the formal
+acceptance checklist.
 
 ## P6.1 E2E scenarios
 

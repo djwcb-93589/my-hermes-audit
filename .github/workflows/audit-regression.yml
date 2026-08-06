@@ -1,0 +1,160 @@
+name: Audit representative regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      subject_repository:
+        description: Repository containing the reviewed MyHermes Subject
+        required: true
+        type: string
+      subject_ref:
+        description: Immutable or reviewed Subject ref
+        required: true
+        default: main
+        type: string
+      subject_config_path:
+        description: Secret-free config path relative to the Subject checkout
+        required: true
+        default: configs/audit-ci.yaml
+        type: string
+      baseline_path:
+        description: Versioned, checked-in read-only Baseline path in this repository
+        required: true
+        type: string
+      trials:
+        description: Explicit representative Trial count (1-100)
+        required: true
+        default: '5'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MYHERMES_API_KEY: ${{ secrets.MYHERMES_API_KEY }}
+      MYHERMES_MODEL: ${{ secrets.MYHERMES_MODEL }}
+      MYHERMES_BASE_URL: ${{ secrets.MYHERMES_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Require read-only Baseline and explicit credentials
+        id: preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${MYHERMES_API_KEY:-}" || -z "${MYHERMES_MODEL:-}" ]]; then
+            printf '%s\n' 'status=skipped reason=missing_model_credentials' >> "$GITHUB_STEP_SUMMARY"
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git ls-files --error-unmatch "${{ inputs.baseline_path }}" >/dev/null 2>&1; then
+            printf '%s\n' 'status=failed reason=baseline_not_checked_in' >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          echo 'run=true' >> "$GITHUB_OUTPUT"
+          printf '%s\n' 'baseline_mode=readonly credential_check=present' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout reviewed Subject
+        if: steps.preflight.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.subject_repository }}
+          ref: ${{ inputs.subject_ref }}
+          token: ${{ secrets.MYHERMES_READ_TOKEN || github.token }}
+          path: my-hermes
+
+      - name: Run current Benchmark and compare the read-only Baseline
+        if: steps.preflight.outputs.run == 'true'
+        id: regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --locked
+          mkdir -p .p8-ci
+          raw_log="$RUNNER_TEMP/regression-raw.log"
+          set +e
+          uv run myhermes-audit run examples/representative_benchmark_v1.yaml \
+            --subject-repo my-hermes \
+            --subject-config "my-hermes/${{ inputs.subject_config_path }}" \
+            --trials "${{ inputs.trials }}" \
+            --output .p8-ci/current-result.json > "$raw_log" 2>&1
+          run_status=$?
+          set -e
+          compare_status=2
+          if [[ -f .p8-ci/current-result.json ]]; then
+            set +e
+            uv run myhermes-audit baseline compare "${{ inputs.baseline_path }}" \
+              .p8-ci/current-result.json \
+              --policy configs/regression-policy.yaml \
+              --output .p8-ci/representative-regression.json >> "$raw_log" 2>&1
+            compare_status=$?
+            set -e
+            if [[ -f .p8-ci/representative-regression.json ]]; then
+              uv run myhermes-audit report render .p8-ci/representative-regression.json \
+                --input-type regression --output .p8-ci/representative-regression.md >> "$raw_log" 2>&1
+              uv run python - <<'PY'
+          import json
+          from pathlib import Path
+          from myhermes_audit.reports.markdown import load_markdown_report_source
+
+          report = load_markdown_report_source(
+              Path('.p8-ci/representative-regression.json'), input_type='regression'
+          )
+          Path('.p8-ci/safe-artifact-manifest.json').write_text(
+              json.dumps(
+                  {
+                      'report_type': 'audit_regression',
+                      'baseline_id': report.baseline_id,
+                      'current_run_id': report.current_run_id,
+                      'status': report.status.value,
+                      'overall_regression_gate': report.overall_regression_gate,
+                      'suite_id': report.suite_id,
+                      'current_subject_commit': report.current_subject_commit,
+                  },
+                  sort_keys=True,
+              ) + '\n',
+              encoding='utf-8',
+          )
+          PY
+              subject_commit=$(uv run python -c "import json; print(json.load(open('.p8-ci/representative-regression.json', encoding='utf-8'))['current_subject_commit'][:12])")
+            else
+              subject_commit=unknown
+            fi
+          else
+            subject_commit=unknown
+          fi
+          grep -Ev '^(Report:|Regression report:|Markdown output:|Schema written:|Preserved Sandboxes:|- /)' "$raw_log" > .p8-ci/console-summary.txt || true
+          echo "artifact_name=representative-regression-${subject_commit}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "run_exit_code=${run_status} compare_exit_code=${compare_status}" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' 'baseline_updated=false judge=disabled langfuse=disabled pricing=policy-only' >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$run_status" -ne 0 ]]; then
+            exit "$run_status"
+          fi
+          exit "$compare_status"
+
+      - name: Record regression failure safely
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'status=failed stage=representative_regression details=redacted' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload regression safe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.regression.outputs.artifact_name || format('representative-regression-unknown-{0}', github.run_id) }}
+          if-no-files-found: warn
+          path: |
+            .p8-ci/representative-regression.json
+            .p8-ci/representative-regression.md
+            .p8-ci/safe-artifact-manifest.json
+            .p8-ci/console-summary.txt

@@ -1,0 +1,87 @@
+name: Audit deterministic contracts
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Strict deterministic checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --locked
+          mkdir -p .p8-ci
+          uv run python -m compileall -q src
+          uv run myhermes-audit --help > .p8-ci/cli-help.txt
+          uv run myhermes-audit report render --help > .p8-ci/report-render-help.txt
+          uv run myhermes-audit schema --output .p8-ci/audit-suite.schema.json > /dev/null
+          uv run myhermes-audit validate examples/representative_benchmark_v1.yaml > .p8-ci/representative-suite-validation.txt
+          uv run python - <<'PY'
+          from pathlib import Path
+          from myhermes_audit.contracts import (
+              AuditBaseline,
+              AuditRegressionReport,
+              AuditRunResult,
+              ReportRenderOptions,
+          )
+          from myhermes_audit.serialization import pretty_json
+
+          Path(".p8-ci/strict-contract-schemas.json").write_text(
+              pretty_json(
+                  {
+                      "audit_run_result": AuditRunResult.model_json_schema(),
+                      "audit_baseline": AuditBaseline.model_json_schema(),
+                      "audit_regression_report": AuditRegressionReport.model_json_schema(),
+                      "report_render_options": ReportRenderOptions.model_json_schema(),
+                  }
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          while IFS= read -r baseline; do
+            stem="$(basename "${baseline%.json}")"
+            uv run myhermes-audit report render "$baseline" \
+              --input-type baseline \
+              --output ".p8-ci/${stem}.md" > /dev/null
+          done < <(git ls-files 'baselines/*.json')
+          printf '%s\n' 'status=completed' >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' 'network=model-disabled langfuse-disabled baseline-mutation-disabled' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tracked-file secret safety scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -q -I -E '(sk-[A-Za-z0-9_-]{16,}|LF_SECRET_KEY[[:space:]]*=[^$]|MYHERMES_API_KEY[[:space:]]*=[^$])' -- .; then
+            printf '%s\n' 'status=failed reason=tracked_secret_pattern_detected' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          printf '%s\n' 'secret_scan=passed' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record deterministic failure safely
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'status=failed stage=deterministic_contracts details=redacted' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deterministic safe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-deterministic-${{ github.sha }}-${{ github.run_id }}
+          if-no-files-found: warn
+          path: .p8-ci/

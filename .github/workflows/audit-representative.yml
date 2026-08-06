@@ -1,0 +1,132 @@
+name: Audit representative benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      subject_repository:
+        description: Repository containing the reviewed MyHermes Subject
+        required: true
+        type: string
+      subject_ref:
+        description: Immutable or reviewed Subject ref
+        required: true
+        default: main
+        type: string
+      subject_config_path:
+        description: Secret-free config path relative to the Subject checkout
+        required: true
+        default: configs/audit-ci.yaml
+        type: string
+      trials:
+        description: Explicit representative Trial count (1-100)
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  representative:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MYHERMES_API_KEY: ${{ secrets.MYHERMES_API_KEY }}
+      MYHERMES_MODEL: ${{ secrets.MYHERMES_MODEL }}
+      MYHERMES_BASE_URL: ${{ secrets.MYHERMES_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Require explicitly supplied model credentials
+        id: preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${MYHERMES_API_KEY:-}" || -z "${MYHERMES_MODEL:-}" ]]; then
+            printf '%s\n' 'status=skipped reason=missing_model_credentials' >> "$GITHUB_STEP_SUMMARY"
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'run=true' >> "$GITHUB_OUTPUT"
+          printf '%s\n' 'credential_check=present' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout reviewed Subject
+        if: steps.preflight.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.subject_repository }}
+          ref: ${{ inputs.subject_ref }}
+          token: ${{ secrets.MYHERMES_READ_TOKEN || github.token }}
+          path: my-hermes
+
+      - name: Run representative Benchmark without optional remote integrations
+        if: steps.preflight.outputs.run == 'true'
+        id: benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --locked
+          mkdir -p .p8-ci
+          raw_log="$RUNNER_TEMP/representative-raw.log"
+          set +e
+          uv run myhermes-audit run examples/representative_benchmark_v1.yaml \
+            --subject-repo my-hermes \
+            --subject-config "my-hermes/${{ inputs.subject_config_path }}" \
+            --trials "${{ inputs.trials }}" \
+            --output .p8-ci/representative-result.json > "$raw_log" 2>&1
+          run_status=$?
+          set -e
+          if [[ -f .p8-ci/representative-result.json ]]; then
+            uv run myhermes-audit report render .p8-ci/representative-result.json \
+              --output .p8-ci/representative-report.md >> "$raw_log" 2>&1
+            uv run python - <<'PY'
+          import json
+          from pathlib import Path
+          from myhermes_audit.reports.markdown import load_markdown_report_source
+
+          result = load_markdown_report_source(Path('.p8-ci/representative-result.json'))
+          Path('.p8-ci/safe-artifact-manifest.json').write_text(
+              json.dumps(
+                  {
+                      'run_id': result.run_id,
+                      'suite_id': result.suite_id,
+                      'subject_commit': result.subject_fingerprint.git_commit,
+                      'audit_commit': result.audit_fingerprint.audit_commit,
+                      'run_configuration_fingerprint': result.run_configuration_fingerprint,
+                  },
+                  sort_keys=True,
+              ) + '\n',
+              encoding='utf-8',
+          )
+          PY
+            subject_commit=$(uv run python -c "import json; print(json.load(open('.p8-ci/representative-result.json', encoding='utf-8'))['subject_fingerprint']['git_commit'][:12])")
+          else
+            subject_commit=unknown
+          fi
+          grep -Ev '^(Report:|Regression report:|Markdown output:|Schema written:|Preserved Sandboxes:|- /)' "$raw_log" > .p8-ci/console-summary.txt || true
+          echo "artifact_name=representative-benchmark-${subject_commit}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "run_exit_code=${run_status}" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' 'judge=disabled langfuse=disabled pricing=not-configured-by-workflow' >> "$GITHUB_STEP_SUMMARY"
+          exit "$run_status"
+
+      - name: Record representative failure safely
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'status=failed stage=representative_benchmark details=redacted' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload representative safe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.benchmark.outputs.artifact_name || format('representative-benchmark-unknown-{0}', github.run_id) }}
+          if-no-files-found: warn
+          path: |
+            .p8-ci/representative-report.md
+            .p8-ci/safe-artifact-manifest.json
+            .p8-ci/console-summary.txt

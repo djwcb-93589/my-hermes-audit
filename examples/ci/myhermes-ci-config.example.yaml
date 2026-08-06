@@ -1,0 +1,3 @@
+# Safe placeholder only. Supply a reviewed Subject-compatible config in CI.
+# Credentials must be injected by GitHub Secrets, never copied into this file.
+model: ${MYHERMES_MODEL}

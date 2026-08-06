@@ -188,6 +188,11 @@ from myhermes_audit.contracts.regression import (
     parse_metric_number,
     pricing_applicability_fingerprint,
 )
+from myhermes_audit.contracts.report import (
+    REPORT_RENDER_SCHEMA_VERSION,
+    ReportInputType,
+    ReportRenderOptions,
+)
 from myhermes_audit.contracts.scenario import (
     ArtifactOutputCheckpoint,
     CleanupCheckpoint,
@@ -449,6 +454,9 @@ __all__ = (
     "REGRESSION_POLICY_SCHEMA_VERSION",
     "REGRESSION_SCHEMA_VERSION",
     "pricing_applicability_fingerprint",
+    "REPORT_RENDER_SCHEMA_VERSION",
+    "ReportInputType",
+    "ReportRenderOptions",
     "E2EScenarioKind",
     "ArtifactOutputCheckpoint",
     "CleanupCheckpoint",

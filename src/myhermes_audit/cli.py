@@ -19,6 +19,8 @@ from myhermes_audit.contracts import (
     AuditRegressionReport,
     AuditRunResult,
     AuditSuite,
+    ReportInputType,
+    ReportRenderOptions,
 )
 from myhermes_audit.artifacts import (
     atomic_write_json,
@@ -144,6 +146,31 @@ def _build_parser() -> argparse.ArgumentParser:
     baseline_compare.add_argument("--policy", type=Path, required=True)
     baseline_compare.add_argument("--output", type=Path)
     baseline_compare.add_argument("--overwrite", action="store_true")
+
+    report_parser = subparsers.add_parser(
+        "report",
+        help="render an existing strict Audit fact contract without recomputing it",
+    )
+    report_subparsers = report_parser.add_subparsers(
+        dest="report_command", required=True
+    )
+    report_render = report_subparsers.add_parser(
+        "render",
+        help="render an AuditRunResult, AuditBaseline, or Regression report as Markdown",
+    )
+    report_render.add_argument("input", type=Path, help="strict JSON fact input")
+    report_render.add_argument("--output", type=Path, required=True, help="Markdown output (.md)")
+    report_render.add_argument(
+        "--input-type",
+        choices=tuple(item.value for item in ReportInputType),
+        default=ReportInputType.AUTO.value,
+        help="strict source contract to load (default: auto)",
+    )
+    report_render.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace an existing Markdown output explicitly",
+    )
 
     sync_parser = subparsers.add_parser(
         "sync",
@@ -648,6 +675,31 @@ def _baseline_compare_command(arguments: argparse.Namespace) -> int:
     return 0 if report.overall_regression_gate else 1
 
 
+def _report_render_command(arguments: argparse.Namespace) -> int:
+    """Render an already validated public fact model without changing it."""
+
+    from myhermes_audit.reports.markdown import (
+        load_markdown_report_source,
+        write_markdown_report,
+    )
+
+    options = ReportRenderOptions(input_type=ReportInputType(arguments.input_type))
+    source = load_markdown_report_source(
+        arguments.input,
+        input_type=options.input_type,
+    )
+    output = write_markdown_report(
+        arguments.output,
+        source,
+        options=options,
+        overwrite=arguments.overwrite,
+        protected=(arguments.input,),
+    )
+    print("Markdown report rendered")
+    print(f"Markdown output: {output}")
+    return 0
+
+
 def _presence(available: bool) -> str:
     return "installed" if available else "not installed"
 
@@ -789,6 +841,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return _baseline_create_command(arguments)
             if arguments.baseline_command == "compare":
                 return _baseline_compare_command(arguments)
+        if arguments.command == "report":
+            if arguments.report_command == "render":
+                return _report_render_command(arguments)
         if arguments.command == "sync":
             return _sync_command(arguments)
         if arguments.command == "doctor":

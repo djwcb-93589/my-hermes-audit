@@ -1050,8 +1050,10 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
 
     policy_facts = report.regression_policy.to_facts()
     return {
+        "report_type": "audit_regression",
         "baseline_id": report.baseline_id,
         "current_run_id": report.current_run_id,
+        "regression_status": report.status.value,
         "report_schema_version": report.schema_version,
         "baseline_schema_version": BASELINE_SCHEMA_VERSION,
         "baseline_result_schema_version": report.baseline_result_schema_version,
@@ -1095,6 +1097,26 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
             "current_rate": report.current_suite_task_success_rate,
             "delta": report.suite_task_success_rate_delta,
         },
+        "core_representative_metrics": [
+            {
+                "metric_name": item.metric_name,
+                "baseline_value": _safe_regression_scalar(item.baseline_value),
+                "current_value": _safe_regression_scalar(item.current_value),
+                "baseline_sample_count": item.baseline_sample_count,
+                "current_sample_count": item.current_sample_count,
+                "decision": item.decision.value,
+            }
+            for item in report.suite_metrics
+            if item.metric_name
+            in {
+                "task_success_rate",
+                "tool_correctness_rate",
+                "memory_required_evidence_hit_rate",
+                "memory_recall_at_k_mean",
+                "memory_mrr_mean",
+                "background_review_decision_accuracy",
+            }
+        ],
         "regression_count": report.regression_count,
         "improvement_count": report.improvement_count,
         "unchanged_count": report.unchanged_count,
@@ -1104,6 +1126,25 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
         "comparable_core_metric_count": report.comparable_core_metric_count,
         "comparable_local_metric_count": report.comparable_local_metric_count,
         "overall_regression_gate": report.overall_regression_gate,
+        "safe_ci_identity": {
+            "suite_id": report.suite_id,
+            "baseline_suite_comparison_fingerprint": (
+                report.baseline_suite_comparison_fingerprint
+            ),
+            "current_suite_comparison_fingerprint": (
+                report.current_suite_comparison_fingerprint
+            ),
+            "baseline_subject_commit": report.baseline_subject_commit,
+            "current_subject_commit": report.current_subject_commit,
+            "baseline_audit_commit": report.baseline_audit_commit,
+            "current_audit_commit": report.current_audit_commit,
+            "baseline_run_configuration_fingerprint": (
+                report.baseline_run_configuration_fingerprint
+            ),
+            "current_run_configuration_fingerprint": (
+                report.current_run_configuration_fingerprint
+            ),
+        },
         "case_task_success": {
             item.case_id: {
                 "baseline_sample_count": item.baseline_task_success_sample_count,
