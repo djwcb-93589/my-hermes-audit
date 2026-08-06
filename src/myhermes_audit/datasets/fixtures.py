@@ -1,4 +1,4 @@
-"""Safe P1 fixture materialization into a Trial Sandbox."""
+"""Safe fixture materialization into a Trial Sandbox."""
 
 from __future__ import annotations
 
@@ -70,9 +70,9 @@ def validate_runtime_fixture_support(
     if unsupported:
         raise UnsupportedCaseError(
             (
-                "runner supports only declared file, Memory, and explicit P5 Review fixtures"
+                "runner supports only declared file, Memory, and explicit Background Review fixtures"
                 if allow_memory
-                else "P1 supports only file fixtures"
+                else "this execution mode supports only file fixtures"
             ),
             unsupported_fixtures=unsupported,
         )

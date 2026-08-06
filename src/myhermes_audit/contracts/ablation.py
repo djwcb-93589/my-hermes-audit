@@ -1,4 +1,4 @@
-"""P4 Memory/Compression ablation declarations and local result facts."""
+"""Memory/Compression ablation declarations and local result facts."""
 
 from __future__ import annotations
 
@@ -398,9 +398,9 @@ class EffectiveSubjectConfiguration(ContractModel):
         if self.session_context_mode is not expected_session_mode:
             raise ValueError("session context projection must match memory_mode")
         if not self.compression_threshold_control:
-            raise ValueError("P4 configuration requires public threshold control")
+            raise ValueError("ablation configuration requires public threshold control")
         if self.compression_control is not CompressionControl.THRESHOLD_CONFIGURATION:
-            raise ValueError("P4 Compression control must be threshold configuration")
+            raise ValueError("compression control must use threshold configuration")
         if self.compression_threshold is None:
             raise ValueError("configured Compression requires a threshold")
         expected_semantics = (

@@ -77,7 +77,7 @@ class MyHermesConfigBuilder:
         _reject_capability_reenable(override_document)
         document = copy.deepcopy(self._base_document)
         _deep_merge_existing(document, override_document, path="")
-        _force_p1_capability_boundary(document)
+        _enforce_isolated_runtime_boundary(document)
         _reject_literal_secrets(document, path="<root>")
         references = _collect_environment_references(document)
         unsupported = sorted(set(references) - _ALLOWED_CONFIG_REFERENCES)
@@ -198,21 +198,27 @@ def _mapping_section(document: dict[str, Any], name: str) -> dict[str, Any]:
 def _reject_capability_reenable(document: dict[str, Any]) -> None:
     background = document.get("background_review")
     if isinstance(background, dict) and background.get("enabled") not in (None, False):
-        raise ConfigBuildError("background_review cannot be enabled in P1")
+        raise ConfigBuildError(
+            "background_review cannot be enabled in the foreground configuration"
+        )
     browser = document.get("browser")
     if isinstance(browser, dict) and browser.get("enabled") not in (None, False):
-        raise ConfigBuildError("browser cannot be enabled in P1")
+        raise ConfigBuildError("browser cannot be enabled by the isolated Audit runtime")
     plugins = document.get("plugins")
     if isinstance(plugins, dict):
         if plugins.get("enabled") not in (None, []):
-            raise ConfigBuildError("plugins cannot be enabled in P1")
+            raise ConfigBuildError("plugins cannot be enabled by the isolated Audit runtime")
         if plugins.get("search_paths") not in (None, []):
-            raise ConfigBuildError("plugin search paths are not supported in P1")
+            raise ConfigBuildError(
+                "plugin search paths are not supported by the isolated Audit runtime"
+            )
         if plugins.get("enable_project_plugins") not in (None, False):
-            raise ConfigBuildError("project plugins cannot be enabled in P1")
+            raise ConfigBuildError(
+                "project plugins cannot be enabled by the isolated Audit runtime"
+            )
 
 
-def _force_p1_capability_boundary(document: dict[str, Any]) -> None:
+def _enforce_isolated_runtime_boundary(document: dict[str, Any]) -> None:
     _mapping_section(document, "background_review")["enabled"] = False
     _mapping_section(document, "browser")["enabled"] = False
     plugins = _mapping_section(document, "plugins")

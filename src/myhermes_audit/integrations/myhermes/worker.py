@@ -150,9 +150,9 @@ class _ProcessMonotonicTracker:
 class _NoopBackgroundReviewCoordinator:
     """Prevent the Subject's foreground entry point from creating a singleton.
 
-    P0--P4 deliberately have no P5 Review runtime.  MyHermes otherwise treats
+    Trials without Background Review deliberately have no Review runtime. MyHermes otherwise treats
     ``None`` as a request for its process-global coordinator, so the worker
-    always supplies this tiny inert collaborator unless a P5 trial replaces it
+    always supplies this tiny inert collaborator unless a Review-enabled trial replaces it
     with the public, trial-local disabled coordinator.
     """
 
@@ -860,7 +860,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         if request.effective_subject_configuration is not None:
             ablation_path = request.artifact_paths.ablation
             if ablation_path is None:
-                raise RuntimeError("P4 worker request has no Ablation Artifact path")
+                raise RuntimeError("worker ablation request has no Ablation Artifact path")
             try:
                 atomic_write_json(
                     ablation_path,
@@ -878,7 +878,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         if request.memory_strategy is not None:
             memory_path = request.artifact_paths.memory
             if memory_path is None:
-                raise RuntimeError("P3 worker request has no Memory Artifact path")
+                raise RuntimeError("worker Memory request has no Memory Artifact path")
             try:
                 atomic_write_json(
                     memory_path,
@@ -1000,7 +1000,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         if request.memory_strategy is not None:
             memory_path = request.artifact_paths.memory
             if memory_path is None:
-                raise RuntimeError("P3 worker request has no Memory Artifact path")
+                raise RuntimeError("worker Memory request has no Memory Artifact path")
             atomic_write_json(
                 memory_path,
                 _build_memory_artifact(
@@ -1018,7 +1018,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         if request.effective_subject_configuration is not None:
             ablation_path = request.artifact_paths.ablation
             if ablation_path is None:
-                raise RuntimeError("P4 worker request has no Ablation Artifact path")
+                raise RuntimeError("worker ablation request has no Ablation Artifact path")
             atomic_write_json(
                 ablation_path,
                 _build_ablation_artifact(
@@ -1106,7 +1106,7 @@ def _execute(request: MyHermesWorkerRequest) -> MyHermesWorkerResult:
         lifecycle_warnings.append(
             WorkerWarning(
                 warning_type="observation_truncated",
-                message="public Observation projection reached the P1 size limit",
+                message="public Observation projection reached the size limit",
             )
         )
     cache_aggregation = aggregate_model_cache(
@@ -1494,7 +1494,7 @@ def _project_public_compression_observations(
             )
     if len(events) > configuration.maximum_compression_events:
         raise CompressionLimitError(
-            "Subject Compression events exceed the declared P4 limit",
+            "Subject Compression events exceed the declared ablation limit",
             variant_id=request.variant_id,
             observed_event_count=len(events),
             maximum_compression_events=(
@@ -1701,7 +1701,9 @@ def _write_background_review_artifacts(
         or paths.background_review_evidence is None
         or paths.background_review_snapshots is None
     ):
-        raise RuntimeError("P5 worker request has incomplete Review Artifact paths")
+        raise RuntimeError(
+            "Background Review worker request has incomplete Review Artifact paths"
+        )
     atomic_write_json(
         paths.background_review_results,
         BackgroundReviewArtifact(
@@ -1781,7 +1783,7 @@ def _recover_background_review_results(
     list[BackgroundReviewExecutionResult],
     list[BackgroundReviewExecutionError],
 ]:
-    """Recover only verified, already-published P5 plan facts after a crash."""
+    """Recover only verified, already-published Review plan facts after a crash."""
 
     if (
         not request.background_review_plans

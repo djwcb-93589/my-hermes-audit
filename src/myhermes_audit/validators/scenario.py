@@ -1,4 +1,4 @@
-"""Deterministic validation of P6.1 scenario observations."""
+"""Deterministic validation of scenario observations."""
 
 from __future__ import annotations
 

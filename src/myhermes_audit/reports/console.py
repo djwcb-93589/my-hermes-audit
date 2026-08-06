@@ -11,7 +11,7 @@ from myhermes_audit.regression_decision import derive_metric_role, resolve_metri
 
 
 def render_console_summary(result: AuditRunResult) -> str:
-    """Render stored run facts in the P8 operational reading order.
+    """Render stored run facts in the operational reading order.
 
     This function intentionally does not re-aggregate Trials, infer process
     facts, or calculate a headline score.  Detailed event evidence remains in
@@ -261,7 +261,7 @@ def render_console_regression(report: AuditRegressionReport) -> str:
 
     policy_facts = report.regression_policy.to_facts()
     lines = [
-        "P7 Regression comparison",
+        "Regression comparison",
         f"Status:              {report.status.value}",
         f"Baseline:            {report.baseline_id}",
         f"Current run:         {report.current_run_id}",

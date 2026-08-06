@@ -1,4 +1,4 @@
-"""Strict P6.1 end-to-end scenario contracts.
+"""Strict end-to-end scenario contracts.
 
 Scenario plans describe public observations, never an executable Process DSL.
 Commands, input bodies and raw output are deliberately absent from result

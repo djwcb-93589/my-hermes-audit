@@ -1,4 +1,4 @@
-"""Static contracts plus the isolated P1 MyHermes Audit command."""
+"""Static contracts plus the isolated MyHermes Audit command."""
 
 from __future__ import annotations
 

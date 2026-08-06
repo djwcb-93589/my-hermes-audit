@@ -73,7 +73,7 @@ class ReviewStatus(str, Enum):
 
 
 class ReviewTrigger(str, Enum):
-    """The only supported P5 trigger is a completed foreground turn."""
+    """The only supported trigger is a completed foreground turn."""
 
     AFTER_FOREGROUND_TURN = "after_foreground_turn"
 
@@ -138,7 +138,7 @@ class UserStateSnapshot(ContractModel):
 
 
 class ReviewMemoryItemSnapshot(ContractModel):
-    """A content-free public Memory state projection for a P5 Review."""
+    """A content-free public Memory state projection for a Background Review."""
 
     memory_id: Identifier
     kind: MemoryKind
@@ -148,7 +148,7 @@ class ReviewMemoryItemSnapshot(ContractModel):
 
 
 class ReviewMemorySnapshot(ContractModel):
-    """P5 live Memory snapshot without Memory bodies or free metadata."""
+    """Live Memory snapshot without Memory bodies or free metadata."""
 
     snapshot_id: Identifier
     phase: MemorySnapshotPhase | None = None
@@ -193,7 +193,7 @@ class ReviewStateSnapshot(ContractModel):
 
 
 class BackgroundReviewSkillSnapshot(ContractModel):
-    """P5 live Skill projection without a name, body, or free metadata."""
+    """Live Skill projection without a name, body, or free metadata."""
 
     skill_id: Identifier
     name_sha256: Sha256Digest
@@ -206,7 +206,7 @@ class BackgroundReviewSkillSnapshot(ContractModel):
 
 
 class BackgroundReviewStateSnapshot(ContractModel):
-    """Content-free state used only by Worker-produced P5 execution facts."""
+    """Content-free state used only by Worker-produced Review execution facts."""
 
     snapshot_id: Identifier
     captured_at: UtcDatetime
@@ -320,7 +320,7 @@ class ReviewError(ContractModel):
 
 
 class BackgroundReviewExecutionError(ContractModel):
-    """A safe P5 execution diagnostic with no prompt, claim, or file path."""
+    """A safe Review execution diagnostic with no prompt, claim, or file path."""
 
     error_type: Identifier
     stage: Identifier
@@ -423,7 +423,7 @@ class ReviewAttempt(ContractModel):
 
 
 class ReviewLifecycleScenario(ContractModel):
-    """A strict, stable P5 Review invocation plan."""
+    """A strict, stable Background Review invocation plan."""
 
     review_id: Identifier
     kind: ReviewKind
@@ -439,7 +439,9 @@ class ReviewLifecycleScenario(ContractModel):
     @model_validator(mode="after")
     def validate_lifecycle(self) -> "ReviewLifecycleScenario":
         if self.trigger is not ReviewTrigger.AFTER_FOREGROUND_TURN:
-            raise ValueError("P5 supports only after_foreground_turn triggers")
+            raise ValueError(
+                "Background Review supports only after_foreground_turn triggers"
+            )
         if self.lifecycle is ReviewLifecycle.NORMAL:
             if self.repeat_count != 1 or self.stale_target is not None:
                 raise ValueError("normal Reviews require one attempt and no stale target")
@@ -456,7 +458,7 @@ class ReviewLifecycleScenario(ContractModel):
 
 
 class BackgroundReviewPlan(ReviewLifecycleScenario):
-    """Named P5 plan type retained separately from lifecycle terminology."""
+    """Named plan type retained separately from lifecycle terminology."""
 
 
 class BackgroundReviewExecutionResult(ContractModel):

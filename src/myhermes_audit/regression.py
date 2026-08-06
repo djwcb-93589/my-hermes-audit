@@ -1,4 +1,4 @@
-"""P7 repeat-run projections, immutable baselines, and regression comparison."""
+"""Repeat-run projections, immutable baselines, and regression comparison."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def _nearest_rank(values: Sequence[float | int], quantile: float) -> float | int
 
 
 def _stddev(values: Sequence[float | int]) -> float | None:
-    # P7 uses the sample standard deviation consistently. A singleton has no
+    # Repeat-run summaries use the sample standard deviation consistently. A singleton has no
     # estimate of variation and is intentionally represented as None.
     return None if len(values) < 2 else float(statistics.stdev(values))
 

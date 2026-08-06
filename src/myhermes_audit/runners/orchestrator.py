@@ -1,4 +1,4 @@
-"""Failure-isolated serial orchestration for P1 Audit Suites."""
+"""Failure-isolated serial orchestration for Audit Suites."""
 
 from __future__ import annotations
 
@@ -108,7 +108,9 @@ class AuditOrchestrator:
                 "selected cases must be unique members of the loaded Suite"
             )
         if suite.defaults.seed is not None:
-            raise UnsupportedCaseError("P1 does not provide deterministic model seeding")
+            raise UnsupportedCaseError(
+                "deterministic model seeding is not supported by the Audit runtime"
+            )
 
         # All suite, subject, config, fixture, and evaluator preflight completes
         # before the first Sandbox or worker process is created.
@@ -719,7 +721,7 @@ def _p4_effective_subject_configuration(
         value = resolver(case, variant)
         if isinstance(value, EffectiveSubjectConfiguration):
             return value
-        raise TypeError("P4 configuration resolver returned an invalid contract")
+        raise TypeError("ablation configuration resolver returned an invalid contract")
     capability_report = getattr(runner, "capability_report", None)
     observation = (
         None

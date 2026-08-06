@@ -1,4 +1,4 @@
-"""Deterministic P4 fact matching without embeddings or model calls."""
+"""Deterministic fact matching without embeddings or model calls."""
 
 from __future__ import annotations
 

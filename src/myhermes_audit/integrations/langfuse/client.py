@@ -350,7 +350,7 @@ class LangfuseV4Adapter:
                 updated_count=updated_count,
                 unchanged_count=unchanged_count,
                 warnings=[
-                    "historical Dataset Items are retained; P2.1 performs no destructive prune"
+                    "historical Dataset Items are retained; this operation performs no destructive prune"
                 ],
             )
         except AuditError:

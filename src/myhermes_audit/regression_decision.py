@@ -1,4 +1,4 @@
-"""Pure P7 decision functions.
+"""Pure regression decision functions.
 
 This module intentionally has no Pydantic, CLI, filesystem, network, or Agent
 dependency.  The comparison engine and contract validators both call these

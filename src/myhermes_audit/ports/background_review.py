@@ -18,7 +18,7 @@ from myhermes_audit.contracts.common import Identifier
 class BackgroundReviewEvaluationPort(Protocol):
     """Trial-local Background Review execution without a queue or daemon.
 
-    P5 Review work must be complete before its isolated worker exits.  An
+    Review work must be complete before its isolated worker exits. An
     implementation caches by the stable plan ``review_id``: collecting a result
     is read-only and must never invoke a model, tool, or state write again.
     """

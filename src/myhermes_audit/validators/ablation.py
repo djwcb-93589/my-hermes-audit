@@ -1,4 +1,4 @@
-"""Deterministic P4 required-fact and checkpoint evaluation."""
+"""Deterministic required-fact and checkpoint evaluation for ablations."""
 
 from __future__ import annotations
 

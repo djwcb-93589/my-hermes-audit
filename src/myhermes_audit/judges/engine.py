@@ -43,7 +43,7 @@ class JudgeService:
             evaluators = _judge_evaluators(case)
             if len(evaluators) > 1:
                 raise UnsupportedCaseError(
-                    "P2 supports one answer_quality evaluator per case",
+                    "only one answer_quality evaluator is supported per case",
                     case_id=case.case_id,
                 )
             for evaluator in evaluators:

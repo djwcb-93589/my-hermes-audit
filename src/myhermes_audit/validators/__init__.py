@@ -1,4 +1,4 @@
-"""Deterministic P1 validators."""
+"""Deterministic validators."""
 
 from myhermes_audit.validators.file import FileValidator
 from myhermes_audit.validators.ablation import AblationEvaluation, evaluate_ablation

@@ -714,7 +714,7 @@ class TrialResult(ContractModel):
         )
         if self.variant_id is None:
             # Base (non-ablation) Trials carry the same stable identity fields,
-            # but intentionally do not expose P4 Variant configuration facts.
+            # but intentionally do not expose ablation Variant configuration facts.
             if any(
                 item is not None
                 for item in (
@@ -734,7 +734,7 @@ class TrialResult(ContractModel):
                     )
                 if p4_result_present:
                     raise ValueError(
-                        "P4 Trial facts require a complete Variant identity"
+                        "ablation Trial facts require a complete Variant identity"
                     )
             else:
                 if self.trial_identity.variant_id is not None:
@@ -757,7 +757,7 @@ class TrialResult(ContractModel):
                     )
                 if p4_result_present:
                     raise ValueError(
-                        "P4 Trial facts require a complete Variant identity"
+                        "ablation Trial facts require a complete Variant identity"
                     )
         else:
             p4_identity_fields = (
@@ -770,7 +770,7 @@ class TrialResult(ContractModel):
                 self.effective_subject_configuration,
             )
             if any(item is None for item in p4_identity_fields):
-                raise ValueError("P4 Trial identity fields must be all present")
+                raise ValueError("ablation Trial identity fields must be all present")
             assert self.trial_identity is not None
             assert self.variant_id is not None
             assert self.memory_mode is not None
@@ -786,7 +786,7 @@ class TrialResult(ContractModel):
                 or self.trial_identity.model_identifier
                 != self.effective_subject_configuration.model_identifier
             ):
-                raise ValueError("Trial identity must match its P4 Trial fields")
+                raise ValueError("Trial identity must match its ablation fields")
             if (
                 self.effective_subject_configuration.memory_mode
                 is not self.memory_mode
@@ -800,7 +800,7 @@ class TrialResult(ContractModel):
                 != self.trial_identity.model_identifier
             ):
                 raise ValueError(
-                    "runtime model identifier must match the P4 Trial identity"
+                    "runtime model identifier must match the ablation Trial identity"
                 )
             if (
                 len(self.compression_events)
@@ -1353,7 +1353,7 @@ class AuditRunResult(ContractModel):
             raise ValueError("deepseek_pricing_fingerprint must match cost summaries")
         if set(comparison_case_ids) != p4_case_ids:
             raise ValueError(
-                "ablation comparisons must cover every and only P4 Case"
+                "ablation comparisons must cover every and only ablation Case"
             )
         comparison_by_case = {
             item.case_id: item for item in self.ablation_comparisons

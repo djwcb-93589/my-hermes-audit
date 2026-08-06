@@ -1,4 +1,4 @@
-"""Stable P1 aggregation and local report rendering."""
+"""Stable aggregation and local report rendering."""
 
 from myhermes_audit.reports.aggregate import (
     aggregate_audit,

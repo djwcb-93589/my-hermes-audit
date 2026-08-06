@@ -1,4 +1,4 @@
-"""Deterministic P5 Background Review validation.
+"""Deterministic Background Review validation.
 
 This module intentionally consumes only Audit contracts produced by the Worker.
 It imports no ``hermes.*`` module and never replays a Review, model call, tool
@@ -43,7 +43,7 @@ def evaluate_background_review_expectation(
     *,
     metric_prefix: str,
 ) -> list[MetricResult]:
-    """Evaluate all six P5 dimensions for one declared Review expectation."""
+    """Evaluate all six dimensions for one declared Review expectation."""
 
     review_id = expectation.review_id
     result = (

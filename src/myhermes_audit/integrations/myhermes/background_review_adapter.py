@@ -1,4 +1,4 @@
-"""Trial-local P5 adapter over MyHermes' public Background Review surface.
+"""Trial-local adapter over MyHermes' public Background Review surface.
 
 This module is imported only from the isolated worker after its environment and
 filesystem boundaries have been validated.  It deliberately avoids MyHermes'
@@ -167,7 +167,7 @@ class MyHermesBackgroundReviewAdapter(BackgroundReviewEvaluationPort):
             tool_registry=self._tool_registry,
         )
         # The executor is only an inert public dependency required by the
-        # Coordinator.  P5 calls neither coordinator.after_foreground_result()
+        # Coordinator.  This adapter calls neither coordinator.after_foreground_result()
         # nor executor.submit(); this adapter drives each claim synchronously.
         coordinator = BackgroundReviewCoordinator(
             driver_registry=self._review_registry,
@@ -1004,7 +1004,7 @@ class MyHermesBackgroundReviewAdapter(BackgroundReviewEvaluationPort):
 
     @staticmethod
     def _memory_snapshot_projection(raw_memory) -> ReviewMemorySnapshot:
-        """Hash public Memory state before a P5 Artifact can be published."""
+        """Hash public Memory state before a Review Artifact can be published."""
 
         return ReviewMemorySnapshot(
             snapshot_id=raw_memory.snapshot_id,
@@ -1165,7 +1165,7 @@ class MyHermesBackgroundReviewAdapter(BackgroundReviewEvaluationPort):
                 )
             if len(normalized_attempts) == 1:
                 # A setup/claim failure can prevent the first run, but the
-                # stable P5 result still records that no second execution was
+                # The stable result still records that no second execution was
                 # attempted.  It creates no new identity or side effect.
                 normalized_attempts.append(
                     self._attempt(

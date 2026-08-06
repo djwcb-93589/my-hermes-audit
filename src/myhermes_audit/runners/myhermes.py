@@ -236,7 +236,7 @@ class MyHermesTrialRunner:
         report = self._capability_report
         if report is None:
             raise AblationCapabilityError(
-                "P4 capability report is unavailable",
+                "ablation capability report is unavailable",
                 case_id=case.case_id,
                 variant_id=variant.variant_id,
             )
@@ -392,18 +392,18 @@ class MyHermesTrialRunner:
             CaseMode.SCRIPTED_MULTI_TURN,
         }:
             raise UnsupportedCaseError(
-                "P1 supports only single_turn and scripted_multi_turn",
+                "only single_turn and scripted_multi_turn are supported",
                 case_id=case.case_id,
                 mode=case.mode.value,
             )
         if "enabled_toolsets" not in case.execution.model_fields_set:
             raise UnsupportedCaseError(
-                "P1 cases must explicitly declare execution.enabled_toolsets",
+                "cases must explicitly declare execution.enabled_toolsets",
                 case_id=case.case_id,
             )
         if case.execution.workdir != "workspace":
             raise UnsupportedCaseError(
-                "P1 requires execution.workdir=workspace",
+                "execution.workdir must be workspace",
                 case_id=case.case_id,
             )
         if ToolsetName.SKILL_READ in case.execution.enabled_toolsets:
@@ -414,7 +414,7 @@ class MyHermesTrialRunner:
             turn.role is not ConversationRole.USER for turn in case.input.turns
         ):
             raise UnsupportedCaseError(
-                "P1 scripted turns must contain only user messages",
+                "scripted turns must contain only user messages",
                 case_id=case.case_id,
             )
         review_case = _is_background_review_case(case)
@@ -450,7 +450,7 @@ class MyHermesTrialRunner:
             )
         if case.expected.background_reviews and not review_case:
             raise UnsupportedCaseError(
-                "Background Review expectations require an explicit P5 plan",
+                "Background Review expectations require an explicit plan",
                 case_id=case.case_id,
             )
         if memory_case:
@@ -460,7 +460,7 @@ class MyHermesTrialRunner:
         if review_case:
             if case.ablation is not None:
                 raise UnsupportedCaseError(
-                    "P5 Background Review plans cannot be combined with P4 ablations",
+                    "Background Review plans cannot be combined with ablations",
                     case_id=case.case_id,
                 )
             self._preflight_background_review_case(case)
@@ -469,12 +469,12 @@ class MyHermesTrialRunner:
             for item in case.expected.texts
         ):
             raise UnsupportedCaseError(
-                "P1 text expectations support only final_output",
+                "text expectations support only final_output",
                 case_id=case.case_id,
             )
         if any(item.calls for item in case.expected.tool_trajectories):
             raise UnsupportedCaseError(
-                "P1 does not enforce exact ordered tool argument trajectories",
+                "exact ordered tool argument trajectories are not enforced",
                 case_id=case.case_id,
             )
         preflight_evaluators(case)
@@ -723,7 +723,7 @@ class MyHermesTrialRunner:
         strategy = case.execution.memory_strategy
         if strategy is None:
             raise MemoryCapabilityError(
-                "P3 Memory cases must explicitly declare execution.memory_strategy",
+                "Memory cases must explicitly declare execution.memory_strategy",
                 case_id=case.case_id,
                 missing_capability="declared_memory_strategy",
             )
@@ -870,7 +870,7 @@ class MyHermesTrialRunner:
             return
         if report is None:
             raise AblationCapabilityError(
-                "Subject capability report is unavailable for P4",
+                "Subject capability report is unavailable for ablation",
                 case_id=case.case_id,
             )
         capability_summary = _compression_capability_summary(report)
@@ -988,7 +988,7 @@ class MyHermesTrialRunner:
             report = self._capability_report
             if report is None:
                 raise AblationCapabilityError(
-                    "P4 capability report is unavailable",
+                "ablation capability report is unavailable",
                     case_id=case.case_id,
                     variant_id=variant.variant_id,
                 )
@@ -1138,7 +1138,7 @@ class MyHermesTrialRunner:
                 or configuration.model_identifier_source is not model_resolution.source
             ):
                 raise WorkerProtocolError(
-                    "effective model identity changed after P4 preflight",
+                    "effective model identity changed after ablation preflight",
                     case_id=case.case_id,
                     variant_id=variant.variant_id if variant is not None else None,
                 )
@@ -2046,7 +2046,7 @@ def _redact_ablation_facts(
     result: MyHermesWorkerResult,
     artifact: AblationArtifact | None,
 ) -> tuple[MyHermesWorkerResult, AblationArtifact | None]:
-    """Keep P4 protocol facts content-free even if a Subject exposes values."""
+    """Keep ablation protocol facts content-free even if a Subject exposes values."""
 
     def safe_observation(item):
         return item.model_copy(
@@ -2088,9 +2088,9 @@ def _redact_background_review_facts(
     result: MyHermesWorkerResult,
     _sensitive_values: tuple[str, ...],
 ) -> MyHermesWorkerResult:
-    """Keep P5 result/artifact facts safe for local retention and replay.
+    """Keep Background Review result/artifact facts safe for local retention and replay.
 
-    Worker-produced P5 evidence and snapshots use dedicated content-free
+    Worker-produced Review evidence and snapshots use dedicated content-free
     contracts.  The parent therefore preserves their hashes, relationships,
     and state revisions as-is, while replacing every remaining free-form
     outcome or diagnostic string before it regenerates the three artifacts.
@@ -2156,7 +2156,7 @@ def _write_background_review_artifacts(
     results: Sequence[BackgroundReviewExecutionResult],
     errors: Sequence[BackgroundReviewExecutionError],
 ) -> None:
-    """Rewrite all P5 projections from the same redacted parent fact set."""
+    """Rewrite all Review projections from the same redacted parent fact set."""
 
     artifact_paths = (
         paths.background_review_results,
@@ -2166,7 +2166,9 @@ def _write_background_review_artifacts(
     if all(path is None for path in artifact_paths):
         return
     if any(path is None for path in artifact_paths):
-        raise WorkerProtocolError("P5 worker Artifact paths are incomplete")
+        raise WorkerProtocolError(
+            "Background Review worker Artifact paths are incomplete"
+        )
     results_path, evidence_path, snapshots_path = artifact_paths
     assert results_path is not None
     assert evidence_path is not None
@@ -2239,7 +2241,7 @@ def _case_turns(
     if configuration is None:
         return turns
     if variant_id is None:
-        raise AblationVariantError("P4 turns require variant_id")
+        raise AblationVariantError("ablation turns require variant_id")
     variant_digest = hashlib.sha256(variant_id.encode("utf-8")).hexdigest()[:16]
     if configuration.session_context_mode.value == "subject_session":
         return [
@@ -2835,7 +2837,7 @@ def _validate_worker_artifacts(
     if request.effective_subject_configuration is None:
         if ablation_artifact is not None or result.ablation_artifact is not None:
             raise WorkerProtocolError(
-                "non-P4 worker returned an Ablation Artifact"
+                "worker without ablation returned an Ablation Artifact"
             )
         if any(
             (
@@ -2844,10 +2846,12 @@ def _validate_worker_artifacts(
                 result.fact_context_observations,
             )
         ):
-            raise WorkerProtocolError("non-P4 worker returned P4 facts")
+            raise WorkerProtocolError("worker without ablation returned ablation facts")
     else:
         if ablation_artifact is None:
-            raise WorkerProtocolError("P4 worker did not return an Ablation Artifact")
+            raise WorkerProtocolError(
+                "ablation worker did not return an Ablation Artifact"
+            )
         if result.ablation_artifact != "artifacts/ablation.json":
             raise WorkerProtocolError(
                 "worker result names an unexpected Ablation Artifact"
@@ -2867,7 +2871,7 @@ def _validate_worker_artifacts(
             or result.effective_subject_configuration
             != request.effective_subject_configuration
         ):
-            raise WorkerProtocolError("worker P4 identity does not match request")
+            raise WorkerProtocolError("worker ablation identity does not match request")
         if (
             ablation_artifact.compression_events != result.compression_events
             or ablation_artifact.context_diagnostics
@@ -2890,7 +2894,9 @@ def _validate_worker_artifacts(
                 result.background_review_snapshots_artifact,
             )
         ) or result.background_review_results or result.background_review_errors:
-            raise WorkerProtocolError("non-P5 worker returned Background Review facts")
+            raise WorkerProtocolError(
+                "worker without Background Review returned Background Review facts"
+            )
     else:
         if any(
             item is None
@@ -2900,7 +2906,9 @@ def _validate_worker_artifacts(
                 review_snapshots_artifact,
             )
         ):
-            raise WorkerProtocolError("P5 worker did not return all Review Artifacts")
+            raise WorkerProtocolError(
+                "Background Review worker did not return all Review Artifacts"
+            )
         if (
             result.background_review_results_artifact
             != "artifacts/background-review-results.json"
@@ -2971,7 +2979,7 @@ def _fallback_background_review_results(
     error_type: str,
     message: str,
 ) -> list[BackgroundReviewExecutionResult]:
-    """Produce complete, side-effect-free P5 facts for parent fallbacks.
+    """Produce complete, side-effect-free Review facts for parent fallbacks.
 
     A timeout or worker-envelope failure must not silently erase a declared
     Review Plan.  These facts say only that no executable claim lifecycle was
@@ -3041,7 +3049,7 @@ def _merge_recovered_background_review_results(
     error_type: str,
     message: str,
 ) -> list[BackgroundReviewExecutionResult]:
-    """Retain verified checkpoint facts and fill only missing P5 plans."""
+    """Retain verified checkpoint facts and fill only missing Review plans."""
 
     recovered_by_id = {item.review_id: item for item in recovered}
     missing_plans = [plan for plan in plans if plan.review_id not in recovered_by_id]
@@ -3089,7 +3097,7 @@ def _fallback_scenario_results(
     hard_timeout_seconds: int | None = None,
     trial_watchdog_timed_out: bool = False,
 ) -> tuple[list[object], list[ScenarioError]]:
-    """Preserve declared P6.1 coverage when the Worker envelope is lost."""
+    """Preserve declared scenario coverage when the Worker envelope is lost."""
 
     results: list[object] = []
     errors: list[ScenarioError] = []
@@ -3351,7 +3359,7 @@ def _ensure_empty_worker_artifacts(
             or paths.background_review_evidence is None
             or paths.background_review_snapshots is None
         ):
-            raise WorkerProtocolError("P5 fallback paths are incomplete")
+            raise WorkerProtocolError("Background Review fallback paths are incomplete")
         results = list(background_review_results) or _fallback_background_review_results(
             background_review_plans,
             error_type="background_review_protocol_error",
@@ -3473,7 +3481,7 @@ def _recover_parent_background_review_results(
     list[BackgroundReviewExecutionResult],
     list[BackgroundReviewExecutionError],
 ]:
-    """Recover a validated P5 result checkpoint after worker loss.
+    """Recover a validated Review result checkpoint after worker loss.
 
     The result Artifact contains the content-free evidence and snapshots for
     each plan.  It is sufficient for recovery even if termination interrupted

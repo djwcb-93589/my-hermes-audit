@@ -22,7 +22,7 @@ class ToolTrajectoryValidator:
     ) -> MetricResult:
         if expectation.calls:
             raise UnsupportedCaseError(
-                "P1 does not enforce exact ordered tool call arguments"
+                "exact ordered tool call arguments are not enforced"
             )
         if context.tool_calls is None:
             raise ValidatorError("tool Observation data is unavailable")

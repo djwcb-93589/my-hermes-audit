@@ -187,36 +187,36 @@ class MyHermesWorkerRequest(ContractModel):
             raise ValueError("disabled strategy cannot enable the memory toolset")
         p4_enabled = self.effective_subject_configuration is not None
         if p4_enabled and self.protocol_version != WORKER_PROTOCOL_VERSION:
-            raise ValueError("P4 requests require the current Worker protocol")
+            raise ValueError("ablation requests require the current Worker protocol")
         if p4_enabled != (self.variant_id is not None):
-            raise ValueError("P4 request requires Variant and effective configuration")
+            raise ValueError("ablation request requires Variant and effective configuration")
         if p4_enabled != (self.artifact_paths.ablation is not None):
-            raise ValueError("P4 request requires an Ablation Artifact path")
+            raise ValueError("ablation request requires an Ablation Artifact path")
         if not p4_enabled and (
             self.required_fact_expectations or self.checkpoints
         ):
-            raise ValueError("P4 expectations require an effective configuration")
+            raise ValueError("ablation expectations require an effective configuration")
         if p4_enabled:
             configuration = self.effective_subject_configuration
             if configuration is None:
-                raise ValueError("P4 effective configuration is missing")
+                raise ValueError("ablation effective configuration is missing")
             if len(self.turns) > configuration.maximum_turns:
-                raise ValueError("worker turns exceed the P4 maximum_turns limit")
+                raise ValueError("worker turns exceed the ablation maximum_turns limit")
             if any(item.after_turn > len(self.turns) for item in self.checkpoints):
                 raise ValueError("worker checkpoint exceeds the requested turns")
             long_term = configuration.include_memory
             if long_term != (self.memory_strategy is not None):
-                raise ValueError("worker Memory request must match P4 Memory mode")
+                raise ValueError("worker Memory request must match the ablation Memory mode")
             if self.memory_strategy is not configuration.memory_strategy:
-                raise ValueError("worker Memory strategy must match P4 configuration")
+                raise ValueError("worker Memory strategy must match the ablation configuration")
             if configuration.memory_tool_enabled != (
                 ToolsetName.MEMORY in self.enabled_toolsets
             ):
-                raise ValueError("worker memory toolset must match P4 configuration")
+                raise ValueError("worker memory toolset must match the ablation configuration")
             if not long_term and (
                 self.memory_fixture is not None or self.memory_queries
             ):
-                raise ValueError("non-long-term P4 modes cannot expose Memory facts")
+                raise ValueError("non-long-term ablation modes cannot expose Memory facts")
         p5_enabled = bool(self.background_review_plans)
         p5_paths = (
             self.artifact_paths.background_review_results,
@@ -224,17 +224,21 @@ class MyHermesWorkerRequest(ContractModel):
             self.artifact_paths.background_review_snapshots,
         )
         if p5_enabled != all(path is not None for path in p5_paths):
-            raise ValueError("P5 Review requests require all Review Artifact paths")
+            raise ValueError(
+                "Background Review requests require all Review Artifact paths"
+            )
         if not p5_enabled and any(path is not None for path in p5_paths):
-            raise ValueError("non-P5 requests cannot name Review Artifact paths")
+            raise ValueError(
+                "requests without Background Review plans cannot name Review Artifact paths"
+            )
         if self.skill_fixtures and not p5_enabled:
-            raise ValueError("Skill fixtures require a P5 Background Review plan")
+            raise ValueError("Skill fixtures require a Background Review plan")
         plan_ids = [plan.review_id for plan in self.background_review_plans]
         if len(plan_ids) != len(set(plan_ids)):
-            raise ValueError("P5 Review plan IDs must not repeat")
+            raise ValueError("Background Review plan IDs must not repeat")
         scenario_ids = [item.scenario_id for item in self.scenarios]
         if len(scenario_ids) != len(set(scenario_ids)):
-            raise ValueError("P6 scenario IDs must not repeat")
+            raise ValueError("scenario IDs must not repeat")
         process_scenario_ids = [
             item.scenario_id
             for item in self.scenarios
@@ -301,7 +305,7 @@ class MyHermesWorkerRequest(ContractModel):
                 "each Process scenario requires one output Artifact path"
             )
         if not self.scenarios and self.artifact_paths.toolchain_results is not None:
-            raise ValueError("non-P6 requests cannot name Toolchain Artifacts")
+            raise ValueError("requests without scenarios cannot name Toolchain Artifacts")
         return self
 
 
@@ -477,14 +481,14 @@ class MemoryArtifact(ContractModel):
             for item in self.snapshots
         ):
             raise ValueError(
-                "Memory Artifact snapshots require matching P3 semantics"
+                "Memory Artifact snapshots require matching Memory semantics"
             )
         if any(
             item.strategy is not self.strategy or item.provider != self.provider
             for item in self.query_results
         ):
             raise ValueError(
-                "Memory Artifact queries require matching P3 semantics"
+                "Memory Artifact queries require matching Memory semantics"
             )
         if len({item.provider for item in self.snapshots}) > 1:
             raise ValueError("Memory Artifact snapshots must share a provider")
@@ -542,7 +546,7 @@ class AblationArtifact(ContractModel):
 
 
 class BackgroundReviewArtifact(ContractModel):
-    """Worker-owned P5 result artifact; prompt and claim material are absent."""
+    """Worker-owned Review result artifact; prompt and claim material are absent."""
 
     protocol_version: WorkerProtocolVersion = WORKER_PROTOCOL_VERSION
     trial_id: Identifier
@@ -892,11 +896,11 @@ class MyHermesWorkerResult(ContractModel):
             raise ValueError("worker Memory state change IDs must not repeat")
         p4_enabled = self.effective_subject_configuration is not None
         if p4_enabled and self.protocol_version != WORKER_PROTOCOL_VERSION:
-            raise ValueError("P4 results require the current Worker protocol")
+            raise ValueError("ablation results require the current Worker protocol")
         if p4_enabled != (self.variant_id is not None):
-            raise ValueError("worker P4 result requires Variant and configuration")
+            raise ValueError("worker ablation result requires Variant and configuration")
         if p4_enabled != (self.ablation_artifact is not None):
-            raise ValueError("worker P4 result requires an Ablation Artifact")
+            raise ValueError("worker ablation result requires an Ablation Artifact")
         if not p4_enabled and any(
             (
                 self.compression_events,
@@ -904,7 +908,9 @@ class MyHermesWorkerResult(ContractModel):
                 self.fact_context_observations,
             )
         ):
-            raise ValueError("non-P4 worker results cannot contain P4 observations")
+            raise ValueError(
+                "worker results without ablation cannot contain ablation observations"
+            )
         if p4_enabled and len(self.compression_events) > (
             self.effective_subject_configuration.maximum_compression_events
         ):
@@ -918,7 +924,9 @@ class MyHermesWorkerResult(ContractModel):
             self.background_review_errors
         ) or any(item is not None for item in review_artifacts)
         if review_present and not all(item is not None for item in review_artifacts):
-            raise ValueError("P5 worker results require all Review Artifact refs")
+            raise ValueError(
+                "Background Review worker results require all Review Artifact refs"
+            )
         review_ids = [item.review_id for item in self.background_review_results]
         if len(review_ids) != len(set(review_ids)):
             raise ValueError("worker Background Review result IDs must be unique")

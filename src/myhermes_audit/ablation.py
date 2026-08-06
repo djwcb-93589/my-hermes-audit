@@ -1,4 +1,4 @@
-"""P4 Variant configuration, stable identity, diagnostics, and replay comparison."""
+"""Variant configuration, stable identity, diagnostics, and replay comparison."""
 
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ def effective_subject_configuration(
     plan = case.ablation
     if plan is None:
         raise AblationVariantError(
-            "P4 Variant requires an ablation plan",
+            "Variant requires an ablation plan",
             case_id=case.case_id,
             variant_id=variant.variant_id,
         )

@@ -30,7 +30,7 @@ class TextValidator:
     ) -> MetricResult:
         if expectation.target is not TextTarget.FINAL_OUTPUT:
             raise UnsupportedCaseError(
-                "P1 TextValidator supports only final_output",
+                "TextValidator supports only final_output",
                 target=expectation.target.value,
             )
         output = require_text_output(context)
@@ -94,7 +94,7 @@ def _compile_safe_pattern(pattern: str, *, case_sensitive: bool) -> re.Pattern[s
         raise ValidatorError("regex uses unsupported advanced constructs")
     if any(character in pattern for character in "()*+{}"):
         raise ValidatorError(
-            "regex uses grouping or unbounded repetition outside the P1 safe subset"
+            "regex uses grouping or unbounded repetition outside the supported safe subset"
         )
     try:
         return re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)

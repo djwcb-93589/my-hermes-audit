@@ -646,7 +646,7 @@ class AuditCase(ContractModel):
                 raise ValueError("required facts require an ablation plan")
         else:
             if self.mode is CaseMode.SIMULATED_USER:
-                raise ValueError("P4 ablation does not support simulated_user mode")
+                raise ValueError("ablation does not support simulated_user mode")
             turn_count = 1 if self.input.message is not None else len(self.input.turns)
             if turn_count > self.ablation.maximum_turns:
                 raise ValueError("case turns cannot exceed ablation.maximum_turns")

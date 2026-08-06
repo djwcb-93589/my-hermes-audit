@@ -949,7 +949,7 @@ def _publish_evaluators(
 
 
 def _safe_background_review_metric(metric) -> dict:
-    """Project a fixed P5 metric allow-list, never arbitrary validator data."""
+    """Project a fixed Review metric allow-list, never arbitrary validator data."""
 
     value = metric.value if isinstance(metric.value, dict) else {}
     metric_type = metric.metadata.get("metric_type")
@@ -1593,7 +1593,7 @@ def _publish_memory(
             or snapshot.strategy is None
             or snapshot.provider is None
         ):
-            raise ValueError("P3 Memory snapshot semantics are incomplete")
+            raise ValueError("Memory snapshot semantics are incomplete")
         span = root.start_observation(
             name=MEMORY_SNAPSHOT_NAME,
             as_type="span",
@@ -1643,7 +1643,7 @@ def _memory_item_projection(
 
 
 def _publish_background_reviews(root: Any, request: LangfuseTrialRequest) -> None:
-    """Replay only safe P5 facts; never publish evidence or state bodies."""
+    """Replay only safe Review facts; never publish evidence or state bodies."""
 
     trial = request.trial
     if not _has_background_review_facts(request):

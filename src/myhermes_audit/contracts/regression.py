@@ -1,4 +1,4 @@
-"""Versioned, content-safe contracts for P7 baselines and comparisons.
+"""Versioned, content-safe contracts for baselines and comparisons.
 
 The contracts intentionally contain projections of an ``AuditRunResult`` only.
 They never carry prompts, model responses, memory text, review evidence, or
@@ -80,7 +80,7 @@ _STRICT_DECIMAL_TEXT = re.compile(
 
 
 def parse_metric_number(value: object) -> int | float | Decimal | None:
-    """Parse the finite numeric forms used by versioned P7 Metric contracts.
+    """Parse the finite numeric forms used by versioned Metric contracts.
 
     Pydantic's JSON mode serializes ``Decimal`` as text.  The parser therefore
     accepts only a strict decimal grammar for strings and never falls back to
@@ -451,7 +451,7 @@ class MetricSnapshot(ContractModel):
 
 
 class BenchmarkSummary(ContractModel):
-    """Safe suite projection plus P7 distribution statistics."""
+    """Safe suite projection plus repeat-run distribution statistics."""
 
     summary: AuditSummary
     task_success_sample_count: NonNegativeInt
@@ -813,7 +813,7 @@ class CaseRegressionSummary(ContractModel):
     current_task_success_passed_count: NonNegativeInt
     current_task_success_rate: StrictFloat | None = Field(..., ge=0, le=1)
     task_success_rate_delta: StrictFloat | None = Field(...)
-    # Deprecated compatibility alias; P7 output uses task_success_rate_delta.
+    # Deprecated compatibility alias; current output uses task_success_rate_delta.
     pass_rate_delta: StrictFloat | None = None
     baseline_failure_categories: dict[NonEmptyText, NonNegativeInt] = Field(default_factory=dict)
     current_failure_categories: dict[NonEmptyText, NonNegativeInt] = Field(default_factory=dict)

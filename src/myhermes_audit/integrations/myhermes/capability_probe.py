@@ -1294,8 +1294,8 @@ def _run_probe(request: SubjectCapabilityProbeRequest) -> SubjectCapabilityRepor
         required=False,
     )
 
-    # P5 is deliberately optional at probe level so a Subject without Review
-    # support remains compatible with P0-P4.  These checks only inspect public
+    # Background Review is optional at probe level, so a Subject without Review
+    # support remains compatible with the core execution path. These checks only inspect public
     # symbols/signatures; they never instantiate stores, create a database, or
     # obtain a Review claim/token.
     review_runtime = builder.check(

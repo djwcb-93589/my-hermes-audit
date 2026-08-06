@@ -1,4 +1,4 @@
-"""P1 evaluator planning and deterministic validator dispatch."""
+"""Evaluator planning and deterministic validator dispatch."""
 
 from __future__ import annotations
 
@@ -113,7 +113,7 @@ class ValidatorResultsArtifact(ContractModel):
         )
         if has_structured_p4 != has_compression:
             raise ValueError(
-                "structured P4 results require exactly one compression evaluator"
+                "structured ablation results require exactly one compression evaluator"
             )
         return self
 
@@ -147,7 +147,7 @@ class ValidatorResultsArtifact(ContractModel):
 
     @property
     def required_fact_hard_gates_passed(self) -> bool | None:
-        """Aggregate required P4 fact and checkpoint gates independently."""
+        """Aggregate required ablation fact and checkpoint gates independently."""
 
         return self.required_gate_status(
             evaluator_kind=EvaluatorKind.COMPRESSION,
@@ -166,7 +166,7 @@ class ValidatorResultsArtifact(ContractModel):
 
     @property
     def review_hard_gates_passed(self) -> bool | None:
-        """Aggregate only the required P5 Review hard gates."""
+        """Aggregate only the required Review hard gates."""
 
         return self.required_gate_status(
             evaluator_kind=EvaluatorKind.BACKGROUND_REVIEW,
@@ -299,7 +299,7 @@ def preflight_evaluators(case: AuditCase) -> None:
                 for expectation in case.expected.tool_trajectories
             ):
                 raise UnsupportedCaseError(
-                    "tool_trajectory expectations must declare a P1 constraint",
+                    "tool_trajectory expectations must declare a supported constraint",
                     case_id=case.case_id,
                     evaluator_id=evaluator.evaluator_id,
                 )
@@ -339,13 +339,13 @@ def preflight_evaluators(case: AuditCase) -> None:
         if evaluator.kind is EvaluatorKind.COMPRESSION:
             if evaluator.config:
                 raise UnsupportedCaseError(
-                    "compression evaluator config must be empty; use strict P4 contracts",
+                    "compression evaluator config must be empty; use the declared ablation contract",
                     case_id=case.case_id,
                     evaluator_id=evaluator.evaluator_id,
                 )
             if compression_covered:
                 raise UnsupportedCaseError(
-                    "P4 expectations cannot be evaluated more than once",
+                    "ablation expectations cannot be evaluated more than once",
                     case_id=case.case_id,
                     evaluator_id=evaluator.evaluator_id,
                 )
@@ -361,7 +361,7 @@ def preflight_evaluators(case: AuditCase) -> None:
             ) or any(item.required for item in case.ablation.checkpoints)
             if evaluator.required is not has_p4_hard_gate:
                 raise UnsupportedCaseError(
-                    "compression evaluator required must match declared P4 hard gates",
+                    "compression evaluator required must match declared ablation hard gates",
                     case_id=case.case_id,
                     evaluator_id=evaluator.evaluator_id,
                 )
@@ -370,7 +370,7 @@ def preflight_evaluators(case: AuditCase) -> None:
         if evaluator.kind is EvaluatorKind.BACKGROUND_REVIEW:
             if evaluator.config:
                 raise UnsupportedCaseError(
-                    "background_review evaluator config must be empty; use strict P5 contracts",
+                    "background_review evaluator config must be empty; use the declared Review contract",
                     case_id=case.case_id,
                     evaluator_id=evaluator.evaluator_id,
                 )
@@ -403,7 +403,7 @@ def preflight_evaluators(case: AuditCase) -> None:
                 )
             if not case.scenarios:
                 raise UnsupportedCaseError(
-                    "scenario evaluator requires at least one P6 scenario",
+                    "scenario evaluator requires at least one declared scenario",
                     case_id=case.case_id,
                     evaluator_id=evaluator.evaluator_id,
                 )
@@ -417,7 +417,7 @@ def preflight_evaluators(case: AuditCase) -> None:
             scenario_covered = True
             continue
         raise UnsupportedCaseError(
-            "evaluator kind is outside the P1 boundary",
+            "evaluator kind is not supported by the current validation contract",
             case_id=case.case_id,
             evaluator_id=evaluator.evaluator_id,
             evaluator_kind=evaluator.kind.value,
@@ -447,7 +447,7 @@ def preflight_evaluators(case: AuditCase) -> None:
         orphan_groups.append("scenarios")
     if orphan_groups:
         raise UnsupportedCaseError(
-            "P1 expectations must be attached to an evaluator",
+            "expectations must be attached to an evaluator",
             case_id=case.case_id,
             expectation_groups=orphan_groups,
         )
@@ -609,7 +609,7 @@ def _evaluate_one(
         ]
     else:
         raise UnsupportedCaseError(
-            "evaluator kind is outside the P1 boundary",
+            "evaluator kind is not supported by the current validation contract",
             evaluator_kind=evaluator.kind.value,
         )
 
@@ -672,7 +672,7 @@ def _deterministic_group(evaluator: EvaluatorSpec, *, case_id: str) -> str:
 def _validate_tool_config(evaluator: EvaluatorSpec, *, case_id: str) -> None:
     if evaluator.config:
         raise UnsupportedCaseError(
-            "P1 tool_trajectory evaluator config must be empty",
+            "tool_trajectory evaluator config must be empty",
             case_id=case_id,
             evaluator_id=evaluator.evaluator_id,
         )

@@ -1,4 +1,4 @@
-"""P0 公共合同导出。"""
+"""公共合同导出。"""
 
 from myhermes_audit.contracts.ablation import (
     AblationComparisonResult,

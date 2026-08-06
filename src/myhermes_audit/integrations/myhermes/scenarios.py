@@ -1,4 +1,4 @@
-"""Worker-local projections for P6.1 Toolchain and Process scenarios.
+"""Worker-local projections for Toolchain and Process scenarios.
 
 Only response messages and the public ObservationBundle are consumed.  Audit
 never starts a Process, calls a Tool handler, or imports a ProcessManager.
