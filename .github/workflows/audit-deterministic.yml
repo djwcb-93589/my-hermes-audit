@@ -203,17 +203,102 @@ jobs:
           fi
           printf '%s\n' 'secret_scan=passed' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Record deterministic failure safely
-        if: failure()
+      - name: Prepare deterministic safe artifact publication
+        if: success()
+        id: completed_artifact_contract
         shell: bash
         run: |
           set -euo pipefail
+          audit_python="$GITHUB_WORKSPACE/.venv/bin/python"
+          "$audit_python" tools/p8_ci_support.py validate-fact \
+            --kind run --path .p8-ci/contract-smoke-result.json
+          "$audit_python" tools/p8_ci_support.py validate-fact \
+            --kind baseline --path .p8-ci/contract-smoke-baseline.json
+          "$audit_python" tools/p8_ci_support.py validate-fact \
+            --kind regression --path .p8-ci/contract-smoke-regression.json
+          "$audit_python" - <<'PY'
+          import json
+          from pathlib import Path
+
+          from myhermes_audit.artifacts import atomic_write_json, atomic_write_text
+
+          files = (
+              ".p8-ci/contract-smoke-result.json",
+              ".p8-ci/contract-smoke-baseline.json",
+              ".p8-ci/contract-smoke-regression.json",
+              ".p8-ci/contract-smoke-run.md",
+              ".p8-ci/contract-smoke-baseline.md",
+              ".p8-ci/contract-smoke-regression.md",
+              ".p8-ci/safe-artifact-manifest.json",
+              ".p8-ci/console-summary.txt",
+          )
+          for value in files[:-2]:
+              path = Path(value)
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit("deterministic artifact contract failed")
+          manifest = {
+              "artifact_manifest_version": "p8-ci-safe-manifest-v1",
+              "artifact_status": "complete",
+              "fact_source": [
+                  "AuditRunResult",
+                  "AuditBaseline",
+                  "AuditRegressionReport",
+              ],
+              "files": list(files),
+          }
+          atomic_write_json(Path(files[-2]), manifest)
+          atomic_write_text(
+              Path(files[-1]),
+              "\n".join(
+                  (
+                      "artifact_status=complete",
+                      "strict_result=validated",
+                      "strict_baseline=validated",
+                      "strict_regression=validated",
+                      "markdown=derived_from_strict_json",
+                      "judge=disabled",
+                      "langfuse=disabled",
+                  )
+              )
+              + "\n",
+          )
+          PY
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Record deterministic failure artifacts safely
+        if: failure() && steps.completed_artifact_contract.outputs.ready != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .p8-ci
+          printf '%s\n' '{"artifact_manifest_version":"p8-ci-safe-manifest-v1","artifact_status":"unavailable","stage":"deterministic_contracts","reason":"deterministic_contract_failed","exit_code":1,"files":[".p8-ci/safe-artifact-manifest.json",".p8-ci/console-summary.txt"]}' > .p8-ci/safe-artifact-manifest.json
+          printf '%s\n' 'artifact_status=unavailable' 'stage=deterministic_contracts' 'reason=deterministic_contract_failed' 'exit_code=1' 'details=redacted' > .p8-ci/console-summary.txt
           printf '%s\n' 'status=failed stage=deterministic_contracts details=redacted' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload deterministic safe artifacts
-        if: always()
+      - name: Upload deterministic completed safe artifacts
+        if: always() && steps.completed_artifact_contract.outputs.ready == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: audit-deterministic-${{ github.sha }}-${{ github.run_id }}
-          if-no-files-found: warn
-          path: .p8-ci/
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            .p8-ci/contract-smoke-result.json
+            .p8-ci/contract-smoke-baseline.json
+            .p8-ci/contract-smoke-regression.json
+            .p8-ci/contract-smoke-run.md
+            .p8-ci/contract-smoke-baseline.md
+            .p8-ci/contract-smoke-regression.md
+            .p8-ci/safe-artifact-manifest.json
+            .p8-ci/console-summary.txt
+
+      - name: Upload deterministic failure summary
+        if: always() && failure() && steps.completed_artifact_contract.outputs.ready != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: audit-deterministic-failure-${{ github.sha }}-${{ github.run_id }}
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            .p8-ci/safe-artifact-manifest.json
+            .p8-ci/console-summary.txt

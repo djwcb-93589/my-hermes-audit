@@ -136,8 +136,9 @@ static compilation, tracked-file secret scanning, and a small in-memory
 contract smoke. The smoke constructs existing strict Result, Baseline, and
 Regression objects without a Trial; validates their JSON reload; renders each
 with the production renderer; verifies Markdown overwrite refusal; and rejects
-a wrong Result schema. Its artifacts contain only safe synthetic facts and
-generated schema/help/validation records.
+a wrong Result schema. The upload allowlist contains only its strict synthetic
+facts, corresponding Markdown, safe Manifest, and safe console summary; local
+schema/help/validation records are not uploaded.
 
 `audit-representative.yml` is manual only. It runs `uv sync --locked` for Audit,
 exports the reviewed Subject's locked runtime requirements, installs those
@@ -170,6 +171,29 @@ rendering of strict JSON. Invalid or partial JSON is not uploaded. Workflows
 never upload raw logs, Sandboxes, SQLite, Subject configuration bodies, prompts,
 model output, Memory stores, Review evidence, credentials, raw responses, or
 user IDs.
+
+All safe CI artifacts live under the hidden `.p8-ci/` directory. Every
+`actions/upload-artifact` step therefore sets `include-hidden-files: true` and
+`if-no-files-found: error`; an empty Artifact is a CI configuration failure, not
+a warning. Normal uploads use fixed allowlists only:
+
+- Deterministic: `contract-smoke-result.json`, `contract-smoke-baseline.json`,
+  `contract-smoke-regression.json`, their three corresponding Markdown files,
+  `safe-artifact-manifest.json`, and `console-summary.txt`.
+- Representative: `representative-result.json`,
+  `representative-report.md`, `safe-artifact-manifest.json`, and
+  `console-summary.txt`.
+- Regression: `current-result.json`, `representative-regression.json`,
+  `representative-regression.md`, `safe-artifact-manifest.json`, and
+  `console-summary.txt`.
+
+Before a normal upload, the strict JSON facts are revalidated, Markdown must
+already exist, and the safe Manifest records the exact upload allowlist. A
+failed or skipped workflow uses a separate status Artifact containing only the
+safe Manifest and console summary; it never broadens a normal allowlist to
+include temporary files. Artifact upload occurs before the final task or
+Regression gate, so a task failure can still publish its valid, safe evidence,
+while an Artifact upload failure fails the Job.
 
 Use GitHub Secrets only for `MYHERMES_API_KEY`, `MYHERMES_MODEL`, optional
 `MYHERMES_BASE_URL`, and an optional private-repository read token. The real

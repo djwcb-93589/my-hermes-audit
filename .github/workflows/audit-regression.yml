@@ -238,6 +238,7 @@ jobs:
           audit_python="$GITHUB_WORKSPACE/.venv/bin/python"
           publication_log="$RUNNER_TEMP/regression-publication.log"
           outcome_kind=failure
+          artifact_kind=failure
           terminal_exit_code=2
           if [[ "$RESULT_CANDIDATE" != 'true' ]]; then
             "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
@@ -299,30 +300,40 @@ jobs:
                 printf '%s\n' 'regression_status=unavailable' 'comparison_outcome=invalid_strict_report' >> .p8-ci/console-summary.txt
               fi
             else
-              set +e
-              uv run --no-sync myhermes-audit report render .p8-ci/representative-regression.json \
-                --input-type regression \
-                --output .p8-ci/representative-regression.md >> "$publication_log" 2>&1
-              render_exit_code=$?
-              set -e
-              if ! "$audit_python" tools/p8_ci_support.py write-regression-artifacts \
-                --result .p8-ci/current-result.json \
-                --regression .p8-ci/representative-regression.json \
+            set +e
+            uv run --no-sync myhermes-audit report render .p8-ci/representative-regression.json \
+              --input-type regression \
+              --output .p8-ci/representative-regression.md >> "$publication_log" 2>&1
+            render_exit_code=$?
+            set -e
+            if [[ "$render_exit_code" -ne 0 ]]; then
+              rm -f -- .p8-ci/current-result.json .p8-ci/representative-regression.json .p8-ci/representative-regression.md
+              "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
                 --manifest .p8-ci/safe-artifact-manifest.json \
                 --console .p8-ci/console-summary.txt \
-                --run-exit-code "$RUN_EXIT_CODE" \
-                --compare-exit-code "$compare_exit_code" \
-                --github-output "$GITHUB_OUTPUT"; then
-                "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
-                  --manifest .p8-ci/safe-artifact-manifest.json \
-                  --console .p8-ci/console-summary.txt \
-                  --stage regression_publication \
-                  --reason safe_projection_failed \
-                  --exit-code 2
-              elif [[ "$render_exit_code" -eq 0 ]]; then
-                outcome_kind=regression
-                terminal_exit_code=0
-              fi
+                --stage regression_publication \
+                --reason strict_regression_render_failed \
+                --exit-code 2
+            elif ! "$audit_python" tools/p8_ci_support.py write-regression-artifacts \
+              --result .p8-ci/current-result.json \
+              --regression .p8-ci/representative-regression.json \
+              --manifest .p8-ci/safe-artifact-manifest.json \
+                --console .p8-ci/console-summary.txt \
+              --run-exit-code "$RUN_EXIT_CODE" \
+              --compare-exit-code "$compare_exit_code" \
+              --github-output "$GITHUB_OUTPUT"; then
+              rm -f -- .p8-ci/current-result.json .p8-ci/representative-regression.json .p8-ci/representative-regression.md
+              "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
+                --manifest .p8-ci/safe-artifact-manifest.json \
+                --console .p8-ci/console-summary.txt \
+                --stage regression_publication \
+                --reason safe_projection_failed \
+                --exit-code 2
+            else
+              outcome_kind=regression
+              artifact_kind=complete
+              terminal_exit_code=0
+            fi
             fi
           else
             if ! "$audit_python" tools/p8_ci_support.py write-run-artifacts \
@@ -347,6 +358,7 @@ jobs:
           fi
           printf '%s\n' "current_run_exit_code=$RUN_EXIT_CODE outcome_kind=$outcome_kind terminal_exit_code=$terminal_exit_code" >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' 'baseline_updated=false judge=disabled langfuse=disabled pricing=policy-only' >> "$GITHUB_STEP_SUMMARY"
+          echo "artifact_kind=$artifact_kind" >> "$GITHUB_OUTPUT"
           echo "outcome_kind=$outcome_kind" >> "$GITHUB_OUTPUT"
           echo "terminal_exit_code=$terminal_exit_code" >> "$GITHUB_OUTPUT"
 
@@ -368,16 +380,92 @@ jobs:
           set -euo pipefail
           printf '%s\n' 'status=failed stage=representative_regression details=redacted' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload regression safe artifacts
-        if: always()
+      - name: Prepare regression completed Artifact whitelist
+        if: always() && steps.publication.outputs.artifact_kind == 'complete'
+        id: completed_artifact_contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          audit_python="$GITHUB_WORKSPACE/.venv/bin/python"
+          "$audit_python" tools/p8_ci_support.py validate-fact \
+            --kind run --path .p8-ci/current-result.json
+          "$audit_python" tools/p8_ci_support.py validate-fact \
+            --kind regression --path .p8-ci/representative-regression.json
+          "$audit_python" - <<'PY'
+          import json
+          from pathlib import Path
+
+          from myhermes_audit.artifacts import atomic_write_json
+
+          files = (
+              ".p8-ci/current-result.json",
+              ".p8-ci/representative-regression.json",
+              ".p8-ci/representative-regression.md",
+              ".p8-ci/safe-artifact-manifest.json",
+              ".p8-ci/console-summary.txt",
+          )
+          paths = [Path(value) for value in files]
+          if any(path.is_symlink() or not path.is_file() for path in paths):
+              raise SystemExit("regression artifact contract failed")
+          manifest = json.loads(paths[-2].read_text(encoding="utf-8"))
+          if not isinstance(manifest, dict):
+              raise SystemExit("regression manifest contract failed")
+          manifest["artifact_status"] = "complete"
+          manifest["files"] = list(files)
+          atomic_write_json(paths[-2], manifest)
+          PY
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Prepare regression status Artifact whitelist
+        if: always() && (steps.publication.outputs.artifact_kind != 'complete' || steps.completed_artifact_contract.outputs.ready != 'true')
+        id: status_artifact_contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          files = (
+              ".p8-ci/safe-artifact-manifest.json",
+              ".p8-ci/console-summary.txt",
+          )
+          paths = [Path(value) for value in files]
+          if any(path.is_symlink() or not path.is_file() for path in paths):
+              raise SystemExit("regression status artifact contract failed")
+          manifest = json.loads(paths[0].read_text(encoding="utf-8"))
+          if not isinstance(manifest, dict):
+              raise SystemExit("regression status manifest contract failed")
+          manifest["files"] = list(files)
+          paths[0].write_text(
+              json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Upload regression completed safe artifacts
+        if: always() && steps.completed_artifact_contract.outputs.ready == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: representative-regression-${{ github.run_id }}
-          if-no-files-found: warn
+          include-hidden-files: true
+          if-no-files-found: error
           path: |
             .p8-ci/current-result.json
             .p8-ci/representative-regression.json
             .p8-ci/representative-regression.md
+            .p8-ci/safe-artifact-manifest.json
+            .p8-ci/console-summary.txt
+
+      - name: Upload regression status artifacts
+        if: always() && steps.status_artifact_contract.outputs.ready == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: representative-regression-status-${{ github.run_id }}
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
             .p8-ci/safe-artifact-manifest.json
             .p8-ci/console-summary.txt
 

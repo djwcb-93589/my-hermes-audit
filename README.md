@@ -135,8 +135,10 @@ Git credentials, and only strict JSON facts plus their safe Markdown/manifest/
 summary projections are uploaded. A strict current Result from run exit `1`
 still reaches read-only Compare, whose Regression gate controls the final
 Regression status; exits `2`/`3` or incomplete facts do not manufacture a
-Regression. P8 intentionally adds no schedule/Cron and never updates a
-Baseline automatically. See
+Regression. The safe files live beneath the hidden `.p8-ci/` directory, so
+each upload explicitly enables hidden files, uses a fixed allowlist, and treats
+an empty Artifact as a CI error. P8 intentionally adds no schedule/Cron and
+never updates a Baseline automatically. See
 [`docs/p8-reporting-ci.md`](docs/p8-reporting-ci.md),
 [`baselines/README.md`](baselines/README.md), and
 [`docs/p8-production-acceptance.md`](docs/p8-production-acceptance.md) for

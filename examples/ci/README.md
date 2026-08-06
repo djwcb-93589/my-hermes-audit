@@ -32,5 +32,12 @@ Baseline must be a regular, non-symlink, Git-tracked Audit file that passes
 strict `AuditBaseline` loading; and Trials are decimal integers from 1 through
 100. Never commit a key, endpoint credentials, prompt, Memory state, Langfuse
 secret, Judge secret, or full local configuration.
+
+The workflows place safe outputs in the hidden `.p8-ci/` directory. Their
+Artifact upload steps explicitly enable hidden files, use only a fixed safe
+file allowlist, and treat a missing allowlisted file as a CI error. Strict JSON
+is the only fact source; Markdown, the safe Manifest, and the console summary
+are derived or auxiliary outputs. A failed or skipped run uploads only its
+separate safe Manifest and console summary, never an entire `.p8-ci/` directory.
 `regression-policy.example.yaml` is a safe policy template; it controls only
 existing Regression decisions and does not contain pricing or model credentials.

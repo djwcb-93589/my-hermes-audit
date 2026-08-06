@@ -78,6 +78,11 @@ Benchmark, Baseline operation, model, Judge, Langfuse call, or CI job.
 - [ ] Representative Artifacts include strict `representative-result.json`;
   Regression Artifacts include strict `current-result.json` and strict
   `representative-regression.json`. Markdown only renders these JSON facts.
+- [ ] CI safe Artifact files live in hidden `.p8-ci/`; every upload explicitly
+  enables hidden files and treats a missing allowlisted file as an error.
+- [ ] Deterministic, Representative, and Regression uploads use fixed safe
+  allowlists recorded verbatim in their safe Manifest. Failure or credential
+  status uploads contain only the safe Manifest and console summary.
 - [ ] A run exit of `1` with a strict current Result still executes Compare, and
   the strict Regression Report gate determines the final CI exit. Run exits
   `2`/`3` or missing/invalid strict current facts do not create a pseudo
