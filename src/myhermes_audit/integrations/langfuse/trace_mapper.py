@@ -69,6 +69,10 @@ def publish_replay_observations(
         "subject_dirty": request.subject_dirty,
         "audit_commit": request.audit_commit,
         "audit_version": request.audit_version,
+        "result_schema_version": request.result_schema_version,
+        "suite_comparison_sha256": request.suite_comparison_sha256,
+        "run_configuration_fingerprint": request.run_configuration_fingerprint,
+        "trial_configuration_fingerprint": trial.configuration_fingerprint,
         "worker_protocol_version": (
             trial.observations.worker_protocol_version
             if trial.observations is not None
@@ -1063,10 +1067,18 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
         "current_pricing_fingerprint": report.current_pricing_fingerprint,
         "baseline_model_identity": report.baseline_model_identity.status.value,
         "current_model_identity": report.current_model_identity.status.value,
-        "baseline_configuration_identity": report.baseline_configuration_identity.status.value,
-        "current_configuration_identity": report.current_configuration_identity.status.value,
-        "baseline_configuration_fingerprint": report.baseline_configuration_fingerprint,
-        "current_configuration_fingerprint": report.current_configuration_fingerprint,
+        "baseline_run_configuration_identity": (
+            report.baseline_run_configuration_identity.status.value
+        ),
+        "current_run_configuration_identity": (
+            report.current_run_configuration_identity.status.value
+        ),
+        "baseline_run_configuration_fingerprint": (
+            report.baseline_run_configuration_fingerprint
+        ),
+        "current_run_configuration_fingerprint": (
+            report.current_run_configuration_fingerprint
+        ),
         "pricing_applicability_fingerprint": report.pricing_applicability_fingerprint,
         "baseline_trial_count": report.baseline_trial_count,
         "current_trial_count": report.current_trial_count,

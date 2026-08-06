@@ -287,6 +287,12 @@ def _safe_identity_projection(value: object, *, key: str | None = None) -> objec
     )
 
 
+def safe_configuration_identity_projection(value: object) -> object:
+    """Return a deterministic projection safe to use as an identity fact."""
+
+    return _safe_identity_projection(value)
+
+
 def configuration_fingerprint(
     case: AuditCase,
     variant: AblationVariant | None,
@@ -335,6 +341,29 @@ def configuration_fingerprint(
                 else case.execution.memory_strategy.value
             ),
             "model_identifier": model_identifier,
+        }
+    )
+
+
+def run_configuration_fingerprint(
+    run_configuration_facts: Mapping[str, object],
+) -> str:
+    """Hash only the common, secret-free configuration of one Audit run.
+
+    Trial fingerprints intentionally include Case and Variant facts.  This
+    companion identity is instead calculated once from the Subject's common
+    configuration and global execution facts, before Case-specific execution
+    settings are applied.
+    """
+
+    if not isinstance(run_configuration_facts, Mapping):
+        raise ValueError("run configuration facts must be a mapping")
+    return canonical_sha256(
+        {
+            "configuration_identity_schema": "run-configuration-v1",
+            "run_configuration": safe_configuration_identity_projection(
+                run_configuration_facts
+            ),
         }
     )
 
@@ -981,6 +1010,8 @@ __all__ = (
     "effective_config_overrides",
     "effective_subject_configuration",
     "effective_toolsets",
+    "run_configuration_fingerprint",
+    "safe_configuration_identity_projection",
     "stable_trial_id",
     "subject_identity_fingerprint",
     "token_diagnostics",

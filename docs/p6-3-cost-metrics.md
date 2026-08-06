@@ -37,9 +37,9 @@ Missing runtime model identity yields `not_evaluated`; a present but different
 identifier yields `invalid` with the safe warning
 `deepseek_pricing_model_mismatch` and no monetary totals.
 
-The result schema is `1.6`; older reports without cost fields or pricing
-snapshots are legacy data
-and are never backfilled or interpreted as zero.
+The result schema is `1.7`; older reports without cost fields, pricing, or the
+required Run configuration fingerprint are legacy data and are never
+backfilled or interpreted as zero.
 
 ## Trial and aggregate status
 

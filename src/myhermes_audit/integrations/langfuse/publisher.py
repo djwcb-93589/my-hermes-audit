@@ -165,6 +165,13 @@ def publish_audit_result(
                 subject_dirty=result.subject_fingerprint.dirty,
                 audit_commit=result.audit_fingerprint.audit_commit or "unavailable",
                 audit_version=result.audit_fingerprint.audit_version,
+                result_schema_version=result.schema_version,
+                suite_comparison_sha256=(
+                    result.audit_fingerprint.suite_comparison_sha256
+                ),
+                run_configuration_fingerprint=(
+                    result.run_configuration_fingerprint
+                ),
                 case=case,
                 trial=trial,
                 data_classification=_case_classification(suite, case),

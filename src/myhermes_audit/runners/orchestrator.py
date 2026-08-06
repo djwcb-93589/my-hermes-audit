@@ -18,6 +18,7 @@ from myhermes_audit.ablation import (
     comparison_basis_fingerprint,
     duration_diagnostics,
     effective_subject_configuration,
+    run_configuration_fingerprint,
     stable_trial_id,
     token_diagnostics,
 )
@@ -131,6 +132,9 @@ class AuditOrchestrator:
             suite,
             created_at=audit_started,
         )
+        run_configuration_fingerprint_value = _run_configuration_fingerprint(
+            self.runner
+        )
         created_base = self.sandbox_base is None
         if created_base:
             sandbox_base = Path(tempfile.mkdtemp(prefix="myhermes-audit-run-"))
@@ -232,6 +236,7 @@ class AuditOrchestrator:
             suite_id=suite.suite_id,
             subject_fingerprint=subject_fingerprint,
             audit_fingerprint=audit_fingerprint,
+            run_configuration_fingerprint=run_configuration_fingerprint_value,
             deepseek_pricing_fingerprint=(
                 None
                 if suite.defaults.deepseek_pricing is None
@@ -754,6 +759,22 @@ def _base_configuration_facts(
             case_id=case.case_id,
         )
     return prepared, model_identifier
+
+
+def _run_configuration_fingerprint(runner: TrialRunnerPort) -> str:
+    resolver = getattr(runner, "run_configuration_facts", None)
+    if not callable(resolver):
+        raise SubjectPreflightError(
+            "Run configuration identity cannot be resolved"
+        )
+    try:
+        facts = resolver()
+        return run_configuration_fingerprint(facts)
+    except Exception as exc:
+        raise SubjectPreflightError(
+            "Run configuration identity cannot be resolved",
+            error_type=type(exc).__name__,
+        ) from exc
 
 
 def _trial_error(

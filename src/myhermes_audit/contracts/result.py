@@ -79,8 +79,8 @@ from myhermes_audit.contracts.scenario import (
 from myhermes_audit.serialization import canonical_sha256
 
 
-RESULT_SCHEMA_VERSION = "1.6"
-ResultSchemaVersion = Literal["1.6"]
+RESULT_SCHEMA_VERSION = "1.7"
+ResultSchemaVersion = Literal["1.7"]
 
 
 class TrialStatus(str, Enum):
@@ -1265,6 +1265,12 @@ class AuditRunResult(ContractModel):
     suite_id: Identifier
     subject_fingerprint: SubjectFingerprint
     audit_fingerprint: AuditFingerprint
+    run_configuration_fingerprint: Sha256Digest = Field(
+        description=(
+            "Required secret-free fingerprint of the configuration shared by "
+            "every Trial in this Audit run."
+        )
+    )
     deepseek_pricing_fingerprint: Sha256Digest | None = None
     started_at: UtcDatetime
     finished_at: UtcDatetime | None = None

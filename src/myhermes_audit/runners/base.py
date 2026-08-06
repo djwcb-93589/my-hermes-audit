@@ -92,6 +92,9 @@ class TrialRunnerPort(Protocol):
     def preflight(self, cases: Sequence[AuditCase]) -> None:
         """Reject unsupported cases before any Trial is started."""
 
+    def run_configuration_facts(self) -> dict[str, object]:
+        """Resolve secret-free facts shared by every Trial in one Audit run."""
+
     def base_configuration_facts(
         self,
         case: AuditCase,

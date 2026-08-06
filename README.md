@@ -56,11 +56,18 @@ pricing-sensitive metrics `not_comparable`; other metrics remain comparable.
 P7 task success rates use only explicit boolean `task_passed` samples, with
 sample/passed counts and rates retained for both the Suite and every Case;
 unknown (`None`) values are excluded.  Baseline and Regression contracts are
-versioned independently (`baseline-v6`, `regression-v9`) and retain total
-Trial counts separately from declared repeats per Case.  Identity conflicts
-are represented as `ambiguous` and cannot be compared; missing
+versioned independently (`baseline-v7`, `regression-v10`) and retain total
+Trial counts separately from declared repeats per Case.  A Run carries one
+secret-free Run configuration fingerprint for Baseline and Regression
+comparability, while each Trial retains its Case/Variant-effective
+configuration fingerprint for diagnostics.  Case execution, Toolset, and
+Memory-strategy differences therefore belong to the semantic Suite and Trial
+layers rather than creating a false Run configuration conflict. Identity
+conflicts are represented as `ambiguous` and cannot be compared; missing
 identities are represented as `missing` and also cannot satisfy the core
-Baseline identity contract. Decimal Metric values accept the exact finite
+Baseline identity contract. `AuditRunResult` is schema `1.7`; older Result,
+Baseline, and Regression payloads are rejected by their versioned contracts.
+Decimal Metric values accept the exact finite
 decimal text emitted by JSON serialization, and formal Baseline/Regression
 writers validate the same model again before atomic publication. Empty Runs
 and missing runtime core Metrics are rejected as invalid inputs.

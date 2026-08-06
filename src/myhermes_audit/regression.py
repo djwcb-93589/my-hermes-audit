@@ -542,7 +542,6 @@ def _identity_values(result: AuditRunResult) -> tuple[dict[str, IdentityEvidence
         )
         if value
     }
-    configs = {trial.configuration_fingerprint for trial in result.trials if trial.configuration_fingerprint}
     protocols = {
         trial.observations.worker_protocol_version
         for trial in result.trials
@@ -550,7 +549,9 @@ def _identity_values(result: AuditRunResult) -> tuple[dict[str, IdentityEvidence
     }
     identities = {
         "model": _identity_evidence(models),
-        "configuration": _identity_evidence(configs),
+        "run_configuration": _identity_evidence(
+            {result.run_configuration_fingerprint}
+        ),
         "worker_protocol": _identity_evidence(protocols),
         "result_schema": _identity_evidence({result.schema_version}),
         "metric_contract": _identity_evidence({METRIC_CONTRACT_VERSION}),
@@ -619,13 +620,13 @@ def build_baseline(result: AuditRunResult) -> AuditBaseline:
         "result_schema_version": result.schema_version,
         "metric_contract_version": METRIC_CONTRACT_VERSION,
         "model_identity": identities["model"],
-        "configuration_identity": identities["configuration"],
+        "run_configuration_identity": identities["run_configuration"],
         "worker_protocol_identity": identities["worker_protocol"],
         "result_schema_identity": identities["result_schema"],
         "metric_contract_identity": identities["metric_contract"],
         "worker_protocol_version": _identity_projection(identities["worker_protocol"]),
         "model_identifier": _identity_projection(identities["model"]),
-        "configuration_fingerprint": _identity_projection(identities["configuration"]),
+        "run_configuration_fingerprint": result.run_configuration_fingerprint,
         "pricing_fingerprint": result.deepseek_pricing_fingerprint,
         "declared_trial_count": result.summary.trial_count,
         "total_trial_count": result.summary.trial_count,
@@ -827,7 +828,11 @@ def compare_baseline(
                 for name, old_identity, new_identity in (
                     ("worker_protocol", baseline.worker_protocol_identity, current_identities["worker_protocol"]),
                     ("model", baseline.model_identity, current_identities["model"]),
-                    ("configuration", baseline.configuration_identity, current_identities["configuration"]),
+                    (
+                        "run_configuration",
+                        baseline.run_configuration_identity,
+                        current_identities["run_configuration"],
+                    ),
                     ("result_schema", baseline.result_schema_identity, current_identities["result_schema"]),
                     ("metric_contract", baseline.metric_contract_identity, current_identities["metric_contract"]),
                 )
@@ -960,7 +965,7 @@ def compare_baseline(
     status = RegressionStatus(report_decision.status)
     warnings = sorted(set(identity_warnings + list(report_comparability.pricing_reasons)))
     current_model = _identity_projection(current_identities["model"])
-    current_config = _identity_projection(current_identities["configuration"])
+    current_run_configuration = current.run_configuration_fingerprint
     current_protocol = _identity_projection(current_identities["worker_protocol"])
     current_declared_per_case, current_declared_mapping = _declared_trial_mapping(
         list(current_cases.values())
@@ -987,12 +992,14 @@ def compare_baseline(
         current_audit_commit=current.audit_fingerprint.audit_commit,
         baseline_model_identifier=baseline.model_identifier,
         current_model_identifier=current_model,
-        baseline_configuration_fingerprint=baseline.configuration_fingerprint,
-        current_configuration_fingerprint=current_config,
+        baseline_run_configuration_fingerprint=(
+            baseline.run_configuration_fingerprint
+        ),
+        current_run_configuration_fingerprint=current_run_configuration,
         baseline_model_identity=baseline.model_identity,
         current_model_identity=current_identities["model"],
-        baseline_configuration_identity=baseline.configuration_identity,
-        current_configuration_identity=current_identities["configuration"],
+        baseline_run_configuration_identity=baseline.run_configuration_identity,
+        current_run_configuration_identity=current_identities["run_configuration"],
         baseline_worker_protocol_identity=baseline.worker_protocol_identity,
         current_worker_protocol_identity=current_identities["worker_protocol"],
         baseline_result_schema_identity=baseline.result_schema_identity,

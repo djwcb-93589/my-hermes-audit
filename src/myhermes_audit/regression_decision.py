@@ -60,6 +60,9 @@ COMPARABILITY_REASON_CODES = frozenset(
         "configuration_identity_missing",
         "configuration_identity_ambiguous",
         "configuration_identity_mismatch",
+        "configuration_fingerprint_missing",
+        "configuration_fingerprint_ambiguous",
+        "configuration_fingerprint_mismatch",
         "worker_protocol_identity_missing",
         "worker_protocol_identity_ambiguous",
         "worker_protocol_identity_mismatch",
@@ -620,12 +623,17 @@ def derive_comparability_reason_codes(
     if tuple(baseline_case_ids) != tuple(current_case_ids):
         reasons.append("case_set_or_order_mismatch")
     for name, baseline_status, baseline_value, current_status, current_value in identities:
+        reason_prefix = (
+            "configuration_fingerprint"
+            if name == "run_configuration"
+            else f"{name}_identity"
+        )
         if "ambiguous" in {baseline_status, current_status}:
-            reasons.append(f"{name}_identity_ambiguous")
+            reasons.append(f"{reason_prefix}_ambiguous")
         elif "missing" in {baseline_status, current_status}:
-            reasons.append(f"{name}_identity_missing")
+            reasons.append(f"{reason_prefix}_missing")
         elif baseline_value != current_value:
-            reasons.append(f"{name}_identity_mismatch")
+            reasons.append(f"{reason_prefix}_mismatch")
     pricing_reason = derive_pricing_comparability_reason(
         pricing_required,
         baseline_pricing_fingerprint,

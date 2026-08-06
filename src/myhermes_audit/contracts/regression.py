@@ -57,8 +57,8 @@ from myhermes_audit.regression_decision import (
 )
 
 
-BASELINE_SCHEMA_VERSION = "baseline-v6"
-REGRESSION_SCHEMA_VERSION = "regression-v9"
+BASELINE_SCHEMA_VERSION = "baseline-v7"
+REGRESSION_SCHEMA_VERSION = "regression-v10"
 REGRESSION_POLICY_SCHEMA_VERSION = "regression-policy-v1"
 METRIC_CONTRACT_VERSION = "p7-metrics-v1"
 REQUIRED_RUNTIME_CORE_METRIC_NAMES = frozenset(
@@ -70,8 +70,8 @@ REQUIRED_RUNTIME_CORE_METRIC_NAMES = frozenset(
     }
 )
 
-BaselineSchemaVersion = Literal["baseline-v6"]
-RegressionSchemaVersion = Literal["regression-v9"]
+BaselineSchemaVersion = Literal["baseline-v7"]
+RegressionSchemaVersion = Literal["regression-v10"]
 RegressionPolicySchemaVersion = Literal["regression-policy-v1"]
 MetricNumber = StrictInt | StrictFloat | Decimal
 _STRICT_DECIMAL_TEXT = re.compile(
@@ -544,13 +544,13 @@ class AuditBaseline(ContractModel):
     result_schema_version: NonEmptyText
     metric_contract_version: NonEmptyText = METRIC_CONTRACT_VERSION
     model_identity: IdentityEvidence
-    configuration_identity: IdentityEvidence
+    run_configuration_identity: IdentityEvidence
     worker_protocol_identity: IdentityEvidence
     result_schema_identity: IdentityEvidence
     metric_contract_identity: IdentityEvidence
     worker_protocol_version: NonEmptyText | None = None
     model_identifier: NonEmptyText | None = None
-    configuration_fingerprint: Sha256Digest | None = None
+    run_configuration_fingerprint: Sha256Digest
     pricing_fingerprint: Sha256Digest | None = None
     declared_trial_count: NonNegativeInt
     total_trial_count: NonNegativeInt
@@ -576,7 +576,10 @@ class AuditBaseline(ContractModel):
             raise ValueError("declared trial mapping must cover the Case list")
         for identity, scalar in (
             (self.model_identity, self.model_identifier),
-            (self.configuration_identity, self.configuration_fingerprint),
+            (
+                self.run_configuration_identity,
+                self.run_configuration_fingerprint,
+            ),
             (self.worker_protocol_identity, self.worker_protocol_version),
         ):
             if identity.status is not IdentityStatus.AVAILABLE:
@@ -927,12 +930,12 @@ class AuditRegressionReport(ContractModel):
     current_audit_commit: GitObjectId | None = None
     baseline_model_identifier: NonEmptyText | None = None
     current_model_identifier: NonEmptyText | None = None
-    baseline_configuration_fingerprint: Sha256Digest | None = None
-    current_configuration_fingerprint: Sha256Digest | None = None
+    baseline_run_configuration_fingerprint: Sha256Digest
+    current_run_configuration_fingerprint: Sha256Digest
     baseline_model_identity: IdentityEvidence
     current_model_identity: IdentityEvidence
-    baseline_configuration_identity: IdentityEvidence
-    current_configuration_identity: IdentityEvidence
+    baseline_run_configuration_identity: IdentityEvidence
+    current_run_configuration_identity: IdentityEvidence
     baseline_worker_protocol_identity: IdentityEvidence
     current_worker_protocol_identity: IdentityEvidence
     baseline_result_schema_identity: IdentityEvidence
@@ -994,8 +997,14 @@ class AuditRegressionReport(ContractModel):
         for identity, scalar in (
             (self.baseline_model_identity, self.baseline_model_identifier),
             (self.current_model_identity, self.current_model_identifier),
-            (self.baseline_configuration_identity, self.baseline_configuration_fingerprint),
-            (self.current_configuration_identity, self.current_configuration_fingerprint),
+            (
+                self.baseline_run_configuration_identity,
+                self.baseline_run_configuration_fingerprint,
+            ),
+            (
+                self.current_run_configuration_identity,
+                self.current_run_configuration_fingerprint,
+            ),
         ):
             if identity.status is IdentityStatus.AVAILABLE and scalar != identity.value:
                 raise ValueError("report identity scalar projection is inconsistent")
@@ -1079,7 +1088,11 @@ class AuditRegressionReport(ContractModel):
                     )
                     for name, baseline_identity, current_identity in (
                         ("model", self.baseline_model_identity, self.current_model_identity),
-                        ("configuration", self.baseline_configuration_identity, self.current_configuration_identity),
+                        (
+                            "run_configuration",
+                            self.baseline_run_configuration_identity,
+                            self.current_run_configuration_identity,
+                        ),
                         ("worker_protocol", self.baseline_worker_protocol_identity, self.current_worker_protocol_identity),
                         ("result_schema", self.baseline_result_schema_identity, self.current_result_schema_identity),
                         ("metric_contract", self.baseline_metric_contract_identity, self.current_metric_contract_identity),

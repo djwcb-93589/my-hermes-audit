@@ -41,6 +41,9 @@ class LangfuseTrialRequest:
     subject_dirty: bool
     audit_commit: str
     audit_version: str
+    result_schema_version: str
+    suite_comparison_sha256: str | None
+    run_configuration_fingerprint: str
     case: AuditCase
     trial: TrialResult
     data_classification: DataClassification

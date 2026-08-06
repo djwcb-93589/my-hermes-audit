@@ -59,6 +59,7 @@ from myhermes_audit.ablation import (
     effective_config_overrides,
     effective_subject_configuration,
     effective_toolsets,
+    safe_configuration_identity_projection,
 )
 from myhermes_audit.contracts.suite import (
     CaseMode,
@@ -139,6 +140,7 @@ from myhermes_audit.security import (
     sensitive_environment_values,
     truncate_text_head_tail,
 )
+from myhermes_audit.serialization import canonical_sha256
 from myhermes_audit.validators.engine import preflight_evaluators
 
 
@@ -149,6 +151,7 @@ _LOG_TAIL_BYTES = _LOG_BYTE_LIMIT - _LOG_HEAD_BYTES
 _LOG_TRUNCATED_TAIL_BYTES = _LOG_TAIL_BYTES - len(_LOG_TRUNCATION_BYTES)
 _MAX_PROTOCOL_BYTES = 8 * 1024 * 1024
 _TERMINATION_GRACE_SECONDS = 3.0
+_RUN_CONFIGURATION_ADAPTER_VERSION = "myhermes-run-configuration-v1"
 
 
 class _BoundedByteCapture:
@@ -265,6 +268,53 @@ class MyHermesTrialRunner:
             model_identifier=resolution.model_identifier,
             model_identifier_source=resolution.source,
         )
+
+    def run_configuration_facts(self) -> dict[str, object]:
+        """Resolve the common, Case-independent configuration of this run.
+
+        The returned facts remain parent-process-only and are immediately
+        reduced to a fingerprint by the orchestrator.  They deliberately omit
+        Case execution overrides, Toolsets, Memory strategy, and Variants.
+        """
+
+        prepared = self._config_builder.prepare({})
+        resolution = resolve_effective_model_identifier(
+            case_environment={},
+            parent_environment=self._parent_environment,
+            subject_configuration=prepared.document,
+            sensitive_values=self._sensitive_values,
+        )
+        effective_environment: dict[str, object] = {}
+        for name in sorted(
+            MODEL_ENVIRONMENT_ALLOWLIST | set(prepared.environment_references)
+        ):
+            value = self._parent_environment.get(name)
+            if value is None:
+                continue
+            if is_sensitive_environment_name(name):
+                effective_environment[name] = "<configured>"
+            elif name in {"MODEL", "FALLBACK_MODEL"}:
+                effective_environment[name] = {
+                    "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                    "length": len(value),
+                }
+            else:
+                effective_environment[name] = value
+        return {
+            "subject_adapter_configuration_version": (
+                _RUN_CONFIGURATION_ADAPTER_VERSION
+            ),
+            "subject_configuration_sha256": canonical_sha256(
+                safe_configuration_identity_projection(prepared.document)
+            ),
+            "effective_environment_sha256": canonical_sha256(
+                safe_configuration_identity_projection(effective_environment)
+            ),
+            "model_resolution": {
+                "identifier": resolution.model_identifier,
+                "source": resolution.source.value,
+            },
+        }
 
     def base_configuration_facts(
         self,

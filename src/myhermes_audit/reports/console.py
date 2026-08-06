@@ -20,6 +20,13 @@ def render_console_summary(result: AuditRunResult) -> str:
         f"MyHermes Audit: {result.suite_id}",
         "",
         f"Subject commit:    {result.subject_fingerprint.git_commit}",
+        "Suite semantics:   "
+        + (
+            result.audit_fingerprint.suite_comparison_sha256
+            or result.audit_fingerprint.suite_sha256
+        ),
+        f"Run config:        {result.run_configuration_fingerprint}",
+        "Trial configs:     " + _trial_configuration_fingerprints(result),
         "Local execution:   "
         + (
             "unknown"
@@ -432,9 +439,15 @@ def render_console_regression(report: AuditRegressionReport) -> str:
         "Model identity:      "
         f"{report.baseline_model_identity.status.value} -> "
         f"{report.current_model_identity.status.value}",
-        "Configuration ID:    "
-        f"{report.baseline_configuration_identity.status.value} -> "
-        f"{report.current_configuration_identity.status.value}",
+        "Run config identity: "
+        f"{report.baseline_run_configuration_identity.status.value} -> "
+        f"{report.current_run_configuration_identity.status.value}",
+        "Run config hash:     "
+        f"{_fingerprint_or_missing(report.baseline_run_configuration_fingerprint)} -> "
+        f"{_fingerprint_or_missing(report.current_run_configuration_fingerprint)}",
+        "Suite semantics:     "
+        f"{_fingerprint_or_missing(report.baseline_suite_comparison_fingerprint)} -> "
+        f"{_fingerprint_or_missing(report.current_suite_comparison_fingerprint)}",
         "Result/Metric schema:"
         f" {report.baseline_result_schema_version}/"
         f"{report.current_result_schema_version}/"
@@ -500,6 +513,23 @@ def render_console_regression(report: AuditRegressionReport) -> str:
             f"decision={case.decision.value}"
         )
     return "\n".join(lines) + "\n"
+
+
+def _trial_configuration_fingerprints(result: AuditRunResult) -> str:
+    """Render Trial-scoped identities without treating Case differences as a conflict."""
+
+    values = sorted(
+        {
+            trial.configuration_fingerprint
+            for trial in result.trials
+            if trial.configuration_fingerprint is not None
+        }
+    )
+    if not values:
+        return "unavailable"
+    if len(values) == 1:
+        return values[0]
+    return f"{len(values)} distinct Case/Variant hashes: " + ", ".join(values)
 
 
 __all__ = ("render_console_summary", "render_console_regression")

@@ -63,11 +63,11 @@ inferred by parsing free-form logs and are never collapsed into “model issue�
 
 ## Baseline contract
 
-`AuditBaseline` is `baseline-v6`. It can be created from any strictly valid
+`AuditBaseline` is `baseline-v7`. It can be created from any strictly valid
 non-empty `AuditRunResult`, including a result with failed or timed-out Trials.
 It stores
 the source run ID, Audit and Subject commits, Suite ID and both Suite digests,
-Result Schema, Worker Protocol, model/config/pricing identities, total Trial
+Result Schema, Worker Protocol, model/Run-configuration/pricing identities, total Trial
 count and per-Case declared repeat counts, ordered Case IDs, suite and Case metric projections, cache/cost
 aggregates, failure distributions, Review action distributions, sample counts,
 and safe warnings.
@@ -82,19 +82,35 @@ unless `--overwrite` is explicit and reports the old and new IDs when replacing
 one. It never updates Git, a remote store, or the source result.
 
 Every real Trial, including a non-ablation Trial, carries a stable
-`TrialIdentity` and configuration fingerprint. The base fingerprint records
-the resolved, secret-free Subject configuration projection, effective model
-identifier, Case execution settings, enabled Toolsets, Memory strategy, and an
-explicit `ablation_state: base`; it contains no prompt, output, credential,
-machine path, run ID, Sandbox ID, or timestamp. Ablation Trials continue to
-use the existing `EffectiveSubjectConfiguration` plus variant overrides and
-retain their original fingerprint semantics.
+`TrialIdentity` and a Trial-effective configuration fingerprint. The base
+fingerprint records the resolved, secret-free Subject configuration projection,
+effective model identifier, Case execution settings, enabled Toolsets, Memory
+strategy, and an explicit `ablation_state: base`; it contains no prompt,
+output, credential, machine path, run ID, Sandbox ID, or timestamp. Ablation
+Trials continue to use the existing `EffectiveSubjectConfiguration` plus
+variant overrides and retain their original fingerprint semantics.
 
-Baseline creation rejects conflicting or missing model, configuration, Worker
-Protocol, Result Schema, or metric-contract identities before writing a file.
-All five are core identities and must be `available` with exactly one value;
-`missing` and `ambiguous` are retained in comparison diagnostics but cannot
-become a Baseline.
+`AuditRunResult.run_configuration_fingerprint` is a distinct required fact,
+calculated once before Cases execute. It hashes only the safe common Subject
+configuration projection, global model/runtime environment facts, resolved
+base-model source, and public MyHermes adapter configuration version. It never
+contains Case execution, Toolsets, Memory strategy, Fixtures, expectations,
+Case/Variant/Trial/Run/Sandbox IDs, repeat count, pricing, Subject commit,
+timestamps, output paths, credentials, Base-URL credentials, prompts, model
+outputs, user identity, or a raw configuration document. Different Cases may
+therefore legitimately have different Trial-effective fingerprints while
+sharing one Run fingerprint.
+
+This means a normal multi-Case representative Benchmark can create a Baseline
+directly: different Case Toolsets, Memory strategies, and execution contracts
+do not make the shared Run configuration identity ambiguous.
+
+Baseline creation rejects conflicting or missing model, Run configuration,
+Worker Protocol, Result Schema, or metric-contract identities before writing a
+file. All five are core identities and must be `available` with exactly one
+value; `missing` and `ambiguous` are retained in comparison diagnostics but
+cannot become a Baseline. The Run configuration identity comes directly from
+the top-level Result, never from collecting Trial fingerprints.
 
 Metric numeric fields use one strict parser. Runtime integers, finite floats,
 finite `Decimal` values, and finite decimal strings such as `"0E-8"` are
@@ -108,16 +124,24 @@ Memory text, Review evidence正文, user identity, or local absolute paths.
 
 ## Comparability
 
-`AuditRegressionReport` is `regression-v9` and reports structured reasons when
+`AuditRegressionReport` is `regression-v10` and reports structured reasons when
 comparison is not valid. Core correctness comparison requires the same Suite
 ID, semantic Suite digest, ordered Case set, Result Schema identity, metric
-contract, Worker Protocol, model identity, and configuration identity. Each
+contract, Worker Protocol, model identity, and Run configuration identity. Each
 identity is explicitly `available`, `missing`, or `ambiguous`; ambiguous
 identities are never comparable, even when both sides are ambiguous. Any core
 missing identity is also not comparable; `missing == missing` is not treated as
 equality.
 Audit commit, Subject commit, run ID, Trial IDs, Sandbox IDs, and run time may
 differ; Subject commit differences are the normal version-regression use case.
+
+Case execution, Toolsets, and Memory strategy belong to the semantic Suite
+fingerprint. A Suite change is therefore rejected as a Suite mismatch rather
+than masquerading as a Run configuration mismatch. Variant changes remain
+visible through Trial-effective configuration fingerprints. A changed common
+Subject config, global model/runtime environment, resolved base-model source,
+or public adapter configuration version changes the Run fingerprint and yields
+`configuration_fingerprint_mismatch`, making the Report `not_comparable`.
 
 The declared repeat counts may differ. Rates are computed using each side's
 actual denominator and both counts are displayed, so raw passed counts are not
@@ -288,12 +312,15 @@ outside the safe contract are excluded.
 
 ## Versioning and scope
 
-Baseline and Regression contracts are `baseline-v6` and `regression-v9`.
-The v9 Report requires both comparable core/local count fields and an explicit
+Baseline and Regression contracts are `baseline-v7` and `regression-v10`.
+The v10 Report requires both comparable core/local count fields, Run
+configuration identity fields, and an explicit
 `schema_version`; older Reports or payloads missing these fields are rejected.
+Older `baseline-v6` Baselines and Result schema `1.6` payloads are likewise
+rejected rather than silently upgraded.
 P7 adds the
 semantic Suite comparison digest to `AuditFingerprint`, so the Audit Result
-Schema is `1.6`; Worker Protocol remains v13. Existing Trial and evaluator
+Schema is `1.7`; Worker Protocol remains v13. Existing Trial and evaluator
 semantics are unchanged. P6.4 Cases and YAML are untouched.
 
 P7 deliberately does not implement CI gates, parallel Trial scheduling,
