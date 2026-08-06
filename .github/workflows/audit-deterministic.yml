@@ -12,9 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
         with:
           enable-cache: true
 
@@ -52,6 +54,136 @@ jobs:
               encoding="utf-8",
           )
           PY
+          uv run --no-sync python - <<'PY'
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          from pydantic import ValidationError
+
+          from myhermes_audit.artifacts import atomic_write_validated_model_json
+          from myhermes_audit.contracts import (
+              AuditBaseline,
+              AuditRegressionReport,
+              AuditRunResult,
+              ReportInputType,
+          )
+          from myhermes_audit.contracts.fingerprint import (
+              AuditFingerprint,
+              SubjectFingerprint,
+          )
+          from myhermes_audit.contracts.result import (
+              TrialObservationSummary,
+              TrialResult,
+              TrialRuntimeSummary,
+              TrialStatus,
+          )
+          from myhermes_audit.errors import ReportError
+          from myhermes_audit.integrations.myhermes.contracts import (
+              WORKER_PROTOCOL_VERSION,
+          )
+          from myhermes_audit.regression import (
+              RegressionPolicy,
+              build_baseline,
+              compare_baseline,
+          )
+          from myhermes_audit.reports.aggregate import (
+              aggregate_audit,
+              aggregate_cases,
+          )
+          from myhermes_audit.reports.markdown import (
+              load_markdown_report_source,
+              write_markdown_report,
+          )
+
+          output = Path(".p8-ci")
+          timestamp = datetime(2026, 8, 6, tzinfo=timezone.utc)
+          trial = TrialResult(
+              trial_id="ci-smoke-trial-1",
+              run_id="ci-smoke-worker-run-1",
+              case_id="ci-smoke-case",
+              trial_number=1,
+              status=TrialStatus.COMPLETED,
+              task_passed=True,
+              passed=True,
+              duration_ms=1,
+              runtime=TrialRuntimeSummary(
+                  subject_model="ci-smoke-model",
+                  iterations=1,
+                  tool_call_count=0,
+                  model_call_count=0,
+              ),
+              observations=TrialObservationSummary(
+                  worker_protocol_version=WORKER_PROTOCOL_VERSION,
+              ),
+          )
+          result = AuditRunResult(
+              schema_version="1.7",
+              run_id="ci-smoke-run",
+              suite_id="ci-smoke-suite",
+              subject_fingerprint=SubjectFingerprint(
+                  repository="ci-synthetic",
+                  git_commit="0" * 40,
+                  dirty=False,
+                  python_requirement=">=3.13",
+              ),
+              audit_fingerprint=AuditFingerprint(
+                  audit_version="0.1.0",
+                  audit_commit="1" * 40,
+                  suite_sha256="2" * 64,
+                  suite_comparison_sha256="2" * 64,
+                  python_version="3.13",
+                  platform="ci",
+                  created_at=timestamp,
+              ),
+              run_configuration_fingerprint="3" * 64,
+              started_at=timestamp,
+              finished_at=timestamp,
+              trials=[trial],
+              cases=aggregate_cases(["ci-smoke-case"], [trial]),
+              summary=aggregate_audit(["ci-smoke-case"], [trial]),
+          )
+          baseline = build_baseline(result)
+          regression = compare_baseline(
+              baseline,
+              result,
+              RegressionPolicy.conservative_default(),
+          )
+          paths = {
+              "run": output / "contract-smoke-result.json",
+              "baseline": output / "contract-smoke-baseline.json",
+              "regression": output / "contract-smoke-regression.json",
+          }
+          atomic_write_validated_model_json(paths["run"], result)
+          atomic_write_validated_model_json(paths["baseline"], baseline)
+          atomic_write_validated_model_json(paths["regression"], regression)
+          loaded = {
+              "run": AuditRunResult.model_validate_json(paths["run"].read_text(encoding="utf-8")),
+              "baseline": AuditBaseline.model_validate_json(paths["baseline"].read_text(encoding="utf-8")),
+              "regression": AuditRegressionReport.model_validate_json(paths["regression"].read_text(encoding="utf-8")),
+          }
+          for kind, input_type in (
+              ("run", ReportInputType.RUN),
+              ("baseline", ReportInputType.BASELINE),
+              ("regression", ReportInputType.REGRESSION),
+          ):
+              source = load_markdown_report_source(paths[kind], input_type=input_type)
+              if source != loaded[kind]:
+                  raise AssertionError(f"strict {kind} reload changed the fact")
+              write_markdown_report(output / f"contract-smoke-{kind}.md", source)
+          try:
+              write_markdown_report(output / "contract-smoke-run.md", loaded["run"])
+          except ReportError:
+              pass
+          else:
+              raise AssertionError("Markdown overwrite must be rejected")
+          wrong_schema = result.model_dump_json().replace('"1.7"', '"wrong-schema"', 1)
+          try:
+              AuditRunResult.model_validate_json(wrong_schema)
+          except ValidationError:
+              pass
+          else:
+              raise AssertionError("wrong Result schema must be rejected")
+          PY
           while IFS= read -r baseline; do
             stem="$(basename "${baseline%.json}")"
             uv run myhermes-audit report render "$baseline" \
@@ -80,7 +212,7 @@ jobs:
 
       - name: Upload deterministic safe artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: audit-deterministic-${{ github.sha }}-${{ github.run_id }}
           if-no-files-found: warn

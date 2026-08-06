@@ -132,29 +132,59 @@ status.
 `audit-deterministic.yml` runs on push and pull request. It has no model
 credentials, no Langfuse, no Subject execution, and no Baseline mutation. It
 performs strict imports/contract schema generation, Suite validation, CLI help,
-static compilation, and tracked-file secret scanning. Its summary is structured
-and its artifacts contain only generated schema/help/validation records.
+static compilation, tracked-file secret scanning, and a small in-memory
+contract smoke. The smoke constructs existing strict Result, Baseline, and
+Regression objects without a Trial; validates their JSON reload; renders each
+with the production renderer; verifies Markdown overwrite refusal; and rejects
+a wrong Result schema. Its artifacts contain only safe synthetic facts and
+generated schema/help/validation records.
 
-`audit-representative.yml` is manual only. It requires a selected Subject
-repository plus model credentials supplied solely through GitHub Secrets. A
-missing required secret produces a structured skip and prints no value. Judge
-and Langfuse remain disabled unless an operator makes a separately reviewed,
-explicit change; P8 does not set fixed pricing.
+`audit-representative.yml` is manual only. It runs `uv sync --locked` for Audit,
+exports the reviewed Subject's locked runtime requirements, installs those
+requirements and the editable Subject into the exact Audit `.venv` interpreter
+that starts the Worker, and then performs a no-model `import hermes` preflight.
+It never creates or relies on `my-hermes/.venv`. An export, install, or import
+failure is a redacted structured environment failure; it never starts the
+Benchmark or publishes a partial Result. A missing required credential produces
+a structured skip and prints no value. Judge and Langfuse remain disabled unless
+an operator makes a separately reviewed, explicit change; P8 does not set fixed
+pricing.
 
-`audit-regression.yml` is manual only. It executes an explicit repeat/current
-Benchmark and compares it against a versioned read-only Baseline path. A
-Regression or not-comparable result remains nonzero. It never filters trials,
-updates a Baseline, or creates an automatic approval.
+`audit-regression.yml` uses the same shared Worker environment preparation,
+then executes an explicit repeat/current Benchmark and compares it against a
+versioned read-only Baseline path. A run exit of `1` with a strict current
+Result still runs Compare: the strict Regression Report gate, not the original
+run exit, determines the final status. The safe summary records the original
+current-run exit code and failed-Case count separately from Regression status.
+Run exits `2`/`3`, or a missing/invalid strict current Result, never run Compare
+and end nonzero with a redacted structured failure instead of a pseudo
+Regression. A Regression or not-comparable report remains nonzero. The workflow
+never filters trials, updates a Baseline, or creates an automatic approval.
 
-Allowed uploaded artifacts are strict Result/Baseline/Regression JSON,
-Markdown, a safe Artifact manifest, safe console summary, Suite fingerprint,
-and safe commit/workflow identity. Artifact names use the Suite ID, short
-subject commit when available, and workflow/run identity. Workflows never
-upload Sandboxes, SQLite, prompts, Memory stores, Review evidence, full config,
-credentials, raw responses, or user IDs.
+Representative Artifacts contain a strict `representative-result.json`, its
+rendered Markdown, a safe Artifact manifest, and a safe console summary.
+Regression Artifacts contain a strict `current-result.json`, strict
+`representative-regression.json`, its rendered Markdown, a safe manifest, and a
+safe console summary. JSON remains the only fact source; Markdown is only a
+rendering of strict JSON. Invalid or partial JSON is not uploaded. Workflows
+never upload raw logs, Sandboxes, SQLite, Subject configuration bodies, prompts,
+model output, Memory stores, Review evidence, credentials, raw responses, or
+user IDs.
 
 Use GitHub Secrets only for `MYHERMES_API_KEY`, `MYHERMES_MODEL`, optional
-`MYHERMES_BASE_URL`, and an optional private-repository read token. Workflows
-use `bash` with `set -euo pipefail`, never dump the environment, and emit only
-redacted/status diagnostics. See [`../examples/ci/README.md`](../examples/ci/README.md)
-for the safe placeholders.
+`MYHERMES_BASE_URL`, and an optional private-repository read token. The real
+Benchmark step maps them to MyHermes' public runtime names
+`OPENAI_API_KEY`, `MODEL`, and optional `OPENAI_BASE_URL`; no provider is
+inferred and the reviewed Subject keeps its normal non-secret endpoint default
+when the optional override is absent. Model Secrets are scoped only to the
+credential check and real Benchmark step, never to checkout, dependency
+preparation, preflight, rendering, manifest creation, or Artifact upload.
+Both checkouts use `persist-credentials: false`, including the private Subject
+checkout. Dispatch paths and Trial counts are first placed in step-level
+environment variables, then strictly validated: Trials are decimal `1..100`,
+Subject configs are regular non-symlink files beneath `my-hermes/`, and
+Baselines are regular non-symlink Git-tracked Audit files that pass strict
+`AuditBaseline` loading. Third-party Actions are pinned to reviewed full commit
+SHAs. Workflows use `bash` with `set -euo pipefail`, never dump the environment,
+and emit only redacted/status diagnostics. See
+[`../examples/ci/README.md`](../examples/ci/README.md) for the safe placeholders.

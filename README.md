@@ -124,8 +124,19 @@ uv run myhermes-audit report render reports/representative-regression.json \
 ```
 
 The checked-in workflows split deterministic push/PR contract checks from
-manual credentialed representative and Regression jobs; P8 intentionally adds
-no schedule/Cron and never updates a Baseline automatically. See
+manual credentialed representative and Regression jobs. Manual jobs install the
+reviewed Subject's locked dependencies and editable package into the same Audit
+virtual environment that starts the Worker; a source checkout alone is never
+treated as runnable. Their real Benchmark step maps GitHub Secrets to
+`OPENAI_API_KEY`, `MODEL`, and optional `OPENAI_BASE_URL`; all other setup,
+render, manifest, and upload steps are secret-free. Dispatch Trial counts and
+paths are strictly validated before shell use, both checkouts clear persisted
+Git credentials, and only strict JSON facts plus their safe Markdown/manifest/
+summary projections are uploaded. A strict current Result from run exit `1`
+still reaches read-only Compare, whose Regression gate controls the final
+Regression status; exits `2`/`3` or incomplete facts do not manufacture a
+Regression. P8 intentionally adds no schedule/Cron and never updates a
+Baseline automatically. See
 [`docs/p8-reporting-ci.md`](docs/p8-reporting-ci.md),
 [`baselines/README.md`](baselines/README.md), and
 [`docs/p8-production-acceptance.md`](docs/p8-production-acceptance.md) for

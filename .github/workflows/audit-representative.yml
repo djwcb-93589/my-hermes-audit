@@ -30,91 +30,240 @@ jobs:
   representative:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      MYHERMES_API_KEY: ${{ secrets.MYHERMES_API_KEY }}
-      MYHERMES_MODEL: ${{ secrets.MYHERMES_MODEL }}
-      MYHERMES_BASE_URL: ${{ secrets.MYHERMES_BASE_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
         with:
           enable-cache: true
 
-      - name: Require explicitly supplied model credentials
-        id: preflight
+      - name: Prepare the Audit Worker environment
+        id: audit_environment
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p .p8-ci
+          if ! uv sync --locked > "$RUNNER_TEMP/audit-environment.log" 2>&1; then
+            printf '%s\n' '{"artifact_manifest_version":"p8-ci-safe-manifest-v1","artifact_status":"unavailable","stage":"audit_environment","reason":"audit_dependency_install_failed","exit_code":2}' > .p8-ci/safe-artifact-manifest.json
+            printf '%s\n' 'artifact_status=unavailable' 'stage=audit_environment' 'reason=audit_dependency_install_failed' 'exit_code=2' 'details=redacted' > .p8-ci/console-summary.txt
+            printf '%s\n' 'status=failed stage=audit_environment reason=audit_dependency_install_failed details=redacted' >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          test -x "$GITHUB_WORKSPACE/.venv/bin/python"
+
+      - name: Require explicitly supplied model credentials
+        id: credential_preflight
+        shell: bash
+        env:
+          MYHERMES_API_KEY: ${{ secrets.MYHERMES_API_KEY }}
+          MYHERMES_MODEL: ${{ secrets.MYHERMES_MODEL }}
+        run: |
+          set -euo pipefail
           if [[ -z "${MYHERMES_API_KEY:-}" || -z "${MYHERMES_MODEL:-}" ]]; then
-            printf '%s\n' 'status=skipped reason=missing_model_credentials' >> "$GITHUB_STEP_SUMMARY"
             echo 'run=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo 'run=true' >> "$GITHUB_OUTPUT"
           printf '%s\n' 'credential_check=present' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Record missing credential skip safely
+        if: always() && steps.credential_preflight.outputs.run == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/.venv/bin/python" tools/p8_ci_support.py write-failure-artifacts \
+            --manifest .p8-ci/safe-artifact-manifest.json \
+            --console .p8-ci/console-summary.txt \
+            --stage credential_preflight \
+            --reason missing_model_credentials \
+            --exit-code 0
+          printf '%s\n' 'status=skipped reason=missing_model_credentials' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout reviewed Subject
-        if: steps.preflight.outputs.run == 'true'
-        uses: actions/checkout@v4
+        if: steps.credential_preflight.outputs.run == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ inputs.subject_repository }}
           ref: ${{ inputs.subject_ref }}
           token: ${{ secrets.MYHERMES_READ_TOKEN || github.token }}
           path: my-hermes
+          persist-credentials: false
 
-      - name: Run representative Benchmark without optional remote integrations
-        if: steps.preflight.outputs.run == 'true'
-        id: benchmark
+      - name: Validate dispatch inputs before use
+        if: steps.credential_preflight.outputs.run == 'true'
+        id: input_validation
+        shell: bash
+        env:
+          SUBJECT_CONFIG_INPUT: ${{ inputs.subject_config_path }}
+          TRIALS_INPUT: ${{ inputs.trials }}
+        run: |
+          set -euo pipefail
+          audit_python="$GITHUB_WORKSPACE/.venv/bin/python"
+          if ! "$audit_python" tools/p8_ci_support.py validate-trials \
+            --value "$TRIALS_INPUT" --github-output "$GITHUB_OUTPUT"; then
+            "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
+              --manifest .p8-ci/safe-artifact-manifest.json \
+              --console .p8-ci/console-summary.txt \
+              --stage dispatch_input_validation \
+              --reason invalid_trials \
+              --exit-code 2
+            printf '%s\n' 'status=failed stage=dispatch_input_validation reason=invalid_trials details=redacted' >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          if ! "$audit_python" tools/p8_ci_support.py validate-subject-config \
+            --root "$GITHUB_WORKSPACE/my-hermes" \
+            --value "$SUBJECT_CONFIG_INPUT" \
+            --github-output "$GITHUB_OUTPUT"; then
+            "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
+              --manifest .p8-ci/safe-artifact-manifest.json \
+              --console .p8-ci/console-summary.txt \
+              --stage dispatch_input_validation \
+              --reason invalid_subject_config \
+              --exit-code 2
+            printf '%s\n' 'status=failed stage=dispatch_input_validation reason=invalid_subject_config details=redacted' >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+
+      - name: Install reviewed Subject into the Audit Worker environment
+        if: steps.credential_preflight.outputs.run == 'true'
+        id: subject_environment
         shell: bash
         run: |
           set -euo pipefail
-          uv sync --locked
-          mkdir -p .p8-ci
+          audit_python="$GITHUB_WORKSPACE/.venv/bin/python"
+          requirements="$RUNNER_TEMP/my-hermes-requirements.txt"
+          environment_log="$RUNNER_TEMP/subject-environment.log"
+          if ! uv export --project "$GITHUB_WORKSPACE/my-hermes" --locked --no-dev --no-emit-project --format requirements-txt --output-file "$requirements" > "$environment_log" 2>&1; then
+            "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
+              --manifest .p8-ci/safe-artifact-manifest.json \
+              --console .p8-ci/console-summary.txt \
+              --stage subject_environment \
+              --reason subject_dependency_export_failed \
+              --exit-code 2
+            printf '%s\n' 'status=failed stage=subject_environment reason=subject_dependency_export_failed details=redacted' >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          if ! uv pip install --python "$audit_python" --requirement "$requirements" >> "$environment_log" 2>&1; then
+            "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
+              --manifest .p8-ci/safe-artifact-manifest.json \
+              --console .p8-ci/console-summary.txt \
+              --stage subject_environment \
+              --reason subject_dependency_install_failed \
+              --exit-code 2
+            printf '%s\n' 'status=failed stage=subject_environment reason=subject_dependency_install_failed details=redacted' >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          if ! uv pip install --python "$audit_python" --no-deps --editable "$GITHUB_WORKSPACE/my-hermes" >> "$environment_log" 2>&1; then
+            "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
+              --manifest .p8-ci/safe-artifact-manifest.json \
+              --console .p8-ci/console-summary.txt \
+              --stage subject_environment \
+              --reason subject_editable_install_failed \
+              --exit-code 2
+            printf '%s\n' 'status=failed stage=subject_environment reason=subject_editable_install_failed details=redacted' >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          if ! "$audit_python" -c 'import hermes' >> "$environment_log" 2>&1; then
+            "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
+              --manifest .p8-ci/safe-artifact-manifest.json \
+              --console .p8-ci/console-summary.txt \
+              --stage subject_environment \
+              --reason subject_import_preflight_failed \
+              --exit-code 2
+            printf '%s\n' 'status=failed stage=subject_environment reason=subject_import_preflight_failed details=redacted' >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          printf '%s\n' 'subject_environment=ready interpreter=audit_worker_venv' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run representative Benchmark without optional remote integrations
+        if: steps.credential_preflight.outputs.run == 'true'
+        id: benchmark
+        shell: bash
+        env:
+          SUBJECT_CONFIG_PATH: ${{ steps.input_validation.outputs.subject_config_path }}
+          TRIAL_COUNT: ${{ steps.input_validation.outputs.trials }}
+          OPENAI_API_KEY: ${{ secrets.MYHERMES_API_KEY }}
+          MODEL: ${{ secrets.MYHERMES_MODEL }}
+          OPENAI_BASE_URL: ${{ secrets.MYHERMES_BASE_URL }}
+        run: |
+          set -euo pipefail
           raw_log="$RUNNER_TEMP/representative-raw.log"
           set +e
-          uv run myhermes-audit run examples/representative_benchmark_v1.yaml \
+          uv run --no-sync myhermes-audit run examples/representative_benchmark_v1.yaml \
             --subject-repo my-hermes \
-            --subject-config "my-hermes/${{ inputs.subject_config_path }}" \
-            --trials "${{ inputs.trials }}" \
+            --subject-config "$SUBJECT_CONFIG_PATH" \
+            --trials "$TRIAL_COUNT" \
             --output .p8-ci/representative-result.json > "$raw_log" 2>&1
           run_status=$?
           set -e
-          if [[ -f .p8-ci/representative-result.json ]]; then
-            uv run myhermes-audit report render .p8-ci/representative-result.json \
-              --output .p8-ci/representative-report.md >> "$raw_log" 2>&1
-            uv run python - <<'PY'
-          import json
-          from pathlib import Path
-          from myhermes_audit.reports.markdown import load_markdown_report_source
-
-          result = load_markdown_report_source(Path('.p8-ci/representative-result.json'))
-          Path('.p8-ci/safe-artifact-manifest.json').write_text(
-              json.dumps(
-                  {
-                      'run_id': result.run_id,
-                      'suite_id': result.suite_id,
-                      'subject_commit': result.subject_fingerprint.git_commit,
-                      'audit_commit': result.audit_fingerprint.audit_commit,
-                      'run_configuration_fingerprint': result.run_configuration_fingerprint,
-                  },
-                  sort_keys=True,
-              ) + '\n',
-              encoding='utf-8',
-          )
-          PY
-            subject_commit=$(uv run python -c "import json; print(json.load(open('.p8-ci/representative-result.json', encoding='utf-8'))['subject_fingerprint']['git_commit'][:12])")
+          if [[ -f .p8-ci/representative-result.json && ! -L .p8-ci/representative-result.json ]]; then
+            result_candidate=true
           else
-            subject_commit=unknown
+            result_candidate=false
           fi
-          grep -Ev '^(Report:|Regression report:|Markdown output:|Schema written:|Preserved Sandboxes:|- /)' "$raw_log" > .p8-ci/console-summary.txt || true
-          echo "artifact_name=representative-benchmark-${subject_commit}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "run_exit_code=${run_status}" >> "$GITHUB_STEP_SUMMARY"
+          echo 'completed=true' >> "$GITHUB_OUTPUT"
+          echo "run_exit_code=$run_status" >> "$GITHUB_OUTPUT"
+          echo "result_candidate=$result_candidate" >> "$GITHUB_OUTPUT"
+
+      - name: Validate and publish representative facts
+        if: always() && steps.benchmark.outputs.completed == 'true'
+        id: publication
+        shell: bash
+        env:
+          RUN_EXIT_CODE: ${{ steps.benchmark.outputs.run_exit_code }}
+          RESULT_CANDIDATE: ${{ steps.benchmark.outputs.result_candidate }}
+        run: |
+          set -euo pipefail
+          audit_python="$GITHUB_WORKSPACE/.venv/bin/python"
+          publication_log="$RUNNER_TEMP/representative-publication.log"
+          final_exit=2
+          if [[ "$RESULT_CANDIDATE" != 'true' ]]; then
+            "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
+              --manifest .p8-ci/safe-artifact-manifest.json \
+              --console .p8-ci/console-summary.txt \
+              --stage representative_publication \
+              --reason strict_result_missing \
+              --exit-code 2
+          elif ! "$audit_python" tools/p8_ci_support.py validate-fact \
+            --kind run --path .p8-ci/representative-result.json > "$publication_log" 2>&1; then
+            rm -f -- .p8-ci/representative-result.json
+            "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
+              --manifest .p8-ci/safe-artifact-manifest.json \
+              --console .p8-ci/console-summary.txt \
+              --stage representative_publication \
+              --reason strict_result_invalid \
+              --exit-code 2
+          else
+            set +e
+            uv run --no-sync myhermes-audit report render .p8-ci/representative-result.json \
+              --input-type run \
+              --output .p8-ci/representative-report.md > "$publication_log" 2>&1
+            render_status=$?
+            set -e
+            if ! "$audit_python" tools/p8_ci_support.py write-run-artifacts \
+              --result .p8-ci/representative-result.json \
+              --manifest .p8-ci/safe-artifact-manifest.json \
+              --console .p8-ci/console-summary.txt \
+              --exit-code "$RUN_EXIT_CODE" \
+              --exit-label run_exit_code; then
+              "$audit_python" tools/p8_ci_support.py write-failure-artifacts \
+                --manifest .p8-ci/safe-artifact-manifest.json \
+                --console .p8-ci/console-summary.txt \
+                --stage representative_publication \
+                --reason safe_projection_failed \
+                --exit-code 2
+            elif [[ "$render_status" -eq 0 && ( "$RUN_EXIT_CODE" == '0' || "$RUN_EXIT_CODE" == '1' ) ]]; then
+              final_exit="$RUN_EXIT_CODE"
+            fi
+          fi
+          printf '%s\n' "run_exit_code=$RUN_EXIT_CODE final_exit_code=$final_exit" >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' 'judge=disabled langfuse=disabled pricing=not-configured-by-workflow' >> "$GITHUB_STEP_SUMMARY"
-          exit "$run_status"
+          echo "final_exit_code=$final_exit" >> "$GITHUB_OUTPUT"
 
       - name: Record representative failure safely
-        if: failure()
+        if: always() && steps.publication.outputs.final_exit_code != '' && steps.publication.outputs.final_exit_code != '0'
         shell: bash
         run: |
           set -euo pipefail
@@ -122,11 +271,24 @@ jobs:
 
       - name: Upload representative safe artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ${{ steps.benchmark.outputs.artifact_name || format('representative-benchmark-unknown-{0}', github.run_id) }}
+          name: representative-benchmark-${{ github.run_id }}
           if-no-files-found: warn
           path: |
+            .p8-ci/representative-result.json
             .p8-ci/representative-report.md
             .p8-ci/safe-artifact-manifest.json
             .p8-ci/console-summary.txt
+
+      - name: Apply representative final gate
+        if: always() && steps.publication.outputs.final_exit_code != ''
+        shell: bash
+        env:
+          FINAL_EXIT_CODE: ${{ steps.publication.outputs.final_exit_code }}
+        run: |
+          set -euo pipefail
+          case "$FINAL_EXIT_CODE" in
+            0|1|2|3) exit "$FINAL_EXIT_CODE" ;;
+            *) exit 2 ;;
+          esac

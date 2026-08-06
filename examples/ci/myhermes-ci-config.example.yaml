@@ -1,3 +1,8 @@
-# Safe placeholder only. Supply a reviewed Subject-compatible config in CI.
-# Credentials must be injected by GitHub Secrets, never copied into this file.
-model: ${MYHERMES_MODEL}
+# Safe placeholder fragment only. Supply a reviewed Subject-compatible config
+# in CI; credentials must be injected by GitHub Secrets, never copied here.
+# The run step maps MYHERMES_MODEL -> MODEL and MYHERMES_API_KEY ->
+# OPENAI_API_KEY before MyHermes imports this configuration.
+model: ${MODEL}
+api_key: ${OPENAI_API_KEY}
+# OPENAI_BASE_URL is an optional run-step environment override. Keep the
+# reviewed Subject configuration's non-secret default base_url when it is unset.

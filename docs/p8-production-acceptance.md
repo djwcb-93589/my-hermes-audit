@@ -53,11 +53,37 @@ Benchmark, Baseline operation, model, Judge, Langfuse call, or CI job.
   compared to a current Result through the existing strict policy path.
 - [ ] Deterministic push/PR CI has no model/network dependency and cannot mutate
   a Baseline.
+- [ ] Deterministic CI's no-network smoke strictly reloads synthetic Result,
+  Baseline, and Regression JSON, renders them through `report-v1`, rejects an
+  implicit Markdown overwrite, and rejects a wrong Result schema.
 - [ ] Representative and Regression CI are manual; no P8 Cron/schedule is
   introduced.
 - [ ] Missing CI credentials produce redacted structured skip/failure output.
+- [ ] Audit runs `uv sync --locked`; the reviewed Subject's locked runtime
+  dependencies and editable package are installed into the same Audit `.venv`
+  interpreter used by the Worker, followed by a no-model `import hermes`
+  preflight.
+- [ ] Model credentials are mapped only in the real Benchmark step:
+  `MYHERMES_API_KEY` to `OPENAI_API_KEY`, `MYHERMES_MODEL` to `MODEL`, and
+  optional `MYHERMES_BASE_URL` to `OPENAI_BASE_URL`; an unset endpoint override
+  leaves the reviewed Subject's normal non-secret default in effect.
+- [ ] Model Secrets are scoped only to credential checking and the real
+  Benchmark. Checkout, environment preparation, rendering, manifests,
+  summaries, and Artifact upload do not receive them.
+- [ ] `workflow_dispatch` Trial counts, Subject config paths, and Baseline paths
+  are validated before shell use; safe paths reject absolute paths, traversal,
+  symlinks, and escape from their checked-out repository root.
+- [ ] Audit and Subject checkout both disable persisted Git credentials, and all
+  third-party workflow Actions are pinned to reviewed full commit SHAs.
+- [ ] Representative Artifacts include strict `representative-result.json`;
+  Regression Artifacts include strict `current-result.json` and strict
+  `representative-regression.json`. Markdown only renders these JSON facts.
+- [ ] A run exit of `1` with a strict current Result still executes Compare, and
+  the strict Regression Report gate determines the final CI exit. Run exits
+  `2`/`3` or missing/invalid strict current facts do not create a pseudo
+  Regression and remain nonzero.
 - [ ] CI Secrets are not echoed or saved, and only approved safe artifacts are
-  uploaded.
+  uploaded; raw logs and Subject configuration bodies are excluded.
 - [ ] Baseline creation or update is an explicit reviewed PR action; comparison
   is read-only.
 
