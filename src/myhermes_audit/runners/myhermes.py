@@ -70,6 +70,7 @@ from myhermes_audit.datasets.fixtures import validate_runtime_fixture_support
 from myhermes_audit.environment import (
     MODEL_ENVIRONMENT_ALLOWLIST,
     WORKER_INHERITED_ENVIRONMENT_ALLOWLIST,
+    is_sensitive_environment_name,
 )
 from myhermes_audit.errors import (
     AblationCapabilityError,
@@ -263,6 +264,43 @@ class MyHermesTrialRunner:
             ),
             model_identifier=resolution.model_identifier,
             model_identifier_source=resolution.source,
+        )
+
+    def base_configuration_facts(
+        self,
+        case: AuditCase,
+    ) -> tuple[dict[str, object], str]:
+        """Resolve the exact non-ablation config facts used by ``run_trial``."""
+
+        prepared = self._config_builder.prepare(case.execution.config_overrides)
+        resolution = self._effective_model_identifier(case, prepared.document)
+        effective_environment: dict[str, object] = {}
+        for name in sorted(MODEL_ENVIRONMENT_ALLOWLIST):
+            value = case.execution.environment_overrides.get(
+                name,
+                self._parent_environment.get(name),
+            )
+            if value is None:
+                continue
+            if is_sensitive_environment_name(name):
+                effective_environment[name] = "<configured>"
+            elif name in {"MODEL", "FALLBACK_MODEL"}:
+                effective_environment[name] = {
+                    "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                    "length": len(value),
+                }
+            else:
+                effective_environment[name] = value
+        return (
+            {
+                "subject_configuration": prepared.document,
+                "effective_environment": effective_environment,
+                "model_resolution": {
+                    "identifier": resolution.model_identifier,
+                    "source": resolution.source.value,
+                },
+            },
+            resolution.model_identifier,
         )
 
     def preflight(self, cases: Sequence[AuditCase]) -> None:

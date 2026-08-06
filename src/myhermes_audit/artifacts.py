@@ -7,6 +7,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from pydantic import BaseModel
+
 from myhermes_audit.contracts import ArtifactRef
 from myhermes_audit.errors import ReportError, UnsafePathError
 from myhermes_audit.serialization import pretty_json
@@ -96,6 +98,31 @@ def atomic_write_json(path: Path, value: object, *, mode: int | None = None) -> 
     return atomic_write_text(path, pretty_json(value) + "\n", mode=mode)
 
 
+def atomic_write_validated_model_json(
+    path: Path,
+    model: BaseModel,
+    *,
+    mode: int | None = None,
+    operation: str = "atomic_write",
+) -> Path:
+    """Validate the exact JSON bytes before publishing a versioned model.
+
+    This is intentionally a thin layer over the existing atomic writer.  A
+    failed same-version round trip happens before destination preparation, so
+    it cannot leave a partial or replacement output behind.
+    """
+
+    try:
+        text = pretty_json(model) + "\n"
+        type(model).model_validate_json(text)
+    except Exception as exc:
+        raise ReportError(
+            "validated JSON artifact cannot be round-tripped",
+            operation=operation,
+        ) from exc
+    return atomic_write_text(path, text, mode=mode)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     try:
@@ -144,6 +171,7 @@ def artifact_ref(
 __all__ = (
     "artifact_ref",
     "atomic_write_json",
+    "atomic_write_validated_model_json",
     "atomic_write_text",
     "sha256_file",
 )

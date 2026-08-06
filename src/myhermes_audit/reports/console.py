@@ -7,7 +7,10 @@ from myhermes_audit.contracts import (
     MetricStatus,
     TrialStatus,
 )
-from myhermes_audit.contracts.regression import AuditRegressionReport
+from myhermes_audit.contracts.regression import (
+    AuditRegressionReport,
+    BASELINE_SCHEMA_VERSION,
+)
 from myhermes_audit.regression_decision import derive_metric_role, resolve_metric_policy
 
 
@@ -424,6 +427,18 @@ def render_console_regression(report: AuditRegressionReport) -> str:
         f"{_integer_or_missing(report.current_declared_trials_per_case)}",
         f"Regression gate:     {'pass' if report.overall_regression_gate else 'fail'}",
         f"Comparability:       {'comparable' if report.status.value != 'not_comparable' else 'not comparable'}",
+        f"Report schema:       {report.schema_version}",
+        f"Baseline schema:     {BASELINE_SCHEMA_VERSION}",
+        "Model identity:      "
+        f"{report.baseline_model_identity.status.value} -> "
+        f"{report.current_model_identity.status.value}",
+        "Configuration ID:    "
+        f"{report.baseline_configuration_identity.status.value} -> "
+        f"{report.current_configuration_identity.status.value}",
+        "Result/Metric schema:"
+        f" {report.baseline_result_schema_version}/"
+        f"{report.current_result_schema_version}/"
+        f"{report.metric_contract_version}",
         f"Policy schema:        {report.regression_policy.schema_version}",
         f"Policy fingerprint:   {report.regression_policy_fingerprint}",
         "Pricing identity:     "

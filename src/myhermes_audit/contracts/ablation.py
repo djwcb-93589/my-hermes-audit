@@ -440,7 +440,7 @@ class EffectiveSubjectConfiguration(ContractModel):
 class TrialIdentity(ContractModel):
     suite_sha256: Sha256Digest
     case_id: Identifier
-    variant_id: Identifier
+    variant_id: Identifier | None = None
     trial_ordinal: PositiveInt
     subject_commit: NonEmptyText
     subject_fingerprint_sha256: Sha256Digest

@@ -44,6 +44,7 @@ from myhermes_audit.contracts.regression import (
     METRIC_CONTRACT_VERSION,
     BASELINE_SCHEMA_VERSION,
     REGRESSION_SCHEMA_VERSION,
+    REQUIRED_RUNTIME_CORE_METRIC_NAMES,
     pricing_applicability_fingerprint,
 )
 from myhermes_audit.serialization import canonical_sha256
@@ -471,6 +472,27 @@ def _benchmark_summary(result: AuditRunResult, trials: Sequence[TrialResult]) ->
     )
 
 
+def _require_non_empty_runtime_core_metrics(
+    result: AuditRunResult,
+    summary: BenchmarkSummary,
+    *,
+    label: str,
+) -> None:
+    if not result.trials or result.summary.trial_count <= 0:
+        raise ValueError(f"{label} must contain at least one Trial")
+    metric_map = {item.metric_name: item for item in summary.metrics}
+    missing = sorted(
+        name
+        for name in REQUIRED_RUNTIME_CORE_METRIC_NAMES
+        if name not in metric_map
+        or metric_map[name].sample_count <= 0
+        or metric_map[name].value is None
+    )
+    if missing:
+        raise ValueError(
+            f"{label} is missing required runtime core Metrics: "
+            + ", ".join(missing)
+        )
 def _benchmark_cases(result: AuditRunResult) -> list[BenchmarkCaseSummary]:
     from myhermes_audit.reports.aggregate import aggregate_audit
 
@@ -564,6 +586,12 @@ def _identity_comparison(
 def build_baseline(result: AuditRunResult) -> AuditBaseline:
     if not isinstance(result, AuditRunResult):
         raise ValueError("baseline input must be an AuditRunResult")
+    suite = _benchmark_summary(result, result.trials)
+    _require_non_empty_runtime_core_metrics(
+        result,
+        suite,
+        label="baseline input",
+    )
     identities, warnings = _identity_values(result)
     incomplete = sorted(
         name for name, evidence in identities.items()
@@ -574,7 +602,6 @@ def build_baseline(result: AuditRunResult) -> AuditBaseline:
             "baseline core identity is missing or ambiguous: "
             + ", ".join(incomplete)
         )
-    suite = _benchmark_summary(result, result.trials)
     cases = _benchmark_cases(result)
     case_ids = [case.case_id for case in cases]
     declared_per_case, declared_mapping = _declared_trial_mapping(cases)
@@ -767,6 +794,11 @@ def compare_baseline(
     policy_snapshot = RegressionPolicySnapshot.from_policy(policy)
     policy_facts = policy_snapshot.to_facts()
     current_suite = _benchmark_summary(current, current.trials)
+    _require_non_empty_runtime_core_metrics(
+        current,
+        current_suite,
+        label="current comparison input",
+    )
     current_cases = {item.case_id: item for item in _benchmark_cases(current)}
     baseline_cases = {item.case_id: item for item in baseline.case_summaries}
     current_comparison_fingerprint = current.audit_fingerprint.suite_comparison_sha256

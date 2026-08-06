@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import math
+import re
 from collections.abc import Mapping, Sequence
+from enum import Enum
+from urllib.parse import urlsplit, urlunsplit
 
 from myhermes_audit.contracts.ablation import (
     AblationComparisonResult,
@@ -195,23 +200,141 @@ def applicable_checkpoints(
     return projected
 
 
+_SENSITIVE_IDENTITY_KEY = re.compile(
+    r"(?:api[_-]?key|password|secret|credential|access[_-]?token|token|authorization|headers?|cookies?)$",
+    re.IGNORECASE,
+)
+_URL_IDENTITY_KEY = re.compile(r"(?:url|endpoint)$", re.IGNORECASE)
+_PATH_IDENTITY_KEY = re.compile(
+    r"(?:path|directory|dir|home|workspace)$",
+    re.IGNORECASE,
+)
+_RUNTIME_IDENTITY_KEY = re.compile(
+    r"(?:run|trial|sandbox|session)[_-]?id$",
+    re.IGNORECASE,
+)
+_USER_IDENTITY_KEY = re.compile(
+    r"(?:user|identity|account|owner)",
+    re.IGNORECASE,
+)
+_CONTENT_IDENTITY_KEY = re.compile(
+    r"(?:prompt|output|reasoning|review|content|message|instruction|system|template)",
+    re.IGNORECASE,
+)
+
+
+def _safe_identity_projection(value: object, *, key: str | None = None) -> object:
+    """Project configuration facts without secrets or machine-local paths."""
+
+    if isinstance(value, Enum):
+        return value.value
+    if key is not None and _SENSITIVE_IDENTITY_KEY.search(key):
+        if isinstance(value, str):
+            reference = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
+            if reference is not None:
+                return {"environment_reference": reference.group(1)}
+        return "<redacted>"
+    if key is not None and _PATH_IDENTITY_KEY.search(key):
+        return "<path>"
+    if key is not None and _RUNTIME_IDENTITY_KEY.search(key):
+        return "<runtime-id>"
+    if key is not None and _USER_IDENTITY_KEY.search(key):
+        return "<user-fact>"
+    if key is not None and _CONTENT_IDENTITY_KEY.search(key):
+        if isinstance(value, str):
+            return {
+                "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                "length": len(value),
+            }
+        return {
+            "sha256": canonical_sha256(_safe_identity_projection(value)),
+            "kind": "content",
+        }
+    if value is None or type(value) in (str, int, bool):
+        if isinstance(value, str):
+            if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\|/)", value):
+                return "<path>"
+            parts = urlsplit(value)
+            if parts.scheme and parts.netloc and (
+                (key is not None and _URL_IDENTITY_KEY.search(key))
+                or parts.username is not None
+                or parts.password is not None
+            ):
+                hostname = parts.hostname or ""
+                port = ""
+                try:
+                    if parts.port is not None:
+                        port = f":{parts.port}"
+                except ValueError:
+                    return "<url>"
+                return urlunsplit((parts.scheme, hostname + port, parts.path, "", ""))
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("configuration identity numbers must be finite")
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(child_key): _safe_identity_projection(child, key=str(child_key))
+            for child_key, child in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_identity_projection(child) for child in value]
+    if hasattr(value, "model_dump"):
+        return _safe_identity_projection(value.model_dump(mode="python"))
+    raise ValueError(
+        "configuration identity contains an unsupported value type"
+    )
+
+
 def configuration_fingerprint(
     case: AuditCase,
-    variant: AblationVariant,
-    configuration: EffectiveSubjectConfiguration,
+    variant: AblationVariant | None,
+    configuration: EffectiveSubjectConfiguration | None = None,
+    *,
+    prepared_subject_configuration: Mapping[str, object] | None = None,
+    model_identifier: str | None = None,
 ) -> str:
+    if variant is not None:
+        if configuration is None:
+            raise AblationVariantError(
+                "Variant configuration is required for its fingerprint",
+                case_id=case.case_id,
+                variant_id=variant.variant_id,
+            )
+        return canonical_sha256(
+            {
+                "variant_id": variant.variant_id,
+                "execution": case.execution,
+                "effective_subject_configuration": configuration,
+                "effective_config_overrides": effective_config_overrides(
+                    case,
+                    configuration,
+                ),
+                "effective_toolsets": [
+                    item.value for item in effective_toolsets(case, configuration)
+                ],
+            }
+        )
+    if prepared_subject_configuration is None or not model_identifier:
+        raise ValueError(
+            "base configuration fingerprint requires prepared Subject config and model"
+        )
     return canonical_sha256(
         {
-            "variant_id": variant.variant_id,
-            "execution": case.execution,
-            "effective_subject_configuration": configuration,
-            "effective_config_overrides": effective_config_overrides(
-                case,
-                configuration,
+            "variant_id": None,
+            "ablation_state": "base",
+            "execution": _safe_identity_projection(case.execution),
+            "prepared_subject_configuration": _safe_identity_projection(
+                prepared_subject_configuration
             ),
-            "effective_toolsets": [
-                item.value for item in effective_toolsets(case, configuration)
-            ],
+            "effective_toolsets": [item.value for item in case.execution.enabled_toolsets],
+            "memory_strategy": (
+                None
+                if case.execution.memory_strategy is None
+                else case.execution.memory_strategy.value
+            ),
+            "model_identifier": model_identifier,
         }
     )
 
@@ -234,23 +357,38 @@ def build_trial_identity(
     *,
     suite_sha256: str,
     case: AuditCase,
-    variant: AblationVariant,
+    variant: AblationVariant | None,
     trial_ordinal: int,
     subject_fingerprint: SubjectFingerprint,
-    configuration: EffectiveSubjectConfiguration,
+    configuration: EffectiveSubjectConfiguration | None = None,
+    prepared_subject_configuration: Mapping[str, object] | None = None,
+    model_identifier: str | None = None,
 ) -> TrialIdentity:
-    config_sha256 = configuration_fingerprint(case, variant, configuration)
+    config_sha256 = configuration_fingerprint(
+        case,
+        variant,
+        configuration,
+        prepared_subject_configuration=prepared_subject_configuration,
+        model_identifier=model_identifier,
+    )
+    effective_model_identifier = (
+        configuration.model_identifier
+        if configuration is not None
+        else model_identifier
+    )
+    if not effective_model_identifier:
+        raise ValueError("Trial identity requires an effective model identifier")
     payload = {
         "suite_sha256": suite_sha256,
         "case_id": case.case_id,
-        "variant_id": variant.variant_id,
+        "variant_id": None if variant is None else variant.variant_id,
         "trial_ordinal": trial_ordinal,
         "subject_commit": subject_fingerprint.git_commit,
         "subject_fingerprint_sha256": subject_identity_fingerprint(
             subject_fingerprint
         ),
         "configuration_sha256": config_sha256,
-        "model_identifier": configuration.model_identifier,
+        "model_identifier": effective_model_identifier,
     }
     return TrialIdentity(
         **payload,

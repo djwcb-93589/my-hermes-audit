@@ -20,7 +20,10 @@ from myhermes_audit.contracts import (
     AuditRunResult,
     AuditSuite,
 )
-from myhermes_audit.artifacts import atomic_write_json
+from myhermes_audit.artifacts import (
+    atomic_write_json,
+    atomic_write_validated_model_json,
+)
 from myhermes_audit.datasets import load_suite
 from myhermes_audit.errors import AuditError, ReportError, UnsupportedCaseError
 from myhermes_audit.fingerprint import suite_sha256
@@ -589,7 +592,11 @@ def _baseline_create_command(arguments: argparse.Namespace) -> int:
             old_id = _load_json_model(output, AuditBaseline, label="existing Baseline").baseline_id
         except ReportError:
             old_id = "<invalid-existing-baseline>"
-    atomic_write_json(output, baseline)
+    atomic_write_validated_model_json(
+        output,
+        baseline,
+        operation="baseline_create",
+    )
     print(f"Baseline ID:         {baseline.baseline_id}")
     print(f"Baseline fingerprint: {baseline.baseline_fingerprint}")
     if old_id is not None:
@@ -631,7 +638,11 @@ def _baseline_compare_command(arguments: argparse.Namespace) -> int:
         overwrite=arguments.overwrite,
         protected=(arguments.baseline, arguments.current),
     )
-    atomic_write_json(output, report)
+    atomic_write_validated_model_json(
+        output,
+        report,
+        operation="baseline_compare",
+    )
     sys.stdout.write(render_console_regression(report))
     print(f"Regression report: {output}")
     return 0 if report.overall_regression_gate else 1

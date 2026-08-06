@@ -297,14 +297,10 @@ def finalize_report_comparability_reasons(
 
     if comparable_core_metric_count < 0 or comparable_local_metric_count < 0:
         raise ValueError("comparable Metric counts cannot be negative")
-    allowed = REASON_CODES | {"no_comparable_core_metrics"}
+    allowed = REASON_CODES
     if any(reason not in allowed for reason in base_reasons):
         raise ValueError("unknown Report comparability reason")
-    base = {
-        reason
-        for reason in base_reasons
-        if reason != "no_comparable_core_metrics"
-    }
+    base = set(base_reasons)
     pricing = tuple(
         sorted(
             set(pricing_reasons).union(
@@ -320,8 +316,6 @@ def finalize_report_comparability_reasons(
         for reason in sorted(base)
         if reason not in PRICING_REASON_CODES
     )
-    if not core_reasons and comparable_core_metric_count == 0:
-        reasons.add("no_comparable_core_metrics")
     final_reasons = tuple(sorted(reasons))
     final_core_reasons = tuple(
         reason for reason in final_reasons if reason not in PRICING_REASON_CODES
@@ -652,11 +646,17 @@ def decide_report_status(
 ) -> ReportDecisionResult:
     """Derive report status and gate from counts, not persisted conclusions."""
 
-    if core_reason_count or comparable_core_metric_count == 0:
+    if comparable_core_metric_count < 0:
+        raise ValueError("comparable core Metric count cannot be negative")
+    if core_reason_count:
         return ReportDecisionResult(
             "not_comparable",
             False,
             "core_comparability_failure",
+        )
+    if comparable_core_metric_count == 0:
+        raise ValueError(
+            "a non-empty comparable Report requires a core Metric"
         )
     if regression_count > 0:
         return ReportDecisionResult("regressed", False, "hard_regression")

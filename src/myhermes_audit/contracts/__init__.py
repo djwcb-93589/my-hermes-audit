@@ -182,8 +182,10 @@ from myhermes_audit.contracts.regression import (
     RegressionPolicySnapshotEntry,
     RegressionStatus,
     BASELINE_SCHEMA_VERSION,
+    REQUIRED_RUNTIME_CORE_METRIC_NAMES,
     REGRESSION_POLICY_SCHEMA_VERSION,
     REGRESSION_SCHEMA_VERSION,
+    parse_metric_number,
     pricing_applicability_fingerprint,
 )
 from myhermes_audit.contracts.scenario import (

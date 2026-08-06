@@ -8,6 +8,7 @@ local filesystem paths.
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
@@ -56,15 +57,58 @@ from myhermes_audit.regression_decision import (
 )
 
 
-BASELINE_SCHEMA_VERSION = "baseline-v5"
-REGRESSION_SCHEMA_VERSION = "regression-v8"
+BASELINE_SCHEMA_VERSION = "baseline-v6"
+REGRESSION_SCHEMA_VERSION = "regression-v9"
 REGRESSION_POLICY_SCHEMA_VERSION = "regression-policy-v1"
 METRIC_CONTRACT_VERSION = "p7-metrics-v1"
+REQUIRED_RUNTIME_CORE_METRIC_NAMES = frozenset(
+    {
+        "failure_rate",
+        "timeout_rate",
+        "environment_error_rate",
+        "cancelled_rate",
+    }
+)
 
-BaselineSchemaVersion = Literal["baseline-v5"]
-RegressionSchemaVersion = Literal["regression-v8"]
+BaselineSchemaVersion = Literal["baseline-v6"]
+RegressionSchemaVersion = Literal["regression-v9"]
 RegressionPolicySchemaVersion = Literal["regression-policy-v1"]
 MetricNumber = StrictInt | StrictFloat | Decimal
+_STRICT_DECIMAL_TEXT = re.compile(
+    r"^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$"
+)
+
+
+def parse_metric_number(value: object) -> int | float | Decimal | None:
+    """Parse the finite numeric forms used by versioned P7 Metric contracts.
+
+    Pydantic's JSON mode serializes ``Decimal`` as text.  The parser therefore
+    accepts only a strict decimal grammar for strings and never falls back to
+    ``float`` or ``str(value)`` coercion.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("metric numbers must not be booleans")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("metric numbers must be finite")
+        return value
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("metric numbers must be finite")
+        return value
+    if isinstance(value, str):
+        if _STRICT_DECIMAL_TEXT.fullmatch(value) is None:
+            raise ValueError("metric number text is not a strict decimal")
+        parsed = Decimal(value)
+        if not parsed.is_finite():
+            raise ValueError("metric numbers must be finite")
+        return parsed
+    raise ValueError("metric numbers must be int, float, Decimal, or decimal text")
 
 
 class RegressionStatus(str, Enum):
@@ -394,15 +438,7 @@ class MetricSnapshot(ContractModel):
     @field_validator("value", mode="before")
     @classmethod
     def validate_value(cls, value: object) -> object:
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
-            raise ValueError("metric values must be numeric")
-        if isinstance(value, float) and not math.isfinite(value):
-            raise ValueError("metric values must be finite")
-        if isinstance(value, Decimal) and not value.is_finite():
-            raise ValueError("metric values must be finite")
-        return value
+        return parse_metric_number(value)
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> "MetricSnapshot":
@@ -495,7 +531,7 @@ class AuditBaseline(ContractModel):
 
     model_config = ConfigDict(frozen=True)
 
-    schema_version: BaselineSchemaVersion = BASELINE_SCHEMA_VERSION
+    schema_version: BaselineSchemaVersion
     baseline_id: Identifier
     baseline_fingerprint: Sha256Digest
     created_at: UtcDatetime
@@ -527,6 +563,8 @@ class AuditBaseline(ContractModel):
 
     @model_validator(mode="after")
     def validate_baseline_identity(self) -> "AuditBaseline":
+        if self.declared_trial_count <= 0 or self.total_trial_count <= 0:
+            raise ValueError("Baseline requires at least one Trial")
         if self.suite_summary.summary.trial_count != self.declared_trial_count:
             raise ValueError("legacy declared trial count must match suite summary")
         if self.total_trial_count != self.declared_trial_count:
@@ -562,6 +600,21 @@ class AuditBaseline(ContractModel):
             raise ValueError("case_ids must preserve Case summary order")
         if len(self.case_ids) != len(set(self.case_ids)):
             raise ValueError("baseline Case IDs must be unique")
+        suite_metrics = {
+            item.metric_name: item for item in self.suite_summary.metrics
+        }
+        missing_runtime = sorted(
+            name
+            for name in REQUIRED_RUNTIME_CORE_METRIC_NAMES
+            if name not in suite_metrics
+            or suite_metrics[name].sample_count <= 0
+            or suite_metrics[name].value is None
+        )
+        if missing_runtime:
+            raise ValueError(
+                "Baseline is missing required runtime core Metrics: "
+                + ", ".join(missing_runtime)
+            )
         payload = self.model_dump(
             mode="json",
             exclude={"baseline_id", "baseline_fingerprint", "created_at"},
@@ -610,28 +663,12 @@ class MetricComparison(ContractModel):
     @field_validator("baseline_value", "current_value", "absolute_delta", mode="before")
     @classmethod
     def validate_numeric_fact(cls, value: object) -> object:
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
-            raise ValueError("comparison values must be numeric")
-        if isinstance(value, float) and not math.isfinite(value):
-            raise ValueError("comparison values must be finite")
-        if isinstance(value, Decimal) and not value.is_finite():
-            raise ValueError("comparison values must be finite")
-        return value
+        return parse_metric_number(value)
 
     @field_validator("relative_delta", mode="before")
     @classmethod
     def validate_relative_fact(cls, value: object) -> object:
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
-            raise ValueError("relative delta must be finite numeric")
-        if isinstance(value, float) and not math.isfinite(value):
-            raise ValueError("relative delta must be finite numeric")
-        if isinstance(value, Decimal) and not value.is_finite():
-            raise ValueError("relative delta must be finite numeric")
-        return value
+        return parse_metric_number(value)
 
     @model_validator(mode="after")
     def validate_comparison(self) -> "MetricComparison":
@@ -997,6 +1034,23 @@ class AuditRegressionReport(ContractModel):
         if self.regression_policy_fingerprint != self.regression_policy.policy_fingerprint:
             raise ValueError("Report policy fingerprint does not match its snapshot")
         all_metrics = [*self.suite_metrics, *(metric for case in self.case_summaries for metric in case.metrics)]
+        suite_metric_map = {item.metric_name: item for item in self.suite_metrics}
+        missing_runtime = sorted(
+            name
+            for name in REQUIRED_RUNTIME_CORE_METRIC_NAMES
+            if name not in suite_metric_map
+            or not suite_metric_map[name].baseline_metric_present
+            or not suite_metric_map[name].current_metric_present
+            or suite_metric_map[name].baseline_sample_count <= 0
+            or suite_metric_map[name].current_sample_count <= 0
+            or suite_metric_map[name].baseline_value is None
+            or suite_metric_map[name].current_value is None
+        )
+        if missing_runtime:
+            raise ValueError(
+                "Regression input is missing required runtime core Metrics: "
+                + ", ".join(missing_runtime)
+            )
         policy_facts = self.regression_policy.to_facts()
         expected_pricing_applicability = pricing_applicability_fingerprint(
             self.regression_policy_fingerprint,
@@ -1159,6 +1213,7 @@ __all__ = (
     "AuditBaseline",
     "AuditRegressionReport",
     "BASELINE_SCHEMA_VERSION",
+    "REQUIRED_RUNTIME_CORE_METRIC_NAMES",
     "BenchmarkCaseSummary",
     "BenchmarkSummary",
     "METRIC_CONTRACT_VERSION",
@@ -1171,6 +1226,7 @@ __all__ = (
     "MetricDecision",
     "MetricDirection",
     "MetricSnapshot",
+    "parse_metric_number",
     "pricing_applicability_fingerprint",
     "PolicyMode",
     "RegressionMetricPolicy",

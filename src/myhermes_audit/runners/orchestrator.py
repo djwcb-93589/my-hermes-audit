@@ -142,6 +142,12 @@ class AuditOrchestrator:
         trials: list[TrialResult] = []
         preserved: list[Path] = []
         for case in selected:
+            base_subject_configuration: dict[str, object] | None = None
+            base_model_identifier: str | None = None
+            if case.ablation is None:
+                base_subject_configuration, base_model_identifier = (
+                    _base_configuration_facts(self.runner, case)
+                )
             variants: Sequence[AblationVariant | None] = (
                 [None]
                 if case.ablation is None
@@ -164,15 +170,23 @@ class AuditOrchestrator:
                 )
                 for trial_number in range(1, suite.defaults.trials + 1):
                     trial_identity = (
-                        None
-                        if variant is None or configuration is None
-                        else build_trial_identity(
+                        build_trial_identity(
                             suite_sha256=audit_fingerprint.suite_sha256,
                             case=case,
                             variant=variant,
                             trial_ordinal=trial_number,
                             subject_fingerprint=subject_fingerprint,
                             configuration=configuration,
+                            prepared_subject_configuration=(
+                                base_subject_configuration
+                                if variant is None
+                                else None
+                            ),
+                            model_identifier=(
+                                base_model_identifier
+                                if variant is None
+                                else None
+                            ),
                         )
                     )
                     trial, preserved_path = self._run_one(
@@ -714,6 +728,32 @@ def _p4_effective_subject_configuration(
             observation is not None and observation.available
         ),
     )
+
+
+def _base_configuration_facts(
+    runner: TrialRunnerPort,
+    case: AuditCase,
+) -> tuple[dict[str, object], str]:
+    resolver = getattr(runner, "base_configuration_facts", None)
+    if not callable(resolver):
+        raise SubjectPreflightError(
+            "normal Trial configuration identity cannot be resolved",
+            case_id=case.case_id,
+        )
+    try:
+        prepared, model_identifier = resolver(case)
+    except Exception as exc:
+        raise SubjectPreflightError(
+            "normal Trial configuration identity cannot be resolved",
+            case_id=case.case_id,
+            error_type=type(exc).__name__,
+        ) from exc
+    if not isinstance(prepared, dict) or not isinstance(model_identifier, str):
+        raise SubjectPreflightError(
+            "normal Trial configuration identity resolver returned invalid facts",
+            case_id=case.case_id,
+        )
+    return prepared, model_identifier
 
 
 def _trial_error(

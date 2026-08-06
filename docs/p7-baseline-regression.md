@@ -63,8 +63,9 @@ inferred by parsing free-form logs and are never collapsed into “model issue�
 
 ## Baseline contract
 
-`AuditBaseline` is `baseline-v5`. It can be created from any strictly valid
-`AuditRunResult`, including a result with failed or timed-out Trials. It stores
+`AuditBaseline` is `baseline-v6`. It can be created from any strictly valid
+non-empty `AuditRunResult`, including a result with failed or timed-out Trials.
+It stores
 the source run ID, Audit and Subject commits, Suite ID and both Suite digests,
 Result Schema, Worker Protocol, model/config/pricing identities, total Trial
 count and per-Case declared repeat counts, ordered Case IDs, suite and Case metric projections, cache/cost
@@ -80,18 +81,34 @@ The model is frozen after load. `baseline create` rejects an existing output
 unless `--overwrite` is explicit and reports the old and new IDs when replacing
 one. It never updates Git, a remote store, or the source result.
 
+Every real Trial, including a non-ablation Trial, carries a stable
+`TrialIdentity` and configuration fingerprint. The base fingerprint records
+the resolved, secret-free Subject configuration projection, effective model
+identifier, Case execution settings, enabled Toolsets, Memory strategy, and an
+explicit `ablation_state: base`; it contains no prompt, output, credential,
+machine path, run ID, Sandbox ID, or timestamp. Ablation Trials continue to
+use the existing `EffectiveSubjectConfiguration` plus variant overrides and
+retain their original fingerprint semantics.
+
 Baseline creation rejects conflicting or missing model, configuration, Worker
 Protocol, Result Schema, or metric-contract identities before writing a file.
 All five are core identities and must be `available` with exactly one value;
 `missing` and `ambiguous` are retained in comparison diagnostics but cannot
 become a Baseline.
 
+Metric numeric fields use one strict parser. Runtime integers, finite floats,
+finite `Decimal` values, and finite decimal strings such as `"0E-8"` are
+accepted; booleans, non-finite values, arrays, objects, empty strings, and
+extra-text strings are rejected. Decimal text is converted back to `Decimal`
+before validation. Baseline and Regression JSON writers validate the exact
+serialized bytes with the same model before invoking the atomic writer.
+
 No Baseline contains API keys, Base URLs, prompts, model responses, reasoning,
 Memory text, Review evidence正文, user identity, or local absolute paths.
 
 ## Comparability
 
-`AuditRegressionReport` is `regression-v8` and reports structured reasons when
+`AuditRegressionReport` is `regression-v9` and reports structured reasons when
 comparison is not valid. Core correctness comparison requires the same Suite
 ID, semantic Suite digest, ordered Case set, Result Schema identity, metric
 contract, Worker Protocol, model identity, and configuration identity. Each
@@ -146,15 +163,17 @@ masks the former.
 
 Report reasons are finalized only after effective Metric policies,
 evaluation/comparability facts, and Metric decisions have been re-derived.
-`no_comparable_core_metrics` is added only when there is no more-specific core
-identity/contract reason and `comparable_core_metric_count == 0` (therefore
-every core Metric is `not_evaluated` or `not_comparable`). A pricing-only local
-failure never adds that core reason when another core Metric is comparable.
-Local Metrics may retain evaluated decisions even when the Report is
-`not_comparable` because no core Metric is comparable; those decisions are
-diagnostic and cannot make the overall gate pass. The generator and strict
-reload validator share the same role, count, pricing-reason, and final-reason
-helpers.
+There is no `no_comparable_core_metrics` reason. A legal non-empty Run must
+carry the required runtime state Metrics (`failure_rate`, `timeout_rate`,
+`environment_error_rate`, and `cancelled_rate`) and therefore establishes at
+least one comparable core Metric when core identities are compatible. Empty
+Runs or missing required runtime Metrics are rejected by baseline/compare
+input validation, not downgraded to a Report. A pricing-only local failure
+never creates a core reason when another core Metric is comparable. Local
+decisions remain visible and participate in the final gate according to their
+policy; they do not invent a core comparability conclusion. The generator and
+strict reload validator share the same role, count, pricing-reason, and
+final-reason helpers.
 
 The complete report contains an immutable `RegressionPolicySnapshot` with the
 policy schema version, default mode, sorted explicit metric entries, and a
@@ -219,10 +238,12 @@ failure (for example 5/5), without naming a special Case rule.
 
 Case decisions use one shared precedence: hard regression, warning, improvement,
 unchanged, all-not-comparable, then all-not-evaluated. Mixed unavailable
-states receive a stable reason code. A report is `not_comparable` when no core
-Metric is comparable, even if no identity mismatch exists; `passed` requires
-at least one comparable core Metric. Local pricing-sensitive decisions remain
-visible as diagnostics and cannot establish the Report gate.
+states receive a stable reason code. A Report is `not_comparable` only for a
+concrete core identity/contract reason. A legal non-empty input supplies the
+required runtime core state Metrics; empty or incomplete inputs are rejected
+before Report construction. Local pricing-sensitive decisions remain visible
+and participate in the final gate according to policy, but cannot establish a
+core comparability conclusion.
 
 ## CLI, console, and JSON
 
@@ -267,9 +288,9 @@ outside the safe contract are excluded.
 
 ## Versioning and scope
 
-Baseline and Regression contracts are `baseline-v5` and `regression-v8`.
-The v8 Report requires both comparable core/local count fields and an explicit
-`schema_version`; v7 Reports or payloads missing these fields are rejected.
+Baseline and Regression contracts are `baseline-v6` and `regression-v9`.
+The v9 Report requires both comparable core/local count fields and an explicit
+`schema_version`; older Reports or payloads missing these fields are rejected.
 P7 adds the
 semantic Suite comparison digest to `AuditFingerprint`, so the Audit Result
 Schema is `1.6`; Worker Protocol remains v13. Existing Trial and evaluator

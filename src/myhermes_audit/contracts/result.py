@@ -698,15 +698,6 @@ class TrialResult(ContractModel):
             raise ValueError(
                 "Trial cache evaluated prompt tokens must mirror observations"
             )
-        p4_identity_fields = (
-            self.trial_identity,
-            self.variant_id,
-            self.memory_mode,
-            self.compression_mode,
-            self.configuration_fingerprint,
-            self.comparison_basis_fingerprint,
-            self.effective_subject_configuration,
-        )
         p4_result_present = any(
             (
                 self.compression_events,
@@ -721,12 +712,65 @@ class TrialResult(ContractModel):
                 self.required_fact_gate_passed is not None,
             )
         )
-        if all(item is None for item in p4_identity_fields):
-            if p4_result_present:
-                raise ValueError("P4 Trial facts require a complete Variant identity")
-        elif any(item is None for item in p4_identity_fields):
-            raise ValueError("P4 Trial identity fields must be all present")
+        if self.variant_id is None:
+            # Base (non-ablation) Trials carry the same stable identity fields,
+            # but intentionally do not expose P4 Variant configuration facts.
+            if any(
+                item is not None
+                for item in (
+                    self.memory_mode,
+                    self.compression_mode,
+                    self.comparison_basis_fingerprint,
+                    self.effective_subject_configuration,
+                )
+            ):
+                raise ValueError(
+                    "base Trials cannot expose partial Variant configuration"
+                )
+            if self.trial_identity is None or self.configuration_fingerprint is None:
+                if self.trial_identity is not None or self.configuration_fingerprint is not None:
+                    raise ValueError(
+                        "base Trial identity requires Trial identity and fingerprint"
+                    )
+                if p4_result_present:
+                    raise ValueError(
+                        "P4 Trial facts require a complete Variant identity"
+                    )
+            else:
+                if self.trial_identity.variant_id is not None:
+                    raise ValueError("base Trial identity must have no Variant ID")
+                if (
+                    self.trial_identity.case_id != self.case_id
+                    or self.trial_identity.trial_ordinal != self.trial_number
+                    or self.trial_identity.configuration_sha256
+                    != self.configuration_fingerprint
+                ):
+                    raise ValueError("base Trial identity does not match Trial facts")
+                if (
+                    self.runtime is not None
+                    and self.runtime.subject_model is not None
+                    and self.runtime.subject_model
+                    != self.trial_identity.model_identifier
+                ):
+                    raise ValueError(
+                        "runtime model identifier must match the Trial identity"
+                    )
+                if p4_result_present:
+                    raise ValueError(
+                        "P4 Trial facts require a complete Variant identity"
+                    )
         else:
+            p4_identity_fields = (
+                self.trial_identity,
+                self.variant_id,
+                self.memory_mode,
+                self.compression_mode,
+                self.configuration_fingerprint,
+                self.comparison_basis_fingerprint,
+                self.effective_subject_configuration,
+            )
+            if any(item is None for item in p4_identity_fields):
+                raise ValueError("P4 Trial identity fields must be all present")
             assert self.trial_identity is not None
             assert self.variant_id is not None
             assert self.memory_mode is not None
@@ -1280,7 +1324,7 @@ class AuditRunResult(ContractModel):
                 != subject_identity_sha256
             ):
                 raise ValueError(
-                    "P4 Trial identity must match Audit Suite and Subject fingerprints"
+                    "Trial identity must match Audit Suite and Subject fingerprints"
                 )
         cost_fingerprints = {
             trial.deepseek_cost.pricing_fingerprint

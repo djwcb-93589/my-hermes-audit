@@ -56,11 +56,14 @@ pricing-sensitive metrics `not_comparable`; other metrics remain comparable.
 P7 task success rates use only explicit boolean `task_passed` samples, with
 sample/passed counts and rates retained for both the Suite and every Case;
 unknown (`None`) values are excluded.  Baseline and Regression contracts are
-versioned independently (`baseline-v5`, `regression-v8`) and retain total
+versioned independently (`baseline-v6`, `regression-v9`) and retain total
 Trial counts separately from declared repeats per Case.  Identity conflicts
 are represented as `ambiguous` and cannot be compared; missing
 identities are represented as `missing` and also cannot satisfy the core
-Baseline identity contract.
+Baseline identity contract. Decimal Metric values accept the exact finite
+decimal text emitted by JSON serialization, and formal Baseline/Regression
+writers validate the same model again before atomic publication. Empty Runs
+and missing runtime core Metrics are rejected as invalid inputs.
 Metric comparisons carry independent comparability fact codes and an explicit
 pricing-applicability fact; serialized reason codes and decisions are checked
 outputs. Invalid comparison inputs are rejected before a Regression Report is
@@ -74,7 +77,9 @@ Pricing-sensitive metrics treat any missing pricing fingerprint as
 Metrics whose effective policy requires pricing are `local`; all other Metrics
 are `core`. Reports persist and verify separate comparable core/local counts.
 Local decisions remain visible for diagnostics, but local comparability cannot
-establish an overall core regression conclusion.
+establish an overall core regression conclusion. A legal non-empty Run always
+contains comparable runtime core state Metrics; there is no
+`no_comparable_core_metrics` Report reason.
 Metric direction, policy thresholds, Case precedence, and report gate status are
 derived by shared pure decision helpers and revalidated when JSON is loaded.
 Comparison is read-only and does not invoke an Agent, Judge, Langfuse, or

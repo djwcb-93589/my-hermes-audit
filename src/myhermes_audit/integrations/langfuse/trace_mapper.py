@@ -7,7 +7,10 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from myhermes_audit.contracts import MemorySnapshotPhase, MetricSource, MetricStatus
-from myhermes_audit.contracts.regression import AuditRegressionReport
+from myhermes_audit.contracts.regression import (
+    AuditRegressionReport,
+    BASELINE_SCHEMA_VERSION,
+)
 from myhermes_audit.integrations.langfuse.redaction import project_remote_content
 from myhermes_audit.ports.langfuse import LangfuseTrialRequest
 from myhermes_audit.regression_decision import derive_metric_role, resolve_metric_policy
@@ -1045,6 +1048,11 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
     return {
         "baseline_id": report.baseline_id,
         "current_run_id": report.current_run_id,
+        "report_schema_version": report.schema_version,
+        "baseline_schema_version": BASELINE_SCHEMA_VERSION,
+        "baseline_result_schema_version": report.baseline_result_schema_version,
+        "current_result_schema_version": report.current_result_schema_version,
+        "metric_contract_version": report.metric_contract_version,
         "comparability_status": report.status.value,
         "comparability_reasons": list(report.comparability_reasons),
         "regression_policy_fingerprint": report.regression_policy_fingerprint,
@@ -1053,6 +1061,12 @@ def project_regression_metadata(report: AuditRegressionReport) -> dict[str, Any]
         "comparability_facts_verified": report.comparability_facts_verified,
         "baseline_pricing_fingerprint": report.baseline_pricing_fingerprint,
         "current_pricing_fingerprint": report.current_pricing_fingerprint,
+        "baseline_model_identity": report.baseline_model_identity.status.value,
+        "current_model_identity": report.current_model_identity.status.value,
+        "baseline_configuration_identity": report.baseline_configuration_identity.status.value,
+        "current_configuration_identity": report.current_configuration_identity.status.value,
+        "baseline_configuration_fingerprint": report.baseline_configuration_fingerprint,
+        "current_configuration_fingerprint": report.current_configuration_fingerprint,
         "pricing_applicability_fingerprint": report.pricing_applicability_fingerprint,
         "baseline_trial_count": report.baseline_trial_count,
         "current_trial_count": report.current_trial_count,
